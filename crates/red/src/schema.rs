@@ -774,22 +774,16 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
     }
 }
 
-/// Quote an identifier for the preview `SELECT` so a table name can never break
-/// out of the SQL. MySQL/MariaDB use backticks (double quotes are string literals
-/// there unless `ANSI_QUOTES` is set); SQLite/Postgres use the SQL-standard double
-/// quote. Embedded quote chars are doubled either way.
+/// Quote an identifier for the preview `SELECT` so a table name can never break out
+/// of the SQL.
 ///
-/// ClickHouse also uses double quotes but, unlike SQLite/Postgres, honors backslash
-/// escapes inside them, so its backslashes are doubled too; otherwise a table name
-/// ending in `\` escapes the closing quote and breaks out.
+/// A thin pass-through to [`DbKind::quote_ident`], which owns the per-engine rules.
+/// It used to hold its own copy of that match with a `_ =>` double-quote fallback,
+/// and the fallback is what quietly generated `SELECT * FROM "ds"."tbl"` for
+/// BigQuery — invalid GoogleSQL, since `"…"` there is a string literal. Kept as a
+/// named function only because several call sites read better with it.
 pub(crate) fn quote_ident(ident: &str, kind: DbKind) -> String {
-    match kind {
-        DbKind::Mysql => format!("`{}`", ident.replace('`', "``")),
-        DbKind::Clickhouse => {
-            format!("\"{}\"", ident.replace('\\', "\\\\").replace('"', "\"\""))
-        }
-        _ => format!("\"{}\"", ident.replace('"', "\"\"")),
-    }
+    kind.quote_ident(ident)
 }
 
 impl Render for SchemaState {

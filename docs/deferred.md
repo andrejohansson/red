@@ -151,6 +151,23 @@ failure part-way leaves the earlier chunks committed, so a retry appends
 duplicates rather than starting clean. Same fix as above (a session), same
 reason it is deferred.
 
+### The filter bar's seeded `WHERE` text is engine-blind
+
+`crates/red/src/filter.rs`'s `quote_ident` always emits ANSI double quotes,
+whatever the engine. MySQL and BigQuery both read `"col"` as a *string literal*,
+so seeding the filter bar in `WHERE` mode from an `Eq`/`Cmp` filter and pressing
+apply sends SQL they reject.
+
+Nothing RED *applies* is affected: an `Eq`/`Cmp` filter travels to the backend as
+structure and the driver renders it with its own quoting. Only the
+seed-then-re-apply path is wrong, and only the display text is otherwise involved.
+
+This predates BigQuery — it has been wrong for MySQL all along — and it is
+separate work from the schema-tree fix that consolidated the other three UI-side
+quoters onto `DbKind::quote_ident`: correcting it means threading a `DbKind`
+through `filter_tooltip`, `filter_chip_text` and the seeding path, which changes
+several signatures and their call sites.
+
 ### No `health` report, and no BigQuery connection importer
 
 `health` falls through to the trait default, which reports that the engine has

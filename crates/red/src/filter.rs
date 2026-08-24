@@ -1421,6 +1421,18 @@ fn plain_text(value: Option<&Value>) -> String {
 /// Double-quote an identifier for the seeded expression, doubling any embedded
 /// quote. Every engine RED speaks accepts double-quoted identifiers here except
 /// MySQL in its default mode, where the user edits the seed before applying.
+/// ANSI double-quote an identifier for the *displayed* filter expression.
+///
+/// **Engine-blind, and wrong to re-run on MySQL or BigQuery.** Both read `"col"` as
+/// a string literal rather than an identifier, so seeding the bar in `WHERE` mode
+/// and pressing apply sends SQL those engines reject. Everything RED *applies* is
+/// safe — an `Eq`/`Cmp` filter travels as structure and the driver renders it with
+/// its own quoting — so this only bites the seed-then-apply path.
+///
+/// Left as-is deliberately rather than half-fixed: correcting it means threading a
+/// [`DbKind`](red_core::DbKind) through `filter_tooltip`, `filter_chip_text` and the
+/// seeding path, which is a change of its own shape. See the entry in
+/// `docs/deferred.md`.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

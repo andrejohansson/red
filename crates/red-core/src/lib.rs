@@ -151,6 +151,46 @@ impl DbKind {
         }
     }
 
+    /// Quote one identifier for this engine's dialect.
+    ///
+    /// Lives here, and is **exhaustive on purpose**, because the app generates
+    /// runnable SQL in several places that cannot reach a driver — the schema tree's
+    /// "browse this table", the workspace's saved query, the schema-diff script, the
+    /// headless `copy`. Each of those had grown its own copy of this match with a
+    /// `_ =>` ANSI-double-quote fallback, and a wildcard is exactly the wrong shape:
+    /// adding BigQuery silently produced `SELECT * FROM "ds"."tbl"`, which GoogleSQL
+    /// reads as a *string literal* and rejects with `Unexpected string literal`. The
+    /// compiler said nothing, because the wildcard already covered it.
+    ///
+    /// So there is one match, no wildcard, and the next engine added breaks the build
+    /// here until someone decides how it quotes. The drivers keep their own
+    /// quoting behind [`quote_ident`](crate::DbKind) — they are the seam to the
+    /// engine and are already tested against it — but nothing in the UI needs a
+    /// second implementation.
+    ///
+    /// Escaping differs per engine and the differences matter: MySQL and BigQuery
+    /// use backticks where the others use double quotes, ClickHouse honours
+    /// backslash escapes *inside* its quotes (so a name ending in `\` would break
+    /// out), and BigQuery has no escape for a backtick at all — such an identifier
+    /// cannot exist there, so stripping is lossless for anything real.
+    pub fn quote_ident(self, ident: &str) -> String {
+        match self {
+            DbKind::Mysql => format!("`{}`", ident.replace('`', "``")),
+            DbKind::Bigquery => format!("`{}`", ident.replace('`', "")),
+            DbKind::Clickhouse => {
+                format!("\"{}\"", ident.replace('\\', "\\\\").replace('"', "\"\""))
+            }
+            DbKind::Postgres | DbKind::Sqlite => {
+                format!("\"{}\"", ident.replace('"', "\"\""))
+            }
+            // Neither is SQL-shaped, so neither has an identifier to quote and
+            // neither can reach a SQL builder (`write_caps().insert` is false, which
+            // the copy/migrate pickers filter on). The ANSI form is a harmless answer
+            // rather than a meaningful one.
+            DbKind::Redis | DbKind::Mongo => format!("\"{}\"", ident.replace('"', "\"\"")),
+        }
+    }
+
     pub const fn is_file(self) -> bool {
         matches!(self, DbKind::Sqlite)
     }
@@ -3622,6 +3662,50 @@ mod tx_tests {
     fn non_sql_seams_have_no_transactions() {
         assert!(!DbKind::Redis.supports_transactions());
         assert!(!DbKind::Mongo.supports_transactions());
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[test]
+    fn backtick_engines_do_not_get_ansi_double_quotes() {
+        // The reported bug: BigQuery reached a `_ =>` fallback and got
+        // `SELECT * FROM "ds"."tbl"`, which GoogleSQL parses as a string literal --
+        // `Unexpected string literal "ds" at [1:15]`.
+        assert_eq!(DbKind::Bigquery.quote_ident("tbl"), "`tbl`");
+        assert_eq!(DbKind::Mysql.quote_ident("tbl"), "`tbl`");
+        assert_eq!(DbKind::Postgres.quote_ident("tbl"), "\"tbl\"");
+        assert_eq!(DbKind::Sqlite.quote_ident("tbl"), "\"tbl\"");
+        assert_eq!(DbKind::Clickhouse.quote_ident("tbl"), "\"tbl\"");
+    }
+
+    #[test]
+    fn every_engine_escapes_its_own_quote_character() {
+        // A name that could close its own quote is how an identifier breaks out into
+        // executable SQL, so each engine has to neutralise its own delimiter.
+        assert_eq!(DbKind::Mysql.quote_ident("we`ird"), "`we``ird`");
+        assert_eq!(DbKind::Postgres.quote_ident("we\"ird"), "\"we\"\"ird\"");
+        // BigQuery has no escape for a backtick, so such an identifier cannot exist
+        // there; stripping is lossless for any real name and closes the hole.
+        assert_eq!(DbKind::Bigquery.quote_ident("we`ird"), "`weird`");
+        // ClickHouse honours backslash escapes inside double quotes, so a name
+        // ending in `\` would otherwise escape the closing quote.
+        assert_eq!(DbKind::Clickhouse.quote_ident("dir\\"), "\"dir\\\\\"");
+    }
+
+    #[test]
+    fn every_engine_is_covered_without_a_wildcard() {
+        // The point of the consolidation: the match is exhaustive, so this loop is a
+        // reminder rather than a guard -- a new engine fails to compile before it can
+        // fail at runtime. What this does assert is that no engine yields an empty or
+        // unquoted answer, which a careless arm could.
+        for kind in DbKind::all() {
+            let quoted = kind.quote_ident("x");
+            assert_eq!(quoted.len(), 3, "{kind} produced {quoted:?}");
+            assert!(quoted.contains('x'), "{kind} lost the identifier");
+        }
     }
 }
 

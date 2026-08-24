@@ -744,10 +744,12 @@ impl AppState {
         // Quoted for the *left* engine: the script moves the left schema toward the
         // right, so it is the left server that would run it.
         let kind = active.config.kind;
-        let quote = move |ident: &str| match kind {
-            red_core::DbKind::Mysql => format!("`{}`", ident.replace('`', "``")),
-            _ => format!("\"{}\"", ident.replace('"', "\"\"")),
-        };
+        // Delegated rather than matched here: this closure used to carry its own
+        // `_ =>` ANSI fallback, which silently emitted double-quoted identifiers for
+        // any engine it did not name — invalid on BigQuery, where `"…"` is a string
+        // literal. `DbKind::quote_ident` is exhaustive, so a new engine cannot slip
+        // through it.
+        let quote = move |ident: &str| kind.quote_ident(ident);
         let sql = v.delta.to_sql(&v.left, scope, &quote);
         self.new_query(cx);
         let editor = match &self.phase {
