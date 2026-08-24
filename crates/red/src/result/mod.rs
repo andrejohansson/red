@@ -2126,6 +2126,9 @@ impl AppState {
             filter,
             joins: Vec::new(),
             namespace: self.send_namespace(),
+            // A first open is never pre-approved: on a cost-priced engine this is
+            // where the estimate gets taken and the user gets asked.
+            cost_confirmed: false,
         });
         self.start_query_ticker(cx);
         // Seed the tab's watch from the setting, when one is configured. Silent if
@@ -2393,6 +2396,10 @@ impl AppState {
                 filter,
                 joins,
                 namespace: self.send_namespace(),
+                // A re-sort is a different statement, and on a cost-priced engine
+                // genuinely a different scan, so it is priced on its own merits
+                // rather than inheriting the original open's approval.
+                cost_confirmed: false,
             });
             self.start_query_ticker(cx);
         }
@@ -2454,6 +2461,9 @@ impl AppState {
                 filter,
                 joins,
                 namespace: self.send_namespace(),
+                // Like a re-sort: a changed filter is a changed query, so it is
+                // priced again rather than riding the previous approval.
+                cost_confirmed: false,
             });
             self.start_query_ticker(cx);
         }
@@ -2570,6 +2580,35 @@ impl AppState {
         self.apply_reopen_in(session, reopen, cx);
     }
 
+    /// Re-run the result at `epoch` with its cost **already approved** — the confirm
+    /// modal's "Run anyway" (see `DatabaseDriver::precheck_cost`).
+    ///
+    /// Takes an epoch rather than a [`ReopenSpec`] so that type can stay private to
+    /// this module: the caller knows which result the user approved, not how a
+    /// re-open is assembled. It goes through `reopen_spec` rather than re-sending the
+    /// bare SQL because the grid holds the sort, filter and join state — dropping
+    /// that would run a different, cheaper-looking query than the one that was
+    /// priced.
+    ///
+    /// Its own entry point rather than a flag on the shared one, so no ordinary
+    /// re-open can carry the approval by accident.
+    pub(crate) fn rerun_cost_approved(
+        &mut self,
+        session: Option<red_service::SessionId>,
+        epoch: Option<red_service::Epoch>,
+        cx: &mut Context<Self>,
+    ) {
+        // Routed by epoch within the owning connection, like every other late reply.
+        // A grid that has since closed finds no match and this quietly does nothing,
+        // which is right: the approval was for a result nobody is looking at now.
+        let grid = epoch.and_then(|e| {
+            self.conn_for(session)
+                .and_then(|a| a.result_by_epoch(e, cx))
+        });
+        let spec = grid.map(|g| g.update(cx, |g, _| g.reopen_spec()));
+        self.reopen_inner(session, spec, true, cx);
+    }
+
     /// [`apply_reopen`](Self::apply_reopen) against a named connection and its own
     /// tab's namespace.
     ///
@@ -2581,6 +2620,18 @@ impl AppState {
         &mut self,
         session: Option<red_service::SessionId>,
         reopen: Option<ReopenSpec>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reopen_inner(session, reopen, false, cx);
+    }
+
+    /// The shared body of the two re-open entry points; `cost_confirmed` is the only
+    /// thing that differs between them.
+    fn reopen_inner(
+        &mut self,
+        session: Option<red_service::SessionId>,
+        reopen: Option<ReopenSpec>,
+        cost_confirmed: bool,
         cx: &mut Context<Self>,
     ) {
         let Some((sql, epoch, table, sort, filter, joins, old_epoch)) = reopen else {
@@ -2607,6 +2658,7 @@ impl AppState {
                 filter,
                 joins,
                 namespace,
+                cost_confirmed,
             },
         );
         self.start_query_ticker(cx);

@@ -1329,6 +1329,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             break; // shutdown requested mid-fetch
                         }
                     }
+                    // A cost refusal is a question, not a failure, so it gets its own
+                    // event and the UI can offer to run it anyway. `open_cursor`
+                    // prices the statement itself, so this arm only has to classify.
+                    Err(RedError::QueryCostConfirm { bytes, limit }) => emit(
+                        &events,
+                        session_id,
+                        Event::QueryCostConfirm {
+                            sql,
+                            bytes,
+                            limit,
+                            epoch: None,
+                        },
+                    ),
                     Err(err) => emit(&events, session_id, Event::Error(err.to_string())),
                 }
             }
@@ -1411,6 +1424,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 filter,
                 joins,
                 namespace,
+                cost_confirmed,
             } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
@@ -1426,6 +1440,28 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let driver = driver.scoped(namespace.as_deref());
+                // Price the query before anything reads it. On every engine but
+                // BigQuery this is a no-op that costs nothing; there it is a `dryRun`
+                // and the answer may be "ask the user first", in which case the
+                // result is never opened at all. Deliberately here rather than
+                // deeper: the page fetches behind this open must not re-ask, or
+                // scrolling an approved result would prompt on every window.
+                if let Err(e) = driver.precheck_cost(&sql, cost_confirmed).await {
+                    match e {
+                        RedError::QueryCostConfirm { bytes, limit } => emit(
+                            &events,
+                            session_id,
+                            Event::QueryCostConfirm {
+                                sql,
+                                bytes,
+                                limit,
+                                epoch: Some(epoch),
+                            },
+                        ),
+                        other => emit(&events, session_id, Event::Error(other.to_string())),
+                    }
+                    continue;
+                }
                 // A re-open on the same epoch supersedes any prior probe.
                 if let Some(f) = state.inflight.remove(&epoch) {
                     f.abort_all();

@@ -1636,6 +1636,35 @@ pub trait DatabaseDriver: Send + Sync {
     /// `FORMAT JSON`, so no JSON parser enters the layer.
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan>;
 
+    /// Price `sql` before anything runs it, and refuse it if it costs too much.
+    ///
+    /// `Ok(())` means "go ahead", and that is the default: on an engine where
+    /// reading is free there is nothing to price and nothing to ask. BigQuery bills
+    /// by bytes scanned, so its impl runs a `dryRun` and answers one of three ways
+    /// — under the confirmation threshold it returns `Ok(())`, between the
+    /// thresholds it returns [`RedError::QueryCostConfirm`] carrying both numbers,
+    /// and over the hard ceiling it returns a plain [`RedError::Query`] naming the
+    /// cap (see `docs/adr/0004`).
+    ///
+    /// `confirmed` is the user's approval for **this statement**, which skips the
+    /// check entirely. Approval is per statement rather than per session on
+    /// purpose: a connection that waved one expensive query through has not agreed
+    /// to the next one.
+    ///
+    /// Called by the service on the paths a human is waiting on — opening a result,
+    /// running a query — and deliberately *not* on the page fetches behind them, so
+    /// scrolling an already-approved result is never re-gated. Unattended work
+    /// (a transfer, a diff, the CLI) passes `confirmed = true`: there is no dialog
+    /// to answer, and the engine-side hard cap is the guard that needs no human.
+    ///
+    /// A [`DbKind::estimates_query_cost`](red_core::DbKind::estimates_query_cost)
+    /// descriptor says which engines answer this, so the UI can offer a cost
+    /// affordance without holding a driver.
+    async fn precheck_cost(&self, sql: &str, confirmed: bool) -> Result<()> {
+        let _ = (sql, confirmed);
+        Ok(())
+    }
+
     /// Stream `sql`'s result straight to `path` in `format`, row-by-row, never
     /// materializing the whole result. Returns what was written, including
     /// whether the format's own limits stopped it short of the result.

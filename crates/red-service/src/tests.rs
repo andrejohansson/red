@@ -651,6 +651,7 @@ async fn opens_and_pages_result() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -716,6 +717,7 @@ async fn computes_column_stats_for_open_result() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -959,6 +961,7 @@ async fn fk_join_expands_referenced_columns_inline() {
                 select: vec![("name".into(), "tier_id.name".into())],
             }],
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -1066,6 +1069,7 @@ async fn where_filters_on_expanded_fk_column() {
                 select: vec![("name".into(), "tier_id.name".into())],
             }],
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -1140,6 +1144,7 @@ async fn resolves_key_and_serves_runs() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -1344,6 +1349,7 @@ async fn mariadb_keyset_end_to_end() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -1745,6 +1751,7 @@ async fn text_key_jump_falls_back_to_offset() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -1951,6 +1958,7 @@ async fn keeps_two_sessions_warm() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     handle.send_to(
@@ -1963,6 +1971,7 @@ async fn keeps_two_sessions_warm() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
 
@@ -2078,6 +2087,7 @@ async fn copies_result_into_table() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2134,6 +2144,7 @@ async fn copies_result_into_table() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2189,6 +2200,7 @@ async fn copies_result_into_a_new_table() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2266,6 +2278,7 @@ async fn copies_result_into_a_new_table() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2324,6 +2337,7 @@ async fn copy_truncate_insert_refreshes_target() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2372,6 +2386,7 @@ async fn copy_truncate_insert_refreshes_target() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     match next(&mut events).await {
@@ -2419,6 +2434,7 @@ async fn copy_is_byte_exact_for_long_values() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2468,6 +2484,7 @@ async fn copy_is_byte_exact_for_long_values() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2547,6 +2564,7 @@ async fn copies_across_connections() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2595,6 +2613,7 @@ async fn copies_across_connections() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2680,6 +2699,7 @@ async fn migrates_all_tables_into_another_connection() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2696,6 +2716,7 @@ async fn migrates_all_tables_into_another_connection() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(
@@ -2732,6 +2753,7 @@ async fn migrates_all_tables_into_another_connection() {
             filter: None,
             joins: Vec::new(),
             namespace: None,
+            cost_confirmed: false,
         },
     );
     assert!(matches!(

@@ -1144,6 +1144,10 @@ impl DatabaseDriver for BigqueryDriver {
         catalog::object_ddl(self, namespace, name, kind).await
     }
 
+    async fn precheck_cost(&self, sql: &str, confirmed: bool) -> Result<()> {
+        self.gate_cost(sql, confirmed).await
+    }
+
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
         if !analyze {
             // A dry run: BigQuery has no textual `EXPLAIN`, and this honours the

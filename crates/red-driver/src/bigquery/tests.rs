@@ -375,6 +375,35 @@ async fn key_bounds_never_probes_the_engine() {
 }
 
 #[tokio::test]
+async fn precheck_cost_is_the_seam_the_windowed_open_path_uses() {
+    // The gate has to live on `precheck_cost`, not only inside `open_cursor`: the
+    // GUI opens results through `OpenResult` (count + fetch_page), which never calls
+    // `open_cursor` at all, so a gate that only guarded the cursor would never fire
+    // in the app.
+    let bytes = 40u64 * 1024 * 1024 * 1024;
+    let mock = MockApi::start(vec![format!(
+        r#"{{"statistics":{{"totalBytesProcessed":"{bytes}"}}}}"#
+    )])
+    .await;
+    let driver = driver_at(&mock.base_url, "ds");
+    match driver.precheck_cost("SELECT * FROM huge", false).await {
+        Err(RedError::QueryCostConfirm { bytes: b, limit }) => {
+            assert_eq!(b, bytes);
+            assert_eq!(limit, DEFAULT_COST_CONFIRM_BYTES);
+        }
+        other => panic!("expected a cost confirmation, got {other:?}"),
+    }
+    // And an approved re-send spends no dry run at all.
+    assert!(
+        driver
+            .precheck_cost("SELECT * FROM huge", true)
+            .await
+            .is_ok()
+    );
+    assert_eq!(mock.hit_count(), 1, "the approval must not re-price");
+}
+
+#[tokio::test]
 async fn a_query_over_the_confirm_threshold_is_not_run() {
     // A dry run reports 40 GiB, which is over the 20 GiB confirm default and under
     // the 100 GiB hard cap: the query must come back as a decision, not a failure,

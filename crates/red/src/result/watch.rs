@@ -410,6 +410,12 @@ impl AppState {
                     filter,
                     joins,
                     namespace,
+                    // A watch tick has no one to ask: it fires on a timer, and a
+                    // dialog per tick would either block the watch forever or train
+                    // the user to dismiss it. The engine-side hard cap still applies
+                    // to every tick, which is the guard that needs no human present —
+                    // the same reasoning a transfer and the CLI use.
+                    cost_confirmed: true,
                 },
             );
         }

@@ -1204,6 +1204,25 @@ pub(crate) enum PendingWrite {
         sql: String,
         assessment: red_core::sql::Assessment,
     },
+    /// A query the engine priced as expensive, held for approval rather than run
+    /// (see `DatabaseDriver::precheck_cost`).
+    ///
+    /// The one member of this enum that is not a *write*. It rides here anyway
+    /// because the question is the same shape — "this does something you may not
+    /// want; proceed?" — and it inherits the whole confirm posture for free: one
+    /// modal, the statement shown verbatim, the owning connection captured at raise
+    /// time rather than at click time. What it deliberately does **not** inherit is
+    /// the danger styling or the "don't ask again" opt-out: an expensive read is not
+    /// destructive, and a cost guard that can be permanently silenced is not a guard.
+    CostlyQuery {
+        sql: String,
+        /// What the engine estimates the query will scan.
+        bytes: u64,
+        /// The threshold it crossed.
+        limit: u64,
+        /// The result to re-open on approval; `None` for a non-windowed query.
+        epoch: Option<red_service::Epoch>,
+    },
     /// A graded multi-statement script, dispatched via `send_script` on confirm.
     /// Separate from [`EditorSql`](Self::EditorSql) because the two run under
     /// different contracts: one statement in a transaction versus N statements

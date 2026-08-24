@@ -1792,6 +1792,27 @@ impl AppState {
                     self.on_ssh_host_unknown(host, port, fingerprint, key, cx);
                 }
             }
+            Event::QueryCostConfirm {
+                sql,
+                bytes,
+                limit,
+                epoch,
+            } => {
+                // Not an error path: the query was priced, not attempted, and the
+                // grid is waiting on a decision rather than on rows. Clearing the
+                // running state matters as much as raising the modal -- a result left
+                // spinning behind a dialog reads as a hung query.
+                self.on_result_error(session, "waiting for cost approval", cx);
+                if let Some(pending) = self.pending_confirm(PendingWrite::CostlyQuery {
+                    sql,
+                    bytes,
+                    limit,
+                    epoch,
+                }) {
+                    self.confirm_exec = Some(pending);
+                }
+                cx.notify();
+            }
             Event::Error(message) => {
                 // Log the full text to stderr (RUST_LOG) too. The toast carries it
                 // as a selectable, expandable detail body, so a long backend error
@@ -2621,6 +2642,14 @@ impl AppState {
         };
         match write {
             Some(PendingWrite::EditorSql { sql, .. }) => self.execute_sql_on(owner, sql, cx),
+            // Re-run the priced query with the approval attached, so the engine does
+            // not stop to ask a second time. The grid's own `reopen_spec` supplies the
+            // sort/filter/join state, which is why the approval re-opens the *result*
+            // rather than re-sending the bare SQL: dropping that state would run a
+            // different (and cheaper-looking) query than the one that was priced.
+            Some(PendingWrite::CostlyQuery { epoch, .. }) => {
+                self.rerun_cost_approved(Some(owner), epoch, cx)
+            }
             Some(PendingWrite::Script { statements, .. }) => self.send_script(statements, cx),
             Some(PendingWrite::Batch {
                 ops,

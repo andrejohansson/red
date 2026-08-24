@@ -1997,6 +1997,22 @@ impl AppState {
                     .join(";\n");
                 ("Submit changes", prose, combined, "Submit")
             }
+            // The only arm here that is not about changing data. It says what the
+            // query costs, because that is the fact the user is being asked to weigh
+            // — "are you sure" would teach nothing, exactly as with the risk card.
+            PendingWrite::CostlyQuery {
+                sql, bytes, limit, ..
+            } => (
+                "This query is expensive",
+                format!(
+                    "It will scan about {}, over the {} you asked to be warned about. \
+                     Nothing has run yet.",
+                    red_core::human_bytes(*bytes),
+                    red_core::human_bytes(*limit)
+                ),
+                sql.clone(),
+                "Run anyway",
+            ),
             PendingWrite::Import { prose, preview, .. } => {
                 ("Confirm import", prose.clone(), preview.clone(), "Import")
             }
@@ -2132,9 +2148,16 @@ impl AppState {
                         ),
                 );
         } else {
+            // An expensive read is not destructive, so it does not wear the danger
+            // styling: reserving red for "this changes or destroys data" is what keeps
+            // red meaning something.
+            let run_variant = match &pending {
+                PendingWrite::CostlyQuery { .. } => ButtonVariant::Primary,
+                _ => ButtonVariant::Danger,
+            };
             footer = footer.child(
                 Button::new("confirm-run", run_label)
-                    .variant(ButtonVariant::Danger)
+                    .variant(run_variant)
                     // Stays disabled until the object's name has been typed, when the
                     // grade called for that. `confirm_destructive` re-checks, so this
                     // is the affordance rather than the guarantee.

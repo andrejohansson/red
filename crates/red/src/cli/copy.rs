@@ -581,6 +581,9 @@ fn open_source(
             // The CLI has no tab context: unqualified names resolve against
             // whatever the saved connection dialled, exactly as before.
             namespace: None,
+            // Headless: no dialog exists to answer a cost estimate, so only the
+            // engine-side hard cap guards this.
+            cost_confirmed: true,
         },
     );
     loop {

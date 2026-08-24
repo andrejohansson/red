@@ -289,6 +289,11 @@ pub enum Command {
         /// means "whatever the connection dialled". Stored on the open result, so
         /// every later page/seek/stat fetch for this epoch binds the same one.
         namespace: Option<String>,
+        /// The user has already approved this query's cost, so the cost precheck is
+        /// skipped (see `DatabaseDriver::precheck_cost`). Set only on the *re-send*
+        /// that follows an approved [`Event::QueryCostConfirm`]; approval belongs to
+        /// one statement, never to the session.
+        cost_confirmed: bool,
     },
     /// Fetch one random-access page of an open result (grid load-on-scroll).
     /// `epoch` selects which open result; an unknown epoch is ignored (the tab
@@ -2419,6 +2424,21 @@ pub enum Event {
     AiAgentAuthStatus {
         agent_id: String,
         status: AiAuthStatus,
+    },
+    /// A query was priced before running and costs more than the confirmation
+    /// threshold, so it was **not** run (see `DatabaseDriver::precheck_cost`).
+    ///
+    /// Its own event rather than an [`Error`](Self::Error) because nothing is wrong:
+    /// the answer the user owes is a decision. `sql` and `epoch` ride along so the
+    /// UI can re-send exactly the request it stopped, with the approval set.
+    QueryCostConfirm {
+        sql: String,
+        /// What the engine estimates the query will scan.
+        bytes: u64,
+        /// The threshold it crossed, so the dialog can say how far over it is.
+        limit: u64,
+        /// The result this belonged to, or `None` for a non-windowed query.
+        epoch: Option<Epoch>,
     },
     Error(String),
 }
