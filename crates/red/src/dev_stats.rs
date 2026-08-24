@@ -35,7 +35,9 @@ pub struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
+        // SAFETY: the caller of `GlobalAlloc::alloc` guarantees `layout` is valid
+        // and non-zero-sized; we forward it unchanged to the system allocator.
+        let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
@@ -44,12 +46,16 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        // SAFETY: the caller guarantees `ptr` came from this allocator with the
+        // same `layout`, which is exactly what the system allocator requires.
+        unsafe { System.dealloc(ptr, layout) };
         LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = System.realloc(ptr, layout, new_size);
+        // SAFETY: the caller guarantees `ptr`/`layout` describe a live block from
+        // this allocator and that `new_size` is a valid size for `layout`'s align.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             // Track the net change rather than alloc/free pair, so the total stays
@@ -116,7 +122,7 @@ pub fn rss_bytes() -> Option<usize> {
     const MACH_TASK_BASIC_INFO: c_uint = 20;
     const KERN_SUCCESS: KernReturn = 0;
 
-    extern "C" {
+    unsafe extern "C" {
         static mach_task_self_: MachPort;
         fn task_info(
             target_task: MachPort,
@@ -146,7 +152,7 @@ pub fn rss_bytes() -> Option<usize> {
 #[cfg(target_os = "linux")]
 pub fn rss_bytes() -> Option<usize> {
     use std::os::raw::{c_int, c_long};
-    extern "C" {
+    unsafe extern "C" {
         fn sysconf(name: c_int) -> c_long;
     }
     const SC_PAGESIZE: c_int = 30;
