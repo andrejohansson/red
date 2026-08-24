@@ -109,6 +109,61 @@ impl MockApi {
     }
 }
 
+/// A mock that chooses its reply by matching a substring of the request line,
+/// rather than by call order.
+///
+/// The catalog paths span several endpoints and fire some of them concurrently, so
+/// an order-indexed mock would be testing the scheduler. `routes` are tried in
+/// order; the first whose pattern appears in the request line wins, and an
+/// unmatched request gets `404` so a test notices a call it did not expect instead
+/// of silently receiving someone else's fixture.
+async fn start_routed(routes: Vec<(&'static str, u16, String)>) -> MockApi {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (task_seen, task_hits) = (Arc::clone(&seen), Arc::clone(&hits));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (seen, hits) = (Arc::clone(&task_seen), Arc::clone(&task_hits));
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let Ok(n) = socket.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = request.lines().next().unwrap_or("").to_string();
+                seen.lock().await.push(line.clone());
+                hits.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = routes
+                    .iter()
+                    .find(|(pattern, _, _)| line.contains(pattern))
+                    .map(|(_, status, body)| (*status, body.clone()))
+                    .unwrap_or((404, r#"{"error":{"message":"unrouted"}}"#.to_string()));
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    MockApi {
+        base_url: format!("http://127.0.0.1:{port}"),
+        seen,
+        hits,
+    }
+}
+
 /// A `jobs.insert` reply.
 fn job_response(id: &str) -> String {
     format!(
@@ -372,6 +427,250 @@ async fn key_bounds_never_probes_the_engine() {
         .expect("key_bounds");
     assert!(bounds.is_none());
     assert_eq!(mock.hit_count(), 0, "it must not talk to BigQuery at all");
+}
+
+// ------------------------------------------------------------ catalog over REST
+
+#[tokio::test]
+async fn the_schema_tree_is_read_over_rest_not_project_wide_information_schema() {
+    // The bug this pins: reading the tree from
+    // `region-x.INFORMATION_SCHEMA.TABLES` needs `bigquery.tables.list` across the
+    // whole *project*, so a role granted access to specific datasets -- the normal
+    // shape of BigQuery access -- got "Access Denied ... to query system entity" and
+    // could not load a schema tree at all, for a database it can query fine.
+    let mock = start_routed(vec![
+        (
+            "/datasets?",
+            200,
+            r#"{"datasets":[
+                {"datasetReference":{"datasetId":"analytics"}},
+                {"datasetReference":{"datasetId":"staging"}}]}"#
+                .to_string(),
+        ),
+        (
+            "/datasets/analytics/tables",
+            200,
+            r#"{"tables":[
+                {"tableReference":{"tableId":"events"},"type":"TABLE"},
+                {"tableReference":{"tableId":"events_view"},"type":"VIEW"},
+                {"tableReference":{"tableId":"rollup"},"type":"MATERIALIZED_VIEW"}]}"#
+                .to_string(),
+        ),
+        (
+            "/datasets/staging/tables",
+            200,
+            r#"{"tables":[{"tableReference":{"tableId":"raw"},"type":"EXTERNAL"}]}"#.to_string(),
+        ),
+    ])
+    .await;
+    let driver = driver_at(&mock.base_url, "analytics");
+    let schemas = driver.list_objects().await.expect("schema tree");
+
+    assert_eq!(
+        schemas.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec!["analytics", "staging"]
+    );
+    let analytics = &schemas[0];
+    assert_eq!(analytics.objects.len(), 3);
+    assert_eq!(analytics.objects[0].kind, ObjectKind::Table);
+    assert_eq!(analytics.objects[1].kind, ObjectKind::View);
+    // The REST spelling is `MATERIALIZED_VIEW`; INFORMATION_SCHEMA says
+    // `MATERIALIZED VIEW`. Both have to map, or the kind silently degrades to Table.
+    assert_eq!(analytics.objects[2].kind, ObjectKind::MaterializedView);
+    // An EXTERNAL table is still a table you can select from.
+    assert_eq!(schemas[1].objects[0].kind, ObjectKind::Table);
+
+    let requests = mock.requests().await;
+    assert!(
+        !requests.iter().any(|r| r.contains("INFORMATION_SCHEMA")),
+        "the tree must not need the project-wide view: {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains("POST")),
+        "and must create no query job at all: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_role_that_cannot_enumerate_datasets_still_sees_its_bound_one() {
+    // The least-privilege case: granted one dataset and nothing at project level, so
+    // `datasets.list` is refused. That must degrade to "show the dataset you're
+    // connected to", not to an empty tree.
+    let mock = start_routed(vec![
+        (
+            "/datasets?",
+            403,
+            r#"{"error":{"message":"Permission bigquery.datasets.list denied"}}"#.to_string(),
+        ),
+        (
+            "/datasets/analytics/tables",
+            200,
+            r#"{"tables":[{"tableReference":{"tableId":"events"},"type":"TABLE"}]}"#.to_string(),
+        ),
+    ])
+    .await;
+    let driver = driver_at(&mock.base_url, "analytics");
+    let schemas = driver.list_objects().await.expect("schema tree");
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].name, "analytics");
+    assert_eq!(schemas[0].objects.len(), 1);
+}
+
+#[tokio::test]
+async fn a_dataset_whose_tables_are_unreadable_still_draws_empty() {
+    // Keeping the node is what shows the user *which* dataset needs a grant; hiding
+    // it would present a project that looks smaller than it is.
+    let mock = start_routed(vec![
+        (
+            "/datasets?",
+            200,
+            r#"{"datasets":[{"datasetReference":{"datasetId":"locked"}}]}"#.to_string(),
+        ),
+        (
+            "/datasets/locked/tables",
+            403,
+            r#"{"error":{"message":"denied"}}"#.to_string(),
+        ),
+    ])
+    .await;
+    let driver = driver_at(&mock.base_url, "");
+    let schemas = driver.list_objects().await.expect("schema tree");
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].name, "locked");
+    assert!(schemas[0].objects.is_empty());
+}
+
+#[tokio::test]
+async fn describe_table_reads_tables_get_and_reconstructs_nested_types() {
+    // `tables.get` needs only `bigquery.tables.get` on the one table, and unlike
+    // INFORMATION_SCHEMA.COLUMNS it carries the field `mode` and nested `fields`.
+    let mock = start_routed(vec![(
+        "/datasets/analytics/tables/events",
+        200,
+        r#"{"schema":{"fields":[
+            {"name":"id","type":"INTEGER","mode":"REQUIRED"},
+            {"name":"tags","type":"STRING","mode":"REPEATED"},
+            {"name":"note","type":"STRING"},
+            {"name":"meta","type":"RECORD","mode":"REPEATED","fields":[
+                {"name":"k","type":"STRING"},
+                {"name":"v","type":"INTEGER"}]},
+            {"name":"created","type":"TIMESTAMP","defaultValueExpression":"CURRENT_TIMESTAMP()"}
+        ]}}"#
+            .to_string(),
+    )])
+    .await;
+    let driver = driver_at(&mock.base_url, "analytics");
+    let detail = driver
+        .describe_table("analytics", "events")
+        .await
+        .expect("detail");
+
+    let by_name = |n: &str| {
+        detail
+            .columns
+            .iter()
+            .find(|c| c.name == n)
+            .unwrap_or_else(|| panic!("no column {n}"))
+    };
+    // REQUIRED is BigQuery's NOT NULL; REPEATED is nullable (an empty array is a
+    // legal value), so reading it as NOT NULL would misreport the column.
+    assert!(by_name("id").not_null);
+    assert!(!by_name("tags").not_null);
+    assert!(!by_name("note").not_null);
+    assert_eq!(by_name("tags").type_name.as_deref(), Some("ARRAY<STRING>"));
+    // A bare `RECORD` tells the user nothing about what is inside it.
+    assert_eq!(
+        by_name("meta").type_name.as_deref(),
+        Some("ARRAY<STRUCT<k STRING, v INT64>>")
+    );
+    assert_eq!(
+        by_name("created").default.as_deref(),
+        Some("CURRENT_TIMESTAMP()")
+    );
+    // No primary key is reported, and the failed constraint probe must not fail the
+    // whole describe: a key is a badge, not a prerequisite.
+    assert!(detail.columns.iter().all(|c| !c.primary_key));
+}
+
+#[tokio::test]
+async fn listing_follows_page_tokens_so_the_tree_is_not_truncated() {
+    // Both `datasets.list` and `tables.list` default to 50 items. Reading one page
+    // would draw a silently short tree -- which reads as "those tables don't exist".
+    let mock = start_routed(vec![
+        (
+            "pageToken=more",
+            200,
+            r#"{"tables":[{"tableReference":{"tableId":"b"},"type":"TABLE"}]}"#.to_string(),
+        ),
+        (
+            "/datasets/ds/tables",
+            200,
+            r#"{"tables":[{"tableReference":{"tableId":"a"},"type":"TABLE"}],
+                "nextPageToken":"more"}"#
+                .to_string(),
+        ),
+        ("/datasets?", 200, r#"{"datasets":[]}"#.to_string()),
+    ])
+    .await;
+    let driver = driver_at(&mock.base_url, "ds");
+    let schemas = driver.list_objects().await.expect("schema tree");
+    assert_eq!(
+        schemas[0]
+            .objects
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"],
+        "both pages must be collected"
+    );
+}
+
+#[tokio::test]
+async fn routines_are_listed_per_dataset_and_filtered_by_kind() {
+    let mock = start_routed(vec![(
+        "/datasets/ds/routines",
+        200,
+        r#"{"routines":[
+            {"routineReference":{"routineId":"do_thing"},"routineType":"PROCEDURE"},
+            {"routineReference":{"routineId":"as_text"},"routineType":"SCALAR_FUNCTION"},
+            {"routineReference":{"routineId":"rows_of"},"routineType":"TABLE_VALUED_FUNCTION"}]}"#
+            .to_string(),
+    )])
+    .await;
+    let driver = driver_at(&mock.base_url, "ds");
+
+    let procs = driver
+        .list_object_group("ds", ObjectKind::Procedure)
+        .await
+        .expect("procedures");
+    assert_eq!(
+        procs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+        vec!["do_thing"]
+    );
+    // A table-valued function is still a function: RED has no narrower kind, and
+    // dropping it would hide a routine the user can call.
+    let funcs = driver
+        .list_object_group("ds", ObjectKind::Function)
+        .await
+        .expect("functions");
+    assert_eq!(
+        funcs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+        vec!["as_text", "rows_of"]
+    );
+}
+
+#[tokio::test]
+async fn ping_probes_the_bound_dataset_rather_than_the_project() {
+    // A role that can read one dataset but not enumerate the project's must still
+    // connect, so the liveness probe asks about the dataset it was given.
+    let mock = start_routed(vec![("/datasets/analytics", 200, "{}".to_string())]).await;
+    let driver = driver_at(&mock.base_url, "analytics");
+    driver.ping().await.expect("ping");
+    let requests = mock.requests().await;
+    assert!(
+        requests[0].contains("/datasets/analytics"),
+        "should probe the dataset, not the list: {requests:?}"
+    );
 }
 
 #[tokio::test]

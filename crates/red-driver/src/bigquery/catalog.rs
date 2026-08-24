@@ -1,15 +1,25 @@
 //! BigQuery introspection, the Server panel, and `EXPLAIN ANALYZE`.
 //!
-//! Everything here reads `INFORMATION_SCHEMA`, and the important structural note is
-//! *which* `INFORMATION_SCHEMA`. BigQuery exposes these views at two scopes: per
-//! dataset (`` `my_dataset`.INFORMATION_SCHEMA.TABLES ``) and per region
-//! (`` `region-us`.INFORMATION_SCHEMA.TABLES ``, covering every dataset in the
-//! project). The region scope is what keeps [`list_objects`] honest about its
-//! cheapness contract — one query for the whole connection rather than one per
-//! dataset — and it is the reason the driver bothers to learn its location.
+//! The structural thing to know here is that BigQuery exposes its metadata **two
+//! ways**, and which one a call uses is a question about *privileges*, not speed:
 //!
-//! Catalog reads are metadata-only and bill no bytes, so they are the one part of
-//! this driver that costs nothing to repeat.
+//! - **REST metadata endpoints** (`datasets.list`, `tables.list`, `tables.get`,
+//!   `routines.list`) need only per-dataset permissions and create no query job.
+//!   The schema tree and [`describe_table`] use these.
+//! - **`INFORMATION_SCHEMA` views**, at either dataset or region scope. The region
+//!   scope answers the whole project in one query, which made it the obvious first
+//!   choice for [`list_objects`] — and it was wrong: querying it needs
+//!   `bigquery.tables.list` and `bigquery.routines.list` across the entire project,
+//!   so a role granted a few specific datasets (the ordinary shape of BigQuery
+//!   access) is refused, and the tree would not load at all for a database it can
+//!   query perfectly. The views are now used only where nothing else answers: the
+//!   declared primary key, an object's `ddl` text, and the job history behind the
+//!   Server panel.
+//!
+//! Catalog reads bill no bytes either way, so this is the one part of the driver
+//! that costs nothing to repeat. The `INFORMATION_SCHEMA` ones still cost a *job*,
+//! which is why the REST path is preferred wherever it can answer, and why every
+//! view-backed read here degrades rather than failing its caller.
 
 use red_core::server::{MetricGroup, MetricValue, ServerMetric, ServerSnapshot};
 use red_core::{
@@ -55,59 +65,125 @@ fn number(row: &[Value], i: usize) -> u64 {
     }
 }
 
-/// The schema-tree skeleton: every dataset in the project with its relations.
+/// The schema-tree skeleton: the datasets this connection can see, each with its
+/// relations.
 ///
-/// Two region-scoped reads, not one per dataset: `SCHEMATA` so a dataset with no
-/// tables still draws (an empty dataset is real, and omitting it would make the
-/// tree disagree with the console), and `TABLES` for the relations themselves.
+/// **Read over REST (`datasets.list` + `tables.list`), not over
+/// `INFORMATION_SCHEMA`**, and that choice is about *permissions* rather than
+/// speed. The region-scoped `` `region-x`.INFORMATION_SCHEMA.TABLES `` view answers
+/// the whole project in one query, which is why it was the obvious first choice —
+/// but querying it requires `bigquery.tables.list` and `bigquery.routines.list`
+/// across the project, so a role granted access to a few specific datasets is
+/// refused outright:
+///
+/// ```text
+/// Access Denied: Table p:region-europe-north1.INFORMATION_SCHEMA.TABLES:
+/// User does not have the required permissions (…) to query system entity
+/// ```
+///
+/// Dataset-scoped grants are the normal shape of BigQuery access, so a schema tree
+/// that needs project-wide privileges is a schema tree most users cannot load. The
+/// REST endpoints need only `bigquery.tables.list` **on each dataset**, which is
+/// exactly what the console and every other client use — and they create no query
+/// job at all, where an `INFORMATION_SCHEMA` read does.
+///
+/// The cost is one round trip per dataset instead of one query. They are metadata
+/// calls, not scans, and they run concurrently, so this stays inside
+/// `list_objects`' cheapness contract: names and kinds only, nothing per-table.
 pub(super) async fn list_objects(driver: &BigqueryDriver) -> Result<Vec<SchemaMeta>> {
-    let region = region(driver).await;
-    let datasets = driver
-        .catalog_rows(&format!(
-            "SELECT schema_name FROM {region}.INFORMATION_SCHEMA.SCHEMATA ORDER BY schema_name"
-        ))
-        .await?;
-    let tables = driver
-        .catalog_rows(&format!(
-            "SELECT table_schema, table_name, table_type \
-             FROM {region}.INFORMATION_SCHEMA.TABLES \
-             ORDER BY table_schema, table_name"
-        ))
-        .await?;
-
-    let mut schemas: Vec<SchemaMeta> = datasets
-        .rows
-        .iter()
-        .map(|r| SchemaMeta {
-            name: text(r, 0),
-            objects: Vec::new(),
+    let names = dataset_names(driver).await?;
+    // Concurrent rather than sequential: the calls are independent and a project
+    // with thirty datasets should not take thirty round trips end to end.
+    let listings = futures_util::future::join_all(
+        names
+            .iter()
+            .map(|name| async move { (name.clone(), dataset_tables(driver, name).await) }),
+    )
+    .await;
+    Ok(listings
+        .into_iter()
+        .map(|(name, objects)| SchemaMeta {
+            name,
+            // A dataset whose tables could not be listed still draws, empty. It is a
+            // dataset the user really has (it came back from `datasets.list`), and
+            // dropping it would hide the thing they need to fix the grant on.
+            objects: objects.unwrap_or_default(),
         })
-        .collect();
-    for row in &tables.rows {
-        let (schema, name, kind) = (text(row, 0), text(row, 1), table_kind(&text(row, 2)));
-        let Some(target) = schemas.iter_mut().find(|s| s.name == schema) else {
-            // A table in a dataset `SCHEMATA` did not list (a race, or a permission
-            // that covers the table but not the dataset listing): keep the object
-            // rather than dropping it, and grow the group for it.
-            schemas.push(SchemaMeta {
-                name: schema,
-                objects: vec![ObjectMeta { name, kind }],
-            });
-            continue;
-        };
-        target.objects.push(ObjectMeta { name, kind });
-    }
-    Ok(schemas)
+        .collect())
 }
 
-/// Map `TABLES.table_type` onto RED's kinds. BigQuery reports `BASE TABLE`,
-/// `VIEW`, `MATERIALIZED VIEW`, `EXTERNAL`, `SNAPSHOT` and `CLONE`; the last four
-/// are all *tables you can select from*, so they draw as tables rather than being
-/// hidden for lacking a dedicated kind.
+/// The datasets to draw: everything `datasets.list` reports, plus the connection's
+/// own bound dataset.
+///
+/// The union matters at both ends. A role with no project-level grant may be unable
+/// to *enumerate* datasets while still reading the one it was given, so a failed or
+/// empty listing falls back to the bound dataset rather than yielding an empty tree.
+/// And a bound dataset missing from the listing is still browsable, so it is added
+/// rather than hidden.
+async fn dataset_names(driver: &BigqueryDriver) -> Result<Vec<String>> {
+    let bound = driver.namespace().to_string();
+    let listed = driver
+        .list_items(&format!("projects/{}/datasets", driver.project), "datasets")
+        .await;
+    let mut names: Vec<String> = match listed {
+        Ok(items) => items
+            .iter()
+            .filter_map(|d| {
+                d.pointer("/datasetReference/datasetId")
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            })
+            .collect(),
+        Err(e) => {
+            // Not fatal, and worth a line: this is the "granted one dataset, not the
+            // project" case, where the tree is legitimately just that dataset.
+            tracing::info!("bigquery: cannot list datasets ({e}); showing the bound one only");
+            Vec::new()
+        }
+    };
+    if !bound.is_empty() && !names.contains(&bound) {
+        names.push(bound);
+    }
+    names.sort();
+    if names.is_empty() {
+        return Err(RedError::Query(
+            "no datasets are visible to this connection: bind one on the connection, \
+             or grant the account access to a dataset in this project"
+                .to_string(),
+        ));
+    }
+    Ok(names)
+}
+
+/// One dataset's relations, by name and kind.
+async fn dataset_tables(driver: &BigqueryDriver, dataset: &str) -> Result<Vec<ObjectMeta>> {
+    let path = format!("projects/{}/datasets/{dataset}/tables", driver.project);
+    Ok(driver
+        .list_items(&path, "tables")
+        .await?
+        .iter()
+        .filter_map(|t| {
+            let name = t
+                .pointer("/tableReference/tableId")
+                .and_then(Json::as_str)?
+                .to_string();
+            let kind = table_kind(t.get("type").and_then(Json::as_str).unwrap_or(""));
+            Some(ObjectMeta { name, kind })
+        })
+        .collect())
+}
+
+/// Map a table's reported type onto RED's kinds.
+///
+/// Covers both spellings, because the two sources disagree: REST reports `TABLE`,
+/// `VIEW`, `MATERIALIZED_VIEW`, `EXTERNAL`, `SNAPSHOT`; `INFORMATION_SCHEMA` says
+/// `BASE TABLE` and `MATERIALIZED VIEW` (space, not underscore). Everything that is
+/// not a view is drawn as a table, since all of them are things you can select
+/// from and RED has no narrower kind for a snapshot or an external table.
 fn table_kind(table_type: &str) -> ObjectKind {
     match table_type.to_ascii_uppercase().as_str() {
         "VIEW" => ObjectKind::View,
-        "MATERIALIZED VIEW" => ObjectKind::MaterializedView,
+        "MATERIALIZED_VIEW" | "MATERIALIZED VIEW" => ObjectKind::MaterializedView,
         _ => ObjectKind::Table,
     }
 }
@@ -128,20 +204,111 @@ pub(super) async fn describe_table(
     } else {
         schema.to_string()
     };
-    let qualified = format!("{}.{}", bq_quote(&driver.project), bq_quote(&dataset));
-    // Literals rather than parameters: a catalog read is built from identifiers RED
-    // already holds, and the table name is escaped for the one context it enters.
+    // `tables.get` over REST, for the same permission reason `list_objects` uses
+    // `tables.list`: it needs only `bigquery.tables.get` on this one table, where an
+    // `INFORMATION_SCHEMA.COLUMNS` read needs the dataset-wide view privilege *and*
+    // spends a query job. It also carries more than the view does — the `mode` on
+    // every field, and the nested `fields` of a `RECORD`.
+    let path = format!(
+        "projects/{}/datasets/{dataset}/tables/{table}",
+        driver.project
+    );
+    let json = driver.get(&path, &[]).await?;
+    let fields = json
+        .pointer("/schema/fields")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    // The declared primary key, which BigQuery reports only through
+    // `INFORMATION_SCHEMA` (there is no REST field for it). Best-effort and
+    // deliberately non-fatal: these views are newer than the rest, they cost a query
+    // job, and a role may not read them. A table with no reported key still browses;
+    // it just carries no key badge. It also drives nothing here — see
+    // `DbKind::supports_keyset_paging` and `edit_caps`.
+    let key_names = primary_key(driver, &dataset, table).await;
+
+    Ok(TableDetail {
+        columns: fields
+            .iter()
+            .filter_map(|f| {
+                let name = f.get("name").and_then(Json::as_str)?.to_string();
+                let mode = f.get("mode").and_then(Json::as_str).unwrap_or("NULLABLE");
+                Some(ColumnMeta {
+                    // `REQUIRED` is BigQuery's NOT NULL; `NULLABLE` and `REPEATED`
+                    // are both nullable (an empty array is a legal repeated value).
+                    not_null: mode.eq_ignore_ascii_case("REQUIRED"),
+                    primary_key: key_names.contains(&name),
+                    type_name: Some(field_type(f)),
+                    default: f
+                        .get("defaultValueExpression")
+                        .and_then(Json::as_str)
+                        .map(str::to_string),
+                    // BigQuery has no identity or sequence column: a generated id is
+                    // an explicit `GENERATE_UUID()` default, not auto-numbering.
+                    auto_increment: false,
+                    name,
+                })
+            })
+            .collect(),
+        // Secondary indexes do not exist on BigQuery (only search indexes), and
+        // foreign keys are reported through `foreign_keys` rather than per table.
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+    })
+}
+
+/// A schema field's type as RED reports it, reconstructing the shapes BigQuery
+/// splits across `type` and `mode`: a repeated field becomes `ARRAY<…>` and a
+/// record spells out its members, so the tree shows `ARRAY<STRUCT<id INT64>>`
+/// rather than a bare `RECORD` that says nothing about what is inside.
+fn field_type(field: &Json) -> String {
+    // Folded onto the GoogleSQL spelling first, because REST answers with the legacy
+    // names and `INTEGER` there means INT64 — see `value::base_type`. Reporting the
+    // raw name would have a migration create a 32-bit column for a 64-bit one.
+    let raw = field.get("type").and_then(Json::as_str).unwrap_or("STRING");
+    let base = super::value::base_type(raw);
+    let inner = match base {
+        "STRUCT" => {
+            let members: Vec<String> = field
+                .get("fields")
+                .and_then(Json::as_array)
+                .map(|fs| {
+                    fs.iter()
+                        .filter_map(|f| {
+                            let name = f.get("name").and_then(Json::as_str)?;
+                            Some(format!("{name} {}", field_type(f)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if members.is_empty() {
+                "STRUCT".to_string()
+            } else {
+                format!("STRUCT<{}>", members.join(", "))
+            }
+        }
+        _ => base.to_string(),
+    };
+    if field
+        .get("mode")
+        .and_then(Json::as_str)
+        .is_some_and(|m| m.eq_ignore_ascii_case("REPEATED"))
+    {
+        format!("ARRAY<{inner}>")
+    } else {
+        inner
+    }
+}
+
+/// The columns of `table`'s declared `PRIMARY KEY`, or empty when it has none, the
+/// views are unreadable, or the query is refused. Never an error: this is a badge,
+/// not a prerequisite.
+async fn primary_key(driver: &BigqueryDriver, dataset: &str, table: &str) -> Vec<String> {
+    let qualified = format!("{}.{}", bq_quote(&driver.project), bq_quote(dataset));
+    // A literal rather than a parameter: a catalog read is built from identifiers RED
+    // already holds, escaped for the one context it enters.
     let literal = table.replace('\'', "\\'");
-    let columns = driver
-        .catalog_rows(&format!(
-            "SELECT column_name, data_type, is_nullable, column_default \
-             FROM {qualified}.INFORMATION_SCHEMA.COLUMNS \
-             WHERE table_name = '{literal}' ORDER BY ordinal_position"
-        ))
-        .await?;
-    // A table with no declared primary key is the norm here, and the join through
-    // TABLE_CONSTRAINTS is what tells a PRIMARY KEY from a FOREIGN KEY constraint.
-    let keys = driver
+    let rows = driver
         .catalog_rows(&format!(
             "SELECT k.column_name \
              FROM {qualified}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k \
@@ -152,35 +319,8 @@ pub(super) async fn describe_table(
              ORDER BY k.ordinal_position"
         ))
         .await
-        // Not fatal: these views are newer than the rest of INFORMATION_SCHEMA and a
-        // role may not be able to read them. A table without a reported key still
-        // browses; it simply has no key badge.
         .unwrap_or_default();
-    let key_names: Vec<String> = keys.rows.iter().map(|r| text(r, 0)).collect();
-
-    Ok(TableDetail {
-        columns: columns
-            .rows
-            .iter()
-            .map(|r| {
-                let name = text(r, 0);
-                ColumnMeta {
-                    not_null: text(r, 2).eq_ignore_ascii_case("NO"),
-                    primary_key: key_names.contains(&name),
-                    type_name: Some(text(r, 1)).filter(|t| !t.is_empty()),
-                    default: Some(text(r, 3)).filter(|d| !d.is_empty() && d != "NULL"),
-                    // BigQuery has no identity or sequence column: a generated id is
-                    // an explicit `GENERATE_UUID()` default, not auto-numbering.
-                    auto_increment: false,
-                    name,
-                }
-            })
-            .collect(),
-        // Secondary indexes do not exist on BigQuery (only search indexes), and
-        // foreign keys are reported through `foreign_keys` rather than per table.
-        indexes: Vec::new(),
-        foreign_keys: Vec::new(),
-    })
+    rows.rows.iter().map(|r| text(r, 0)).collect()
 }
 
 /// The connection-wide foreign-key graph.
@@ -197,76 +337,86 @@ pub(super) async fn foreign_keys(_driver: &BigqueryDriver) -> Result<Vec<FkEdge>
     Ok(Vec::new())
 }
 
-/// How many routines of each kind live in each dataset, so the tree never draws a
-/// group that turns out to be empty.
+/// How many routines of each kind live in each dataset.
+///
+/// **Deliberately empty**, so the Functions and Procedures groups fall back to
+/// click-to-discover — the degradation the trait documents for an engine that
+/// cannot answer.
+///
+/// Answering it would cost a `routines.list` per dataset at *connect*, which is
+/// precisely the "one query per schema multiplying connect cost on a server with
+/// many schemas" that the trait's own doc warns against, for a list nobody has
+/// asked to see. The project-wide `INFORMATION_SCHEMA.ROUTINES` read that would
+/// answer it in one query is the thing that made the schema tree unloadable for a
+/// dataset-scoped role in the first place (see [`list_objects`]).
+///
+/// The visible cost is a group node that may deflate to "none" on expand. That is
+/// the lesser evil here: the alternative is a slower connect for everyone.
 pub(super) async fn object_group_counts(
-    driver: &BigqueryDriver,
+    _driver: &BigqueryDriver,
 ) -> Result<Vec<(String, ObjectKind, usize)>> {
-    let region = region(driver).await;
-    let rows = driver
-        .catalog_rows(&format!(
-            "SELECT routine_schema, routine_type, count(*) \
-             FROM {region}.INFORMATION_SCHEMA.ROUTINES \
-             GROUP BY routine_schema, routine_type"
-        ))
-        .await
-        // A project whose routines are not readable reports nothing, and the groups
-        // fall back to click-to-discover. The caller tells that from a failure by
-        // whether the call succeeded.
-        .unwrap_or_default();
-    Ok(rows
-        .rows
-        .iter()
-        .filter_map(|r| {
-            routine_kind(&text(r, 1)).map(|kind| (text(r, 0), kind, number(r, 2) as usize))
-        })
-        .collect())
+    Ok(Vec::new())
 }
 
 /// The names of one routine kind in one dataset, pulled when its group is expanded.
+///
+/// `routines.list` over REST, needing only `bigquery.routines.list` on this one
+/// dataset — the permission the project-wide `INFORMATION_SCHEMA.ROUTINES` read
+/// demanded across the whole project.
 pub(super) async fn list_object_group(
     driver: &BigqueryDriver,
     namespace: &str,
     kind: ObjectKind,
 ) -> Result<Vec<ObjectMeta>> {
-    let Some(wanted) = routine_type(kind) else {
+    if routine_kind_wanted(kind).is_none() {
         return Ok(Vec::new());
+    }
+    let dataset = if namespace.is_empty() {
+        driver.namespace()
+    } else {
+        namespace
     };
-    let qualified = format!("{}.{}", bq_quote(&driver.project), bq_quote(namespace));
-    let rows = driver
-        .catalog_rows(&format!(
-            "SELECT routine_name FROM {qualified}.INFORMATION_SCHEMA.ROUTINES \
-             WHERE routine_type = '{wanted}' ORDER BY routine_name"
-        ))
-        .await?;
-    Ok(rows
-        .rows
+    let path = format!("projects/{}/datasets/{dataset}/routines", driver.project);
+    let mut names: Vec<ObjectMeta> = driver
+        .list_items(&path, "routines")
+        .await?
         .iter()
-        .map(|r| ObjectMeta {
-            name: text(r, 0),
-            kind,
+        .filter_map(|r| {
+            // Filtered client-side: `routines.list` takes no type filter, and one
+            // dataset's routine list is small enough that asking for all of them and
+            // keeping the matching ones beats a second call.
+            let found = routine_kind(r.get("routineType").and_then(Json::as_str).unwrap_or(""))?;
+            if found != kind {
+                return None;
+            }
+            let name = r
+                .pointer("/routineReference/routineId")
+                .and_then(Json::as_str)?
+                .to_string();
+            Some(ObjectMeta { name, kind })
         })
-        .collect())
+        .collect();
+    names.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(names)
 }
 
-/// `ROUTINES.routine_type` -> RED's kind. A `TABLE_FUNCTION` is reported as a
-/// function: it is a routine you call, and RED has no separate kind for it.
+/// A routine's reported type -> RED's kind. A `TABLE_VALUED_FUNCTION` is reported as
+/// a function: it is a routine you call, and RED has no separate kind for it.
+/// Covers both spellings, since REST says `SCALAR_FUNCTION` where
+/// `INFORMATION_SCHEMA` says `FUNCTION`.
 fn routine_kind(routine_type: &str) -> Option<ObjectKind> {
     match routine_type.to_ascii_uppercase().as_str() {
         "PROCEDURE" => Some(ObjectKind::Procedure),
-        "FUNCTION" | "TABLE_FUNCTION" => Some(ObjectKind::Function),
+        "SCALAR_FUNCTION" | "TABLE_VALUED_FUNCTION" | "FUNCTION" | "TABLE_FUNCTION" => {
+            Some(ObjectKind::Function)
+        }
         _ => None,
     }
 }
 
-/// The `routine_type` literal for one kind, or `None` for a kind BigQuery has no
-/// routines of.
-fn routine_type(kind: ObjectKind) -> Option<&'static str> {
-    match kind {
-        ObjectKind::Procedure => Some("PROCEDURE"),
-        ObjectKind::Function => Some("FUNCTION"),
-        _ => None,
-    }
+/// Whether BigQuery has routines of this kind at all.
+fn routine_kind_wanted(kind: ObjectKind) -> Option<ObjectKind> {
+    matches!(kind, ObjectKind::Procedure | ObjectKind::Function).then_some(kind)
 }
 
 /// An object's definition as SQL.

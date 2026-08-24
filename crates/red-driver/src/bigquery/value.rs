@@ -153,7 +153,13 @@ fn is_struct(ty: &str) -> bool {
 /// Normalise BigQuery's two spellings of the same type onto the GoogleSQL one.
 /// The REST schema uses the legacy names (`INTEGER`, `FLOAT`, `BOOLEAN`) while
 /// `INFORMATION_SCHEMA` and DDL use the modern ones, and both reach this code.
-fn base_type(ty: &str) -> &str {
+///
+/// Shared with the catalog, where the folding is a **correctness** matter and not
+/// just tidiness: BigQuery's `INTEGER` *is* 64-bit, but `red_core::typemap` reads
+/// `integer` as a 32-bit `Int` and only `int64` as a `BigInt`. Reporting a column
+/// as `INTEGER` would make a cross-engine migration create a 32-bit column and
+/// truncate every value that did not fit.
+pub(super) fn base_type(ty: &str) -> &str {
     let t = ty.trim();
     // A parameterised type (`NUMERIC(10, 2)`, `STRING(255)`) classifies on its head.
     let head = t.split(['(', '<']).next().unwrap_or(t).trim();

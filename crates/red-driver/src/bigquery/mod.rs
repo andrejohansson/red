@@ -88,6 +88,15 @@ const SERVER_WAIT: Duration = Duration::from_secs(8);
 /// Gap between `getQueryResults` polls for a job still running.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Items per page when walking a REST list endpoint. The API's own default is 50,
+/// which would make the schema tree a series of round trips for no reason.
+const LIST_PAGE_SIZE: usize = 1000;
+
+/// Pages one list walk will follow before giving up. At [`LIST_PAGE_SIZE`] this is
+/// 50,000 items — far past any real dataset, and a backstop against a
+/// `nextPageToken` that never clears rather than a limit anyone should meet.
+const LIST_PAGE_CAP: usize = 50;
+
 /// The cost defaults live in `red-core`: the app's settings layer needs them for
 /// its own `Default` impl and does not depend on `red-driver`.
 pub use red_core::{DEFAULT_COST_CONFIRM_BYTES, DEFAULT_MAX_BYTES_BILLED};
@@ -245,6 +254,45 @@ impl BigqueryDriver {
             .bearer_auth(&*token)
             .query(query);
         self.send(request).await
+    }
+
+    /// Page through a REST *list* endpoint, following `nextPageToken`, and collect
+    /// every item under `key`.
+    ///
+    /// Paginating rather than reading the first page is not a nicety: `datasets.list`
+    /// and `tables.list` both default to 50 items, so a single-page read would draw a
+    /// silently truncated schema tree — the failure mode that reads as "those tables
+    /// don't exist". [`LIST_PAGE_CAP`] bounds a pathological project rather than
+    /// looping forever, and says so in the log when it bites.
+    async fn list_items(&self, path: &str, key: &str) -> Result<Vec<Json>> {
+        let mut items = Vec::new();
+        let mut token: Option<String> = None;
+        for page in 0..LIST_PAGE_CAP {
+            let mut query = vec![("maxResults", LIST_PAGE_SIZE.to_string())];
+            if let Some(t) = &token {
+                query.push(("pageToken", t.clone()));
+            }
+            let json = self.get(path, &query).await?;
+            if let Some(rows) = json.get(key).and_then(Json::as_array) {
+                items.extend(rows.iter().cloned());
+            }
+            token = json
+                .get("nextPageToken")
+                .and_then(Json::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            if token.is_none() {
+                return Ok(items);
+            }
+            if page + 1 == LIST_PAGE_CAP {
+                tracing::warn!(
+                    path,
+                    items = items.len(),
+                    "bigquery: stopped listing at the page cap; the tree is incomplete"
+                );
+            }
+        }
+        Ok(items)
     }
 
     /// A POST against the API, authenticated and error-mapped.
@@ -755,14 +803,18 @@ impl QueryCursor for BqCursor {
 #[async_trait]
 impl DatabaseDriver for BigqueryDriver {
     async fn ping(&self) -> Result<()> {
-        // The cheapest call that proves both the token and the project: listing
-        // datasets with a page size of one reads no table data and bills nothing.
-        self.get(
-            &format!("projects/{}/datasets", self.project),
-            &[("maxResults", "1".to_string())],
-        )
-        .await
-        .map(|_| ())
+        // Reads no table data and bills nothing either way. When the connection
+        // names a dataset, prove *that* rather than the project: a role granted
+        // access to one dataset and nothing else (the common least-privilege shape)
+        // can read its dataset but may not enumerate the project's, so probing the
+        // list would refuse a connection that works perfectly.
+        let path = match self.namespace() {
+            ns if !ns.is_empty() => format!("projects/{}/datasets/{ns}", self.project),
+            _ => format!("projects/{}/datasets", self.project),
+        };
+        self.get(&path, &[("maxResults", "1".to_string())])
+            .await
+            .map(|_| ())
     }
 
     fn server_version(&self) -> String {
