@@ -74,3 +74,36 @@ actions with `OsAction`s, so they drive the connection-form text fields. Flint's
 so a single menu item can't reach both. The SQL editor's own ⌘C/⌘V keystrokes
 still work, but the menu items don't target it. Unifying the two clipboard
 action sets in Flint, so one menu item serves both surfaces, is the clean fix.
+
+## BigQuery: unverified premises
+
+The BigQuery driver's design (see `docs/adr/0001`–`0005`) rests on several claims
+about BigQuery's *own* behaviour rather than about RED's code. The in-process mock
+HTTP tests cannot check any of them — the fixtures encode the same assumptions the
+code does, so they agree by construction. The env-gated live suite
+(`RED_TEST_BIGQUERY_URL`) is the only thing that can, and **it has never been
+run**: there is no test project yet, so those tests skip.
+
+Each premise below is load-bearing for the ADR named beside it. Treat them as
+unverified until the live suite runs against a real project.
+
+- **`COUNT(*)` bills 0 bytes through RED's wrapping.** BigQuery answers
+  `COUNT(*)` from metadata, but RED asks it as
+  `SELECT count(*) FROM (SELECT * FROM t) AS _red`. The optimizer should prune to
+  zero columns; if it does not, every browse open pays for a full scan. (ADR-0002)
+- **`startIndex` re-reads a completed job without re-billing.** The whole job
+  cache exists for this. If a `getQueryResults` read against a cached job bills a
+  scan, offset paging is no cheaper than re-querying. (ADR-0002)
+- **A ~60s job cache does not interact badly with the 24h temp-table lifetime.**
+  (ADR-0002)
+- **`maximumBytesBilled` rejects before scanning, not after.** A cap enforced
+  after the fact is an alert, not a guard. (ADR-0004)
+- **`num_dml_affected_rows` is populated for a parameterized `INSERT`.** The
+  insert path reports affected rows from it. (ADR-0003)
+- **A declared `PRIMARY KEY` really is unenforced**, i.e. duplicates are
+  accepted. This is the stated reason in-grid editing is off; if BigQuery began
+  enforcing it, ADR-0003's reasoning would need revisiting (though the
+  full-table-scan cost argument stands on its own). (ADR-0003)
+
+The live suite should assert these directly, so a failure names the premise and
+the ADR that depends on it rather than surfacing as a puzzling driver bug.
