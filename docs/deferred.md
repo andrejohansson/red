@@ -107,3 +107,53 @@ unverified until the live suite runs against a real project.
 
 The live suite should assert these directly, so a failure names the premise and
 the ADR that depends on it rather than surfacing as a puzzling driver bug.
+
+## BigQuery: gaps in the shipped driver
+
+Things the driver leaves undone rather than guesses at. Each is a **gap**, not an
+absence: BigQuery can do these, so a future reader should not conclude from the
+code that the engine cannot.
+
+### The foreign-key graph is empty
+
+`foreign_keys` returns no edges, so FK click-through and the relation tree are
+absent on BigQuery, and `describe_table` reports no per-table foreign keys.
+
+BigQuery *does* have declarable (unenforced) foreign keys, exposed across
+`TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE` and `CONSTRAINT_COLUMN_USAGE`. The read
+spans three views whose region-level availability could not be verified against a
+live project, and a relation graph that is subtly wrong sends click-through to the
+wrong table — a worse outcome than the documented empty degradation the trait
+already allows. Pick this up with the live suite, not before.
+
+### `execute_batch` is sequential, not atomic
+
+Every other SQL driver runs a statement batch in one transaction. BigQuery's arm
+runs one job per statement, so a failure part-way leaves the earlier statements
+committed. The trait doc explicitly permits this ("an engine without
+multi-statement transactions runs them sequentially; it documents that") but the
+reason here is different: BigQuery *has* `BEGIN TRANSACTION`, and a
+multi-statement script would be genuinely atomic — it just reports a single
+`numDmlAffectedRows` for the whole job, so the per-statement counts this method
+promises could not be returned without fabricating a split.
+
+Per-statement jobs inside a BigQuery **session** would give both atomicity and
+real counts. That is also what `begin_sandbox` needs, so the two should land
+together.
+
+### Multi-chunk `insert_rows` is not atomic either
+
+A bulk insert wider than the parameter cap is sub-chunked into several jobs. A
+failure part-way leaves the earlier chunks committed, so a retry appends
+duplicates rather than starting clean. Same fix as above (a session), same
+reason it is deferred.
+
+### No `health` report, and no BigQuery connection importer
+
+`health` falls through to the trait default, which reports that the engine has
+none. `INFORMATION_SCHEMA.TABLE_STORAGE` could back a real one.
+
+The DBeaver / DBGate / DataGrip importers set `credentials_path` empty for every
+connection: translating the Simba JDBC form (`ProjectId`, `OAuthPvtKeyPath`,
+`DefaultDataset`, `OAuthType`) into RED's shape is mechanical but needs its own
+fixtures. See `docs/adr/0005`.
