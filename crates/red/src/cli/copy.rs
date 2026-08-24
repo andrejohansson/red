@@ -537,7 +537,11 @@ fn default_schema(kind: DbKind, database: &str) -> Option<String> {
     match kind {
         DbKind::Sqlite => Some("main".into()),
         DbKind::Postgres => Some("public".into()),
-        DbKind::Mysql | DbKind::Clickhouse => (!database.is_empty()).then(|| database.to_string()),
+        // A BigQuery "schema" is the dataset, exactly as a MySQL/ClickHouse one is
+        // the connected database.
+        DbKind::Mysql | DbKind::Clickhouse | DbKind::Bigquery => {
+            (!database.is_empty()).then(|| database.to_string())
+        }
         // `red copy`/`red migrate` are SQL-shaped (SELECT/INSERT); the CLI never
         // routes a Redis or MongoDB connection into them (they aren't SQL sources
         // or targets).

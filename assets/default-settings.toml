@@ -189,6 +189,23 @@ watch_default_secs = 0
 # floored at 10s regardless of what you put here.
 watch_min_secs = 2
 
+[bigquery]
+# BigQuery's cost guards. Every other setting in this file trades memory or
+# latency; these two trade money, because BigQuery bills for reading.
+
+# Hard ceiling on the bytes a single query may bill. Carried on every job, so a
+# query over it fails *before* scanning rather than showing up on an invoice.
+# 0 disables the ceiling. The default is ~100 GiB (about $0.63 on-demand) and is
+# deliberately set rather than unlimited.
+max_bytes_billed = 107374182400
+
+# Estimate above which a query is priced and confirmed instead of run. RED asks
+# BigQuery what the query would scan (a dry run, which costs nothing) and stops
+# to ask you first. 0 disables the confirmation and leaves only the ceiling
+# above. The default is ~20 GiB (about $0.13); set high on purpose, because a
+# prompt that fires on ordinary work is a prompt you learn to dismiss.
+confirm_bytes = 21474836480
+
 [kv]
 # The key-value seam: the Redis key browser today, and any future KvDriver engine
 # unchanged, which is why it's named for the seam and not for Redis.

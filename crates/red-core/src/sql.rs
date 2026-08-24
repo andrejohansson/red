@@ -67,6 +67,7 @@ pub enum Dialect {
     Postgres,
     Sqlite,
     ClickHouse,
+    BigQuery,
 }
 
 impl Dialect {
@@ -78,15 +79,16 @@ impl Dialect {
             DbKind::Mysql => Dialect::MySql,
             DbKind::Sqlite => Dialect::Sqlite,
             DbKind::Clickhouse => Dialect::ClickHouse,
+            DbKind::Bigquery => Dialect::BigQuery,
             DbKind::Redis | DbKind::Mongo => Dialect::Generic,
         }
     }
 
-    /// MySQL alone speaks `#`-to-end-of-line comments. Everywhere else `#` is an
-    /// operator (Postgres JSONB `#>`, `#` XOR), so reading it as a comment would
-    /// hide live SQL from every gate that scans the stripped copy.
+    /// MySQL and GoogleSQL speak `#`-to-end-of-line comments. Everywhere else `#`
+    /// is an operator (Postgres JSONB `#>`, `#` XOR), so reading it as a comment
+    /// would hide live SQL from every gate that scans the stripped copy.
     fn hash_comments(self) -> bool {
-        matches!(self, Dialect::MySql)
+        matches!(self, Dialect::MySql | Dialect::BigQuery)
     }
 
     /// Whether `--` at `i` opens a line comment. MySQL requires whitespace (or
@@ -104,7 +106,7 @@ impl Dialect {
     }
 
     /// Whether a backslash escapes the next character inside a `'…'`/`"…"`
-    /// string. MySQL and ClickHouse say yes; Postgres (under
+    /// string. MySQL, ClickHouse and BigQuery say yes; Postgres (under
     /// `standard_conforming_strings`, its default since 9.1) and SQLite treat
     /// `\` as an ordinary character, so `'C:\'` is a complete literal there.
     /// Postgres `E'…'` strings *do* escape — handled at the quote site, where
@@ -112,7 +114,7 @@ impl Dialect {
     fn backslash_in_strings(self) -> bool {
         matches!(
             self,
-            Dialect::Generic | Dialect::MySql | Dialect::ClickHouse
+            Dialect::Generic | Dialect::MySql | Dialect::ClickHouse | Dialect::BigQuery
         )
     }
 

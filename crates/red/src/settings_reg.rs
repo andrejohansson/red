@@ -802,6 +802,62 @@ static DEFS: &[SettingDef] = &[
                 .then_some("A 1s floor re-runs the query 60 times a minute, per watched tab.")
         }),
     },
+    // --- BigQuery cost guards ---
+    // On the SQL tab rather than a tab of their own: they belong to a SQL engine,
+    // and a whole tab for two keys would draw an empty page for everyone else.
+    SettingDef {
+        key: "bigquery.max_bytes_billed",
+        tab: SettingsTab::Sql,
+        group: "BigQuery",
+        en_label: "Maximum bytes billed",
+        en_help: "Hard ceiling on what one BigQuery query may scan. Carried on every job, \
+               so a query over it fails before scanning rather than showing up on an \
+               invoice. Off means no ceiling.",
+        applies: Applies::Sql,
+        control: Control::Segments(&[
+            seg("Off", int(0)),
+            seg("10 GiB", int(10 * 1073741824)),
+            seg("100 GiB", int(100 * 1073741824)),
+            seg("1 TiB", int(1024 * 1073741824)),
+        ]),
+        get: |s| Value::Int(s.bigquery.max_bytes_billed as i64),
+        set: |s, v| s.bigquery.max_bytes_billed = v.as_int().max(0) as u64,
+        warn: Some(|s| {
+            (s.bigquery.max_bytes_billed == 0).then_some(
+                "With no ceiling, a single mistyped query can scan (and bill for) an \
+                 entire warehouse.",
+            )
+        }),
+    },
+    SettingDef {
+        key: "bigquery.confirm_bytes",
+        tab: SettingsTab::Sql,
+        group: "BigQuery",
+        en_label: "Confirm above",
+        en_help: "Price a BigQuery query first (a dry run, which costs nothing) and ask \
+               before running it when it would scan more than this. Off runs everything \
+               under the ceiling without asking.",
+        applies: Applies::Sql,
+        control: Control::Segments(&[
+            seg("Off", int(0)),
+            seg("1 GiB", int(1073741824)),
+            seg("20 GiB", int(20 * 1073741824)),
+            seg("100 GiB", int(100 * 1073741824)),
+        ]),
+        get: |s| Value::Int(s.bigquery.confirm_bytes as i64),
+        set: |s, v| s.bigquery.confirm_bytes = v.as_int().max(0) as u64,
+        warn: Some(|s| {
+            // A threshold at or above the ceiling can never fire: the ceiling
+            // refuses the query first, so the confirmation is dead configuration.
+            (s.bigquery.confirm_bytes > 0
+                && s.bigquery.max_bytes_billed > 0
+                && s.bigquery.confirm_bytes >= s.bigquery.max_bytes_billed)
+                .then_some(
+                    "This is at or above the ceiling, so it can never fire -- the ceiling \
+                     refuses the query first.",
+                )
+        }),
+    },
     // --- kv seam ---
     SettingDef {
         key: "kv.default_query_mode",

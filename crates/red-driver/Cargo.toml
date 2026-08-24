@@ -30,9 +30,17 @@ url.workspace = true
 # MongoDB driver — the DocDriver seam, see doc.rs/mongo.rs. Isolated to this
 # crate; `bson` rides in as `mongodb::bson` (no separate BSON version).
 mongodb.workspace = true
+# BigQuery driver — its REST API over the same reqwest/rustls stack ClickHouse
+# uses. `rsa` + `base64` sign the service-account JWT assertion (RS256); both are
+# already in the tree, and neither is touched on the ADC path.
+rsa.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+# `net` is for the BigQuery driver's mock-server tests: they stand up a loopback
+# TCP listener that replays canned REST responses, so the whole driver is exercised
+# with no credentials and no billed queries.
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
 
 [lints]
 workspace = true

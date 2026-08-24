@@ -705,6 +705,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             Command::SetStatementTimeout(timeout) => statement_timeout = timeout,
 
             Command::SetDisplayCellCap(bytes) => red_driver::set_display_cell_cap(bytes),
+            Command::SetBigqueryCostCaps {
+                max_bytes_billed,
+                confirm_bytes,
+            } => red_driver::set_bigquery_cost_caps(max_bytes_billed, confirm_bytes),
 
             Command::ConfigureUpdates(config) => {
                 let _ = updater.send(crate::update::UpdateControl::Configure(config));
@@ -1457,6 +1461,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let events = events.clone();
                 let results = state.results.clone();
                 let timeout = statement_timeout;
+                let kind = state.kind;
                 tokio::spawn(async move {
                     // A table browse resolves its seek key from the table's
                     // introspected detail: a sorted browse gets the composite
@@ -1489,6 +1494,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         _ => red_core::RowEditCaps::default(),
                     };
                     let key = match &detail {
+                        // An engine that pages by offset gets no keyset key at all.
+                        // `KeySpec::from_detail` is pure and sees only a
+                        // `TableDetail`, so it cannot know that BigQuery's *unenforced*
+                        // `PRIMARY KEY` is not a usable row identity -- and that a seek
+                        // there costs a fresh billed scan per page while an offset read
+                        // of the already-materialized result is free. The engine
+                        // descriptor is the only place that knows.
+                        Some(_) if !kind.supports_keyset_paging() => {
+                            tracing::info!(%kind, "offset paging: engine opts out of keyset");
+                            None
+                        }
                         Some(detail) => {
                             let key = match &sort {
                                 Some(s) => KeySpec::sorted(detail, &s.column, s.direction),

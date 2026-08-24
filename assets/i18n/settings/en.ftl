@@ -269,6 +269,32 @@ settings-sql-watch_min_secs-seg-2s = 2s
 
 settings-sql-watch_min_secs-seg-5s = 5s
 
+settings-group-bigquery = BigQuery
+
+settings-bigquery-max_bytes_billed =
+    .label = Maximum bytes billed
+    .help = Hard ceiling on what one BigQuery query may scan. Carried on every job, so a query over it fails before scanning rather than showing up on an invoice. Off means no ceiling.
+
+settings-bigquery-max_bytes_billed-seg-off = Off
+
+settings-bigquery-max_bytes_billed-seg-10_gib = 10 GiB
+
+settings-bigquery-max_bytes_billed-seg-100_gib = 100 GiB
+
+settings-bigquery-max_bytes_billed-seg-1_tib = 1 TiB
+
+settings-bigquery-confirm_bytes =
+    .label = Confirm above
+    .help = Price a BigQuery query first (a dry run, which costs nothing) and ask before running it when it would scan more than this. Off runs everything under the ceiling without asking.
+
+settings-bigquery-confirm_bytes-seg-off = Off
+
+settings-bigquery-confirm_bytes-seg-1_gib = 1 GiB
+
+settings-bigquery-confirm_bytes-seg-20_gib = 20 GiB
+
+settings-bigquery-confirm_bytes-seg-100_gib = 100 GiB
+
 settings-group-browsing = Browsing
 
 settings-kv-default_query_mode =

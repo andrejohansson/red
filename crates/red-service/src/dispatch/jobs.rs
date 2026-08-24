@@ -601,6 +601,12 @@ pub(super) fn copy_read_opts() -> QueryOptions {
         window: COPY_CHUNK_ROWS,
         timeout: None,
         full_fidelity: true,
+        // A transfer is user-initiated but not interactively answerable: there is no
+        // dialog open to confirm a cost estimate against, so gating here would fail
+        // the job with a question nobody can answer. The *hard* cap
+        // (`maximumBytesBilled`) still applies, which is the guard that does not
+        // need a human present.
+        cost_confirmed: true,
     }
 }
 
@@ -1039,6 +1045,9 @@ pub(crate) async fn diff_job(
         window: COPY_CHUNK_ROWS,
         timeout: None,
         full_fidelity: true,
+        // As in `copy_read_opts`: a diff runs unattended, so only the hard cap
+        // applies to it.
+        cost_confirmed: true,
     };
     let left_sql = format!(
         "SELECT * FROM {} ORDER BY {}",

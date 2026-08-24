@@ -387,6 +387,9 @@ fn cmd_query(args: QueryArgs) -> u8 {
         window: WINDOW,
         timeout: None,
         full_fidelity: true,
+        // Headless: there is no dialog to confirm a BigQuery cost estimate against,
+        // so only the hard `maximumBytesBilled` cap applies here.
+        cost_confirmed: true,
     };
     // No tab context in the CLI: the saved connection's own database applies.
     svc.send_to(

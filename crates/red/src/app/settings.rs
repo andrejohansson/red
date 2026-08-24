@@ -190,6 +190,12 @@ impl AppState {
                 self.settings.data.max_cell_chars,
             ));
         }
+        if before.bigquery != self.settings.bigquery {
+            self.service.send_global(Command::SetBigqueryCostCaps {
+                max_bytes_billed: self.settings.bigquery.max_bytes_billed,
+                confirm_bytes: self.settings.bigquery.confirm_bytes,
+            });
+        }
         if before.update != self.settings.update {
             // The backend only re-polls if the cadence actually moved.
             self.service

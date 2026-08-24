@@ -55,6 +55,7 @@ pub struct Settings {
     pub sql: SqlSettings,
     pub kv: KvSettings,
     pub doc: DocSettings,
+    pub bigquery: BigquerySettings,
     pub behavior: BehaviorSettings,
     pub update: UpdateSettings,
     pub ai: AiSettings,
@@ -817,6 +818,37 @@ impl BehaviorSettings {
 
 // --- kv ----------------------------------------------------------------------
 
+/// BigQuery's cost guards. The only engine-specific section that exists because an
+/// engine bills for reading: every other setting in this file trades memory or
+/// latency, and these two trade money (see `docs/adr/0004`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BigquerySettings {
+    /// Hard ceiling on the bytes one query may bill. Carried on every job as
+    /// `maximumBytesBilled`, so a query over it fails **before** scanning rather
+    /// than being noticed on an invoice. `0` disables the ceiling.
+    ///
+    /// Defaulted rather than unlimited on purpose: "safe by default" applies to
+    /// money as readily as to `DROP TABLE`.
+    pub max_bytes_billed: u64,
+    /// Estimate above which a query is priced and confirmed instead of run. `0`
+    /// disables the confirmation, leaving only the hard ceiling.
+    ///
+    /// Set high deliberately. A prompt that fires on ordinary work trains the
+    /// reflex that dismisses it, which is the argument `red_core::sql::risk` makes
+    /// about the destructive confirm and it applies unchanged here.
+    pub confirm_bytes: u64,
+}
+
+impl Default for BigquerySettings {
+    fn default() -> Self {
+        Self {
+            max_bytes_billed: red_core::DEFAULT_MAX_BYTES_BILLED,
+            confirm_bytes: red_core::DEFAULT_COST_CONFIRM_BYTES,
+        }
+    }
+}
+
 /// The key-value seam: the Redis key browser today, and any future `KvDriver`
 /// engine unchanged (Valkey, DragonflyDB), which is why the section is named for
 /// the seam rather than for Redis.
@@ -1338,6 +1370,7 @@ impl FileSettingsStore {
             sql: section(&value, "sql", &mut warnings),
             kv: section(&value, "kv", &mut warnings),
             doc: section(&value, "doc", &mut warnings),
+            bigquery: section(&value, "bigquery", &mut warnings),
             behavior: section(&value, "behavior", &mut warnings),
             update: section(&value, "update", &mut warnings),
             ai: ai_section(&value, &mut warnings),

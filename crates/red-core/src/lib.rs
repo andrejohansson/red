@@ -65,6 +65,17 @@ pub enum DbKind {
     /// third `DocDriver` seam (`red-driver`'s `doc` module), a `server → databases →
     /// collections → documents` hierarchy of nested BSON trees —.
     Mongo,
+    /// Google BigQuery: a serverless OLAP warehouse reached over its REST API.
+    /// Structurally the odd one out -- no host, no port, and no user/password (a
+    /// bearer token from ADC or a service-account key), and its hierarchy is one
+    /// level deeper than [`TableRef`] models, so a connection pins one *project*
+    /// and the **dataset** is the [`namespace`](DbKind::namespace_caps).
+    ///
+    /// Every read is billed by bytes scanned, which is why this is the only engine
+    /// whose queries are cost-gated (see [`DbKind::estimates_query_cost`]) and the
+    /// only one that pages by offset over a cached result rather than by keyset
+    /// seek (see [`DbKind::supports_keyset_paging`]).
+    Bigquery,
 }
 
 impl DbKind {
@@ -79,6 +90,7 @@ impl DbKind {
             DbKind::Clickhouse,
             DbKind::Redis,
             DbKind::Mongo,
+            DbKind::Bigquery,
         ]
     }
 
@@ -94,6 +106,51 @@ impl DbKind {
         matches!(self, Self::Sqlite | Self::Postgres | Self::Mysql)
     }
 
+    /// Whether a browse on this engine should page by **keyset seek** rather than
+    /// by offset. True everywhere the seek's premise holds: that an indexed
+    /// `WHERE key > x ORDER BY key LIMIT n` is cheaper than an `OFFSET` walk, so
+    /// it costs the same at row 200 or 46,000,000.
+    ///
+    /// BigQuery inverts that premise and so opts out. It has no indexes, and a
+    /// keyset seek there is a *new job over a new scan* for every page, while
+    /// `fetch_page` re-reads an already-materialized job result at no additional
+    /// scan cost -- so offset paging is both faster and cheaper, the exact reverse
+    /// of every other engine.
+    ///
+    /// A [`DbKind`] descriptor rather than a driver method because the decision is
+    /// made in [`KeySpec::from_detail`], which is pure and sees only a
+    /// [`TableDetail`]. Without it, BigQuery's *unenforced* `PRIMARY KEY`
+    /// declarations would silently switch keyset paging back on.
+    pub const fn supports_keyset_paging(self) -> bool {
+        !matches!(self, Self::Bigquery)
+    }
+
+    /// Whether this engine can price a statement *before* running it, so the UI
+    /// can show what a query will cost and the service can gate an expensive one
+    /// behind a confirmation.
+    ///
+    /// Only BigQuery bills by bytes scanned, and only BigQuery has the `dryRun`
+    /// that answers for free. A descriptor rather than a `== DbKind::Bigquery`
+    /// check for the same reason [`write_caps`](Self::write_caps) is one: the UI
+    /// holds a [`DbKind`], never a driver.
+    pub const fn estimates_query_cost(self) -> bool {
+        matches!(self, Self::Bigquery)
+    }
+
+    /// What the connection form calls the field holding a connection's authority --
+    /// the "where" of it. "Host" for everything with a hostname; **"Project"** for
+    /// BigQuery, whose authority is a GCP project id and which has no host at all.
+    ///
+    /// The sibling of [`NamespaceCaps::label`], which renames the namespace level
+    /// per engine for the same reason: the form is data-driven off these
+    /// descriptors, not a hand-maintained list.
+    pub const fn host_label(self) -> &'static str {
+        match self {
+            Self::Bigquery => "Project",
+            _ => "Host",
+        }
+    }
+
     pub const fn is_file(self) -> bool {
         matches!(self, DbKind::Sqlite)
     }
@@ -107,6 +164,10 @@ impl DbKind {
             DbKind::Clickhouse => Some(8123),
             DbKind::Redis => Some(6379),
             DbKind::Mongo => Some(27017),
+            // Not an omission: BigQuery is reached over HTTPS at a fixed Google
+            // endpoint, so there is no port for a user to get wrong. The first
+            // *network* engine with none (SQLite's `None` is a file path).
+            DbKind::Bigquery => None,
             DbKind::Sqlite => None,
         }
     }
@@ -120,6 +181,7 @@ impl DbKind {
             DbKind::Clickhouse => "clickhouse",
             DbKind::Redis => "redis",
             DbKind::Mongo => "mongodb",
+            DbKind::Bigquery => "bigquery",
         }
     }
 
@@ -137,6 +199,9 @@ impl DbKind {
             // Both the plain and the SRV/DNS-seedlist spelling map to one engine;
             // `mongodb+srv` implies TLS, which the driver reads off the scheme.
             "mongodb" | "mongodb+srv" => Some(DbKind::Mongo),
+            // `sqlalchemy-bigquery`'s spelling, the de facto URL form (see
+            // `docs/adr/0005`); `bq` is the CLI's shorthand.
+            "bigquery" | "bq" => Some(DbKind::Bigquery),
             _ => None,
         }
     }
@@ -190,8 +255,22 @@ impl DbKind {
             // MongoDB: like Redis, every write rides its own seam (`DocDriver`), not
             // this SQL capability set, so any affordance gated on `write_caps` (rather
             // than the connection kind) stays hidden.
+            // MongoDB: like Redis, every write rides its own seam (`DocDriver`), not
+            // this SQL capability set, so any affordance gated on `write_caps` (rather
+            // than the connection kind) stays hidden.
             DbKind::Mongo => WriteCaps {
                 insert: false,
+                guarded_edit: false,
+                best_effort_edit: false,
+            },
+            // BigQuery: an insert / copy / migration **target**, never an in-grid
+            // edit target. It could honour the guarded contract on paper (real
+            // transactions, bound parameters, `num_dml_affected_rows`) and is
+            // switched off anyway, because editing one cell there is a full-table
+            // scan: an `UPDATE ... WHERE id = 5` over an unpartitioned 1 TiB table
+            // scans 1 TiB. See `docs/adr/0003`.
+            DbKind::Bigquery => WriteCaps {
+                insert: true,
                 guarded_edit: false,
                 best_effort_edit: false,
             },
@@ -220,6 +299,11 @@ impl DbKind {
     /// True everywhere there is a server process to ask. SQLite is a file opened
     /// in-process: there is nothing to be out of memory, nothing to be busy, and
     /// nothing to have been up since Tuesday.
+    ///
+    /// BigQuery has no server to describe either, but [`ServerSnapshot`] carries an
+    /// open list of metrics rather than fixed memory/uptime fields, so it reports
+    /// what is meaningful for a serverless warehouse instead: bytes billed over the
+    /// last day, slot-ms consumed, and jobs in flight.
     pub const fn reports_metrics(self) -> bool {
         !matches!(self, DbKind::Sqlite)
     }
@@ -281,6 +365,16 @@ impl DbKind {
                 can_terminate: true,
                 has_wait_graph: false,
             },
+            // `INFORMATION_SCHEMA.JOBS_BY_PROJECT` + `jobs.cancel`. The same shape
+            // as ClickHouse: one request is one job, so there is no session to
+            // terminate apart from its query, and no lock manager to build a wait
+            // graph from.
+            DbKind::Bigquery => SessionCaps {
+                supported: true,
+                can_cancel: true,
+                can_terminate: false,
+                has_wait_graph: false,
+            },
         }
     }
 
@@ -331,6 +425,15 @@ impl DbKind {
             ],
             // Neither engine is SQL-shaped and neither populates a `SchemaMeta`
             // through this path at all.
+            // `INFORMATION_SCHEMA.ROUTINES.routine_type` separates functions from
+            // procedures. No triggers, no sequences, no user-defined types.
+            DbKind::Bigquery => &[
+                ObjectKind::Table,
+                ObjectKind::View,
+                ObjectKind::MaterializedView,
+                ObjectKind::Function,
+                ObjectKind::Procedure,
+            ],
             DbKind::Redis | DbKind::Mongo => &[],
         }
     }
@@ -387,6 +490,16 @@ impl DbKind {
             // the connection, MongoDB names its database per request over
             // `DocDriver`. Both stay unsettable so any UI gated on this descriptor
             // (rather than on the connection kind) stays hidden.
+            // A BigQuery job names its `defaultDataset` per request, so rebinding
+            // costs nothing at all -- the same property that makes ClickHouse's
+            // `scoped` free. Unlike ClickHouse there is no silent fallback to a
+            // `default`: an unqualified name with no default dataset is a hard
+            // error, so this is `required` like MySQL's 1046.
+            DbKind::Bigquery => NamespaceCaps {
+                settable: true,
+                required: true,
+                label: "Dataset",
+            },
             DbKind::Redis | DbKind::Mongo => NamespaceCaps {
                 settable: false,
                 required: false,
@@ -566,6 +679,7 @@ impl fmt::Display for DbKind {
             DbKind::Clickhouse => write!(f, "ClickHouse"),
             DbKind::Redis => write!(f, "Redis"),
             DbKind::Mongo => write!(f, "MongoDB"),
+            DbKind::Bigquery => write!(f, "BigQuery"),
         }
     }
 }
@@ -1296,6 +1410,18 @@ pub struct ConnectionConfig {
     /// a direct (non-Sentinel) connection.
     #[cfg_attr(feature = "serde", serde(default))]
     pub sentinel_master: String,
+    /// Path to a BigQuery service-account key file. Empty selects **Application
+    /// Default Credentials** (the `gcloud auth application-default login` file, or
+    /// the GCE/Cloud-Run metadata server), which is the mode that needs no secret
+    /// of RED's own at all.
+    ///
+    /// A *path*, deliberately, and therefore safe to persist: the key material
+    /// stays in the file and the driver reads it at connect, so the
+    /// "credentials never land in `connections.toml`" rule holds without
+    /// stretching the keychain to cover a filename. Carried in the DSN as
+    /// `?credentials_path=` (see [`Self::dsn`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub credentials_path: String,
 }
 
 /// Render a secret for `Debug`: `<unset>` when empty, `<redacted>` otherwise, so
@@ -1330,6 +1456,8 @@ impl fmt::Debug for ConnectionConfig {
             .field("ssh", &self.ssh)
             .field("proxy", &self.proxy)
             .field("sentinel_master", &self.sentinel_master)
+            // A path, not a secret -- printable, unlike `password`.
+            .field("credentials_path", &self.credentials_path)
             .finish()
     }
 }
@@ -1377,7 +1505,15 @@ impl ConnectionConfig {
             }
             url.push('@');
         }
-        url.push_str(&bracket_host(self.effective_host()));
+        // BigQuery's authority is a GCP project id, not a host. `effective_host`'s
+        // `localhost` fallback would read back as a project *named* "localhost" and
+        // fail with a baffling message, so an unset project stays empty and the
+        // driver is the one that reports it.
+        if self.kind == DbKind::Bigquery {
+            url.push_str(&self.host);
+        } else {
+            url.push_str(&bracket_host(self.effective_host()));
+        }
         if let Some(port) = self.port {
             url.push(':');
             url.push_str(&port.to_string());
@@ -1400,6 +1536,14 @@ impl ConnectionConfig {
         if self.kind == DbKind::Redis && !self.sentinel_master.is_empty() {
             url.push_str("?master=");
             url.push_str(&encode(&self.sentinel_master));
+        }
+        // BigQuery: the service-account key file, spelled as
+        // `sqlalchemy-bigquery` spells it (see `docs/adr/0005`). Empty means ADC.
+        // Always the sole query param -- BigQuery is always TLS and never Sentinel
+        // -- so there is no `?`/`&` conflict to resolve.
+        if self.kind == DbKind::Bigquery && !self.credentials_path.is_empty() {
+            url.push_str("?credentials_path=");
+            url.push_str(&encode(&self.credentials_path));
         }
         url
     }
@@ -1425,6 +1569,15 @@ impl ConnectionConfig {
     pub fn display_target(&self) -> String {
         if self.kind.is_file() {
             return self.database.clone();
+        }
+        // BigQuery has no user and no host; its own notation for the pair that
+        // identifies a connection is `project.dataset`.
+        if self.kind == DbKind::Bigquery {
+            return if self.database.is_empty() {
+                self.host.clone()
+            } else {
+                format!("{}.{}", self.host, self.database)
+            };
         }
         let mut s = String::new();
         if !self.user.is_empty() {
@@ -1454,6 +1607,13 @@ impl ConnectionConfig {
         // TLS is signalled either by the scheme (`rediss`/`clickhouses`) or by a
         // recognized query flag — read it before the query tail is dropped below.
         let tls = dsn_requests_tls(input);
+        // The ?query tail, kept before it is dropped below: most params describe
+        // transport and are consumed by `dsn_requests_tls`, but BigQuery's
+        // `credentials_path` is *configuration* and has to survive the paste.
+        // A `location=` rides along unread on purpose -- the driver learns a job's
+        // location from `jobReference.location` rather than being told -- so a DSN
+        // carrying one parses rather than failing.
+        let query = rest.split(['?', '#']).nth(1).unwrap_or("");
         // Drop any ?query / #fragment tail.
         let rest = rest
             .split(['?', '#'])
@@ -1505,6 +1665,13 @@ impl ConnectionConfig {
                 None => (hostport.to_string(), None),
             }
         };
+        // `bigquery://project/location/dataset`, the three-segment form some Go
+        // drivers use, is rejected rather than read as two segments: that reading
+        // binds the *dataset* to the location and yields a wrong dataset with no
+        // error at all. Declining the paste is the recoverable failure.
+        if kind == DbKind::Bigquery && database.contains('/') {
+            return None;
+        }
         Some(ParsedDsn {
             kind,
             host,
@@ -1513,8 +1680,19 @@ impl ConnectionConfig {
             password,
             database: decode(&database),
             tls,
+            credentials_path: query_param(query, "credentials_path").unwrap_or_default(),
         })
     }
+}
+
+/// One `key=value` from a DSN's query tail, percent-decoded; `None` when absent.
+/// Keys compare case-insensitively, values are decoded with the same [`decode`]
+/// the userinfo path uses, so a Windows key-file path survives the round trip.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        k.eq_ignore_ascii_case(key).then(|| decode(v))
+    })
 }
 
 /// The fields recovered from a pasted connection string by
@@ -1536,6 +1714,9 @@ pub struct ParsedDsn {
     /// `sslmode`/`require_ssl`/`ssl=true` query flag), used to pre-check the
     /// form's TLS toggle.
     pub tls: bool,
+    /// BigQuery's `?credentials_path=` (see
+    /// [`ConnectionConfig::credentials_path`]); empty for every other engine.
+    pub credentials_path: String,
 }
 
 impl std::fmt::Debug for ParsedDsn {
@@ -1548,6 +1729,7 @@ impl std::fmt::Debug for ParsedDsn {
             .field("password", &"<redacted>")
             .field("database", &self.database)
             .field("tls", &self.tls)
+            .field("credentials_path", &self.credentials_path)
             .finish()
     }
 }
@@ -1562,7 +1744,35 @@ impl ParsedDsn {
             password: String::new(),
             database: String::new(),
             tls: false,
+            credentials_path: String::new(),
         }
+    }
+}
+
+/// Default hard ceiling on the bytes one BigQuery query may bill: ~100 GiB
+/// (about $0.63 on-demand). **Set, not unlimited**, deliberately — see
+/// `docs/adr/0004`.
+pub const DEFAULT_MAX_BYTES_BILLED: u64 = 100 * 1024 * 1024 * 1024;
+
+/// Default estimate above which a BigQuery query is priced and confirmed rather
+/// than run: ~20 GiB (about $0.13). Far above ordinary work, because a prompt that
+/// fires on ordinary work trains the reflex that dismisses it.
+pub const DEFAULT_COST_CONFIRM_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// A byte count a human reads at a glance, for finding prose. Binary units, since
+/// that is what every engine's own size functions report in.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -3033,6 +3243,14 @@ pub struct QueryOptions {
     /// into the target (the same invariant export holds via `PageCap::Full`). The
     /// default is `false`; the grid's streaming path stays capped.
     pub full_fidelity: bool,
+    /// The user has already approved this query's cost, so the driver runs it
+    /// without re-gating (see [`RedError::QueryCostConfirm`]).
+    ///
+    /// Rides on the per-query options rather than on the driver because approval
+    /// belongs to *one statement*, not to the session: a connection that waved one
+    /// expensive query through has not agreed to the next one. Ignored by every
+    /// engine that does not price queries.
+    pub cost_confirmed: bool,
 }
 
 impl Default for QueryOptions {
@@ -3041,6 +3259,7 @@ impl Default for QueryOptions {
             window: 1000,
             timeout: None,
             full_fidelity: false,
+            cost_confirmed: false,
         }
     }
 }
@@ -3101,6 +3320,20 @@ pub enum RedError {
     /// A fetch exceeded its configured timeout.
     #[error("query timed out")]
     Timeout,
+    /// The query was priced before running and costs more than the confirm
+    /// threshold, so it was **not** executed (see `DbKind::estimates_query_cost`).
+    ///
+    /// Its own variant rather than a [`RedError::Query`] because it is not a
+    /// failure: nothing is wrong with the statement, and the answer the UI owes the
+    /// user is a decision, not an error. The service turns it into a confirmation
+    /// carrying both numbers; approving re-sends the same query with
+    /// [`QueryOptions::cost_confirmed`] set, which skips the gate.
+    ///
+    /// Distinct from exceeding the *hard* cap, which is refused outright and
+    /// surfaces as a [`RedError::Query`]: that one is not the user's to wave
+    /// through from a dialog.
+    #[error("this query would scan {} (over the {} confirmation threshold)", crate::human_bytes(*bytes), crate::human_bytes(*limit))]
+    QueryCostConfirm { bytes: u64, limit: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, RedError>;

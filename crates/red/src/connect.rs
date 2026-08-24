@@ -92,6 +92,7 @@ pub(crate) fn engine_badge(kind: DbKind) -> (BadgeVariant, &'static str) {
         // own name; `Danger` here is used for its colour, not a status meaning.
         DbKind::Redis => (BadgeVariant::Danger, "Redis"),
         DbKind::Mongo => (BadgeVariant::Success, "MongoDB"),
+        DbKind::Bigquery => (BadgeVariant::Info, "BigQuery"),
     }
 }
 
@@ -107,6 +108,7 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
         // not to signal an error state.
         DbKind::Redis => theme.red,
         DbKind::Mongo => theme.green,
+        DbKind::Bigquery => theme.blue,
     }
 }
 
@@ -122,6 +124,9 @@ pub(crate) fn engine_icon(kind: DbKind) -> &'static str {
         DbKind::Clickhouse => "db-clickhouse",
         DbKind::Redis => "db-redis",
         DbKind::Mongo => "db-mongo",
+        // No vendored BigQuery glyph yet, so it takes the generic fallback this
+        // function documents rather than borrowing another engine's mark.
+        DbKind::Bigquery => "db",
     }
 }
 
@@ -1540,10 +1545,19 @@ impl AppState {
                     .items_start()
                     .gap_3()
                     .child(
-                        labeled_field(crate::i18n::tr!("connect.field_host", "Host"), theme)
-                            .flex_1()
-                            .child(self.host_input.clone())
-                            .children(field_error_line(theme, field_err(errors, FormField::Host))),
+                        labeled_field(
+                            // BigQuery has no host: its authority is a GCP project
+                            // id, so the field says so (see `DbKind::host_label`).
+                            if form.kind == DbKind::Bigquery {
+                                crate::i18n::tr!("connect.field_project", "Project")
+                            } else {
+                                crate::i18n::tr!("connect.field_host", "Host")
+                            },
+                            theme,
+                        )
+                        .flex_1()
+                        .child(self.host_input.clone())
+                        .children(field_error_line(theme, field_err(errors, FormField::Host))),
                     )
                     .child(
                         labeled_field(crate::i18n::tr!("connect.field_port", "Port"), theme)
@@ -1581,6 +1595,21 @@ impl AppState {
                         theme,
                     )
                     .child(self.sentinel_master_input.clone()),
+                )
+            })
+            // BigQuery: a path to a service-account key file. Left empty it uses
+            // Application Default Credentials, which is the mode that needs no
+            // secret of RED's own -- so the field is genuinely optional and says so.
+            .when(form.kind == DbKind::Bigquery, |col| {
+                col.child(
+                    labeled_field(
+                        crate::i18n::tr!(
+                            "connect.field_credentials_path_optional",
+                            "Service-account key file (optional)"
+                        ),
+                        theme,
+                    )
+                    .child(self.credentials_path_input.clone()),
                 )
             })
             .child(
@@ -1821,38 +1850,44 @@ impl AppState {
                                     .child(crate::i18n::tr!("connect.read_only", "Read-only")),
                             )
                             // TLS toggle — network engines only (a file engine has no
-                            // wire to encrypt).
-                            .when(!form.kind.is_file(), |row| {
-                                row.child(
-                                    Toggle::new("tls", form.tls)
-                                        .label(crate::i18n::tr!("connect.tls", "TLS"))
-                                        .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                            this.set_form_tls(*checked, cx)
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_size(theme.scale(12.5))
-                                        .text_color(if form.tls {
-                                            theme.accent
-                                        } else {
-                                            theme.text_muted
-                                        })
-                                        .child(crate::icons::icon(
-                                            "key-round",
-                                            theme.scale(12.),
-                                            if form.tls {
+                            // wire to encrypt, and BigQuery is *always* HTTPS, so a
+                            // toggle there would be an affordance that does nothing).
+                            .when(
+                                !form.kind.is_file() && form.kind != DbKind::Bigquery,
+                                |row| {
+                                    row.child(
+                                        Toggle::new("tls", form.tls)
+                                            .label(crate::i18n::tr!("connect.tls", "TLS"))
+                                            .on_change(cx.listener(
+                                                |this, checked: &bool, _, cx| {
+                                                    this.set_form_tls(*checked, cx)
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_size(theme.scale(12.5))
+                                            .text_color(if form.tls {
                                                 theme.accent
                                             } else {
                                                 theme.text_muted
-                                            },
-                                        ))
-                                        .child(crate::i18n::tr!("connect.tls", "TLS")),
-                                )
-                            }),
+                                            })
+                                            .child(crate::icons::icon(
+                                                "key-round",
+                                                theme.scale(12.),
+                                                if form.tls {
+                                                    theme.accent
+                                                } else {
+                                                    theme.text_muted
+                                                },
+                                            ))
+                                            .child(crate::i18n::tr!("connect.tls", "TLS")),
+                                    )
+                                },
+                            ),
                     ),
             )
     }

@@ -186,6 +186,7 @@ fn pg_connection(
             ssh: None,
             proxy: None,
             sentinel_master: String::new(),
+            credentials_path: String::new(),
         },
         source_name: name,
         folder: None,

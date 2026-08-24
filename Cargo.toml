@@ -62,6 +62,13 @@ url = "2"
 # `mongodb::bson`, so no second BSON version enters the tree.
 mongodb = "3"
 
+# BigQuery signs its service-account JWT assertion with RS256, the one thing the
+# existing crypto set (aes/cbc/sha2/hmac) cannot do. RustCrypto, pure Rust, same
+# family as the rest -- no OpenSSL enters the build. Needed *only* for
+# service-account key files: Application Default Credentials and the GCE metadata
+# server exchange a refresh token over plain HTTPS and need no crypto at all.
+rsa = { version = "0.9", features = ["sha2"] }
+
 # --- Subscription assistant via ACP (red-acp) ---
 # Drives Claude Code as an external agent over the Agent Client Protocol so the
 # user's Pro/Max subscription grounds the assistant (the agent owns auth/billing;

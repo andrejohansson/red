@@ -20,6 +20,7 @@ use red_core::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+mod bigquery;
 mod clickhouse;
 #[cfg(test)]
 mod conformance;
@@ -37,6 +38,9 @@ mod postgres;
 mod redis_kv;
 mod sqlite;
 mod xlsx;
+pub use bigquery::{
+    BigqueryDriver, DEFAULT_COST_CONFIRM_BYTES, DEFAULT_MAX_BYTES_BILLED, set_bigquery_cost_caps,
+};
 pub use clickhouse::ClickhouseDriver;
 pub use doc::{DocChangeStream, DocDriver};
 pub use docexport::{DocExportRequest, run_doc_export};
@@ -1884,22 +1888,10 @@ pub(crate) fn secs_to_duration(secs: f64) -> std::time::Duration {
     }
 }
 
-/// A byte count a human reads at a glance, for finding prose. Binary units, since
-/// that is what every engine's own size functions report in.
-pub(crate) fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+/// A byte count a human reads at a glance, for finding prose. Lives in `red-core`
+/// because [`RedError::QueryCostConfirm`] renders one in its own message, and a
+/// second formatter beside it would drift.
+pub(crate) use red_core::human_bytes;
 
 #[cfg(test)]
 mod tests {

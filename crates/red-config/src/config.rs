@@ -97,6 +97,10 @@ struct RawConnection {
     /// connection.
     #[serde(default)]
     sentinel_master: String,
+    /// Path to a BigQuery service-account key file. Absent = Application Default
+    /// Credentials. A path, not a secret, so unlike `password` it belongs on disk.
+    #[serde(default)]
+    credentials_path: String,
     /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
     #[serde(default)]
     ssh: Option<RawSsh>,
@@ -201,6 +205,7 @@ impl RawConnection {
             ai_enabled: self.ai_enabled,
             ai_tier: self.ai_tier,
             sentinel_master: self.sentinel_master,
+            credentials_path: self.credentials_path,
             ssh: self.ssh.and_then(RawSsh::into_config),
             proxy: self.proxy.and_then(RawProxy::into_config),
         };
@@ -220,6 +225,7 @@ impl RawConnection {
                 config.password = p.password;
                 config.database = p.database;
                 config.tls = p.tls;
+                config.credentials_path = p.credentials_path;
             } else {
                 config.database = dsn;
             }
@@ -276,6 +282,10 @@ struct WriteConnection {
     /// round-trip byte-for-byte. A scalar key, so it stays ahead of `ssh`.
     #[serde(skip_serializing_if = "String::is_empty")]
     sentinel_master: String,
+    /// BigQuery service-account key path; omitted when empty so non-BigQuery files
+    /// round-trip byte-for-byte. A scalar key, so it stays ahead of `ssh`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    credentials_path: String,
     /// Optional `[connection.ssh]` sub-table. Table-valued, so it must follow all
     /// scalar keys (TOML requirement); it and `proxy` are the trailing tables.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,6 +370,7 @@ impl From<&StoredConnection> for WriteConnection {
             last_accessed: s.last_accessed,
             pinned: s.pinned,
             sentinel_master: c.sentinel_master.clone(),
+            credentials_path: c.credentials_path.clone(),
             ssh: c.ssh.as_ref().map(WriteSsh::from_config),
             proxy: c.proxy.as_ref().map(WriteProxy::from_config),
         }
@@ -621,6 +632,7 @@ mod tests {
                     // A Sentinel master must round-trip; conn-a leaves it empty to
                     // confirm it's omitted from the file and reads back blank.
                     sentinel_master: "mymaster".into(),
+                    credentials_path: String::new(),
                     env: ConnEnv::Prod,
                 },
                 last_accessed: None,

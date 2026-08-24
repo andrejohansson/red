@@ -265,7 +265,8 @@ const PG: u8 = 1; // Postgres
 const MY: u8 = 2; // MySQL
 const SL: u8 = 4; // SQLite
 const CH: u8 = 8; // ClickHouse
-const ALL: u8 = PG | MY | SL | CH;
+const BQ: u8 = 16; // BigQuery (GoogleSQL)
+const ALL: u8 = PG | MY | SL | CH | BQ;
 
 /// Which engines a [`FUNCTIONS`] entry is available on, by name. Absent → `ALL`.
 ///
@@ -277,21 +278,32 @@ const ALL: u8 = PG | MY | SL | CH;
 fn function_engines(name: &str) -> u8 {
     match name {
         // Postgres-only spellings.
-        "split_part" | "date_part" | "string_agg" | "array_agg" => PG,
-        // Postgres + MySQL.
-        "lpad" | "rpad" | "extract" => PG | MY,
+        "split_part" | "date_part" => PG,
+        // Postgres + BigQuery: GoogleSQL has both aggregate spellings natively,
+        // where MySQL/SQLite say `group_concat` and have no array type at all.
+        "string_agg" | "array_agg" => PG | BQ,
+        // Postgres + MySQL + BigQuery.
+        "lpad" | "rpad" | "extract" => PG | MY | BQ,
         // Postgres + MySQL + ClickHouse (no SQLite equivalent by this name).
-        "now" | "left" | "right" | "reverse" | "greatest" | "least" | "substring" => PG | MY | CH,
-        // Postgres + MySQL + SQLite (ClickHouse spells these differently).
-        "ltrim" | "rtrim" | "replace" | "mod" => PG | MY | SL,
-        // Postgres + SQLite + ClickHouse (MySQL uses `truncate`).
-        "trunc" => PG | SL | CH,
-        // Postgres + ClickHouse.
-        "date_trunc" => PG | CH,
-        // MySQL + SQLite + ClickHouse (Postgres uses `coalesce`).
-        "ifnull" => MY | SL | CH,
+        // BigQuery has none of these two: it spells the clock `current_timestamp`
+        // and the substring `substr`.
+        "now" | "substring" => PG | MY | CH,
+        // ... but it does have the rest of that group.
+        "left" | "right" | "reverse" | "greatest" | "least" => PG | MY | CH | BQ,
+        // Postgres + MySQL + SQLite + BigQuery (ClickHouse spells these
+        // differently).
+        "ltrim" | "rtrim" | "replace" | "mod" => PG | MY | SL | BQ,
+        // Postgres + SQLite + ClickHouse + BigQuery (MySQL uses `truncate`).
+        "trunc" => PG | SL | CH | BQ,
+        // Postgres + ClickHouse + BigQuery.
+        "date_trunc" => PG | CH | BQ,
+        // MySQL + SQLite + ClickHouse + BigQuery (Postgres uses `coalesce`).
+        "ifnull" => MY | SL | CH | BQ,
         // MySQL + SQLite.
         "group_concat" => MY | SL,
+        // Everywhere but BigQuery, which has no `concat_ws` (its idiom is
+        // `array_to_string`).
+        "concat_ws" => PG | MY | SL | CH,
         // Everything else is broadly portable.
         _ => ALL,
     }
@@ -310,6 +322,7 @@ pub fn functions_for(kind: DbKind) -> Vec<(&'static str, &'static str, &'static 
         DbKind::Mysql => Some(MY),
         DbKind::Sqlite => Some(SL),
         DbKind::Clickhouse => Some(CH),
+        DbKind::Bigquery => Some(BQ),
         // Neither Redis nor MongoDB has a SQL editor surface, so no bit names
         // them; `functions_for` returns empty rather than reaching an
         // `unreachable!()` for a non-SQL connection.

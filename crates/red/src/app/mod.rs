@@ -69,6 +69,9 @@ pub struct AppState {
     /// Redis Sentinel master-group name (shown only for a Redis engine). Empty =
     /// a direct connection.
     pub(crate) sentinel_master_input: Entity<TextInput>,
+    /// BigQuery's service-account key path. Empty = Application Default
+    /// Credentials.
+    pub(crate) credentials_path_input: Entity<TextInput>,
     pub(crate) conn_str_input: Entity<TextInput>,
     /// SSH-tunnel fields, shown when the form's `ssh_enabled` is on (network
     /// engines only). The two secret inputs are obscured.
@@ -767,6 +770,10 @@ impl AppState {
         // setters and `reload_settings` re-push them when they change.
         service.send_global(Command::SetStatementTimeout(settings.sql.timeout()));
         service.send_global(Command::SetDisplayCellCap(settings.data.max_cell_chars));
+        service.send_global(Command::SetBigqueryCostCaps {
+            max_bytes_billed: settings.bigquery.max_bytes_billed,
+            confirm_bytes: settings.bigquery.confirm_bytes,
+        });
         // Configure the AI assistant provider (key from the keyring / env). An
         // empty key leaves it off until one is set.
         service.send_global(Command::ConfigureAi(ai_config(&settings)));
@@ -814,6 +821,8 @@ impl AppState {
         let password_input = cx.new(TextInput::new);
         let database_input = cx.new(|cx| TextInput::new(cx).with_placeholder("analytics_prod"));
         let sentinel_master_input = cx.new(|cx| TextInput::new(cx).with_placeholder("mymaster"));
+        let credentials_path_input =
+            cx.new(|cx| TextInput::new(cx).with_placeholder("leave empty to use gcloud ADC"));
         let conn_str_input =
             cx.new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db"));
 
@@ -1310,6 +1319,7 @@ impl AppState {
             password_input,
             database_input,
             sentinel_master_input,
+            credentials_path_input,
             conn_str_input,
             ssh_host_input,
             ssh_port_input,

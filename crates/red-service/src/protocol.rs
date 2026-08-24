@@ -1205,6 +1205,15 @@ pub enum Command {
     /// Set the driver's display fat-cell cap (`grid.max_cell_chars`), in bytes.
     /// Global; applies to every subsequent display fetch. Export stays full-fidelity.
     SetDisplayCellCap(usize),
+    /// Set BigQuery's two cost guards: the hard `maximumBytesBilled` ceiling every
+    /// job carries, and the dry-run estimate above which a query is confirmed
+    /// rather than run. `0` disables either. Global like
+    /// [`SetDisplayCellCap`](Self::SetDisplayCellCap) and for the same reason: the
+    /// guards are process-wide, so one message covers every session.
+    SetBigqueryCostCaps {
+        max_bytes_billed: u64,
+        confirm_bytes: u64,
+    },
     /// (Re)configure the macOS self-updater (poll cadence, enable flag, running
     /// version, repo). Global; sent at launch and on each settings reload, like
     /// the tuning knobs above. Disabling stops all polling and network access.

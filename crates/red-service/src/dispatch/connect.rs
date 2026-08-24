@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use red_core::{ConnectionConfig, DbKind, RedError};
 use red_driver::{
-    ClickhouseDriver, DatabaseDriver, MongoDriver, MysqlDriver, PostgresDriver, RedisDriver,
-    SqliteDriver,
+    BigqueryDriver, ClickhouseDriver, DatabaseDriver, MongoDriver, MysqlDriver, PostgresDriver,
+    RedisDriver, SqliteDriver,
 };
 
 use crate::proxy::Proxy;
@@ -74,6 +74,30 @@ async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, 
         return Ok((SessionDriver::Sql(Arc::new(driver)), None));
     }
 
+    // BigQuery is the second engine that never reaches `resolve_forward`, and for
+    // the opposite reason to SQLite: SQLite has no network, BigQuery has no *host*.
+    // It is a fixed Google HTTPS endpoint, so there is no host:port to forward to --
+    // and `default_port()` is `None`, so there would be nothing to forward *to*
+    // either. Its proxy is handed to the HTTP client directly instead.
+    if let DbKind::Bigquery = config.kind {
+        if config.ssh.is_some() {
+            // Rejected up front, like the ssh+proxy pair below, because the
+            // alternative is not a setup failure but a TLS handshake failure:
+            // `127.0.0.1` cannot present a certificate for
+            // `bigquery.googleapis.com`, so the tunnel would appear to work and the
+            // connection would fail with something unrecognisable.
+            return Err(RedError::Connect(
+                "BigQuery can't be reached through an SSH tunnel: it is an HTTPS endpoint \
+                 and a local forward can't present a valid certificate for it. Use a proxy \
+                 instead, or remove the tunnel."
+                    .into(),
+            ));
+        }
+        let driver =
+            BigqueryDriver::connect(&config.dsn(), config.read_only, config.proxy.as_ref()).await?;
+        return Ok((SessionDriver::Sql(Arc::new(driver)), None));
+    }
+
     // For a network engine, stand up the forward first (when configured) and dial
     // the local forwarded port instead of the real host. `dsn` is what the driver
     // connects to; `forward` must outlive it, so it rides into the session.
@@ -116,7 +140,7 @@ async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, 
         DbKind::Mongo => SessionDriver::Doc(Arc::new(
             MongoDriver::connect(&dsn, config.read_only).await?,
         )),
-        DbKind::Sqlite => unreachable!("handled above"),
+        DbKind::Sqlite | DbKind::Bigquery => unreachable!("handled above"),
     };
     Ok((driver, forward))
 }

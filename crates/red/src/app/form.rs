@@ -30,6 +30,9 @@ impl AppState {
         self.sentinel_master_input.update(cx, |i, cx| {
             i.set_content(config.sentinel_master.clone(), cx)
         });
+        self.credentials_path_input.update(cx, |i, cx| {
+            i.set_content(config.credentials_path.clone(), cx)
+        });
         // Seed the connection-string mirror for network engines once host/db are
         // set (an empty new form leaves it blank so the placeholder shows).
         let conn_str = if config.kind.is_file() || config.host.is_empty() {
@@ -305,6 +308,13 @@ impl AppState {
             // carry one even if the input holds stale text from an engine switch.
             sentinel_master: if form.kind == DbKind::Redis {
                 read(&self.sentinel_master_input)
+            } else {
+                String::new()
+            },
+            // Likewise scoped to its engine, so stale text from an engine switch
+            // never rides along.
+            credentials_path: if form.kind == DbKind::Bigquery {
+                read(&self.credentials_path_input)
             } else {
                 String::new()
             },

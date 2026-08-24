@@ -93,7 +93,7 @@ pub fn normalize(decl: &str) -> NormType {
 
         "real" | "float" | "float4" | "float8" | "double" | "float32" | "float64" => NormType::Real,
 
-        "decimal" | "numeric" | "dec" | "money" | "fixed" => {
+        "decimal" | "numeric" | "dec" | "money" | "fixed" | "bignumeric" => {
             let (precision, scale) = parse_decimal_args(args);
             NormType::Decimal { precision, scale }
         }
@@ -134,6 +134,7 @@ pub fn spell(kind: DbKind, t: &NormType) -> String {
         DbKind::Postgres => spell_postgres(t),
         DbKind::Mysql => spell_mysql(t),
         DbKind::Clickhouse => spell_clickhouse(t),
+        DbKind::Bigquery => spell_bigquery(t),
         // Redis has no column/DDL model at all; it
         // isn't a `DatabaseDriver`, so it can never appear in a create-table or
         // migration target picker (`write_caps().insert` is false, which the
@@ -176,12 +177,48 @@ pub fn is_lossy(target: DbKind, t: &NormType) -> bool {
         ),
         DbKind::Mysql => matches!(t, NormType::Uuid),
         DbKind::Postgres => false,
+        // BigQuery *is* a create target (`write_caps().insert`), so this has to be
+        // a real answer rather than a blanket `true`. Only `uuid` has no native
+        // equivalent (it becomes `STRING`); the integer and float widths collapse
+        // to `INT64`/`FLOAT64`, which is widening and so not a fidelity loss.
+        DbKind::Bigquery => matches!(t, NormType::Uuid),
         // ClickHouse is never a create target; treat as lossy for completeness.
         DbKind::Clickhouse => true,
         // Redis is never a create target either (no column/DDL model).
         DbKind::Redis => true,
         // MongoDB is never a create target either (schemaless, no DDL model).
         DbKind::Mongo => true,
+    }
+}
+
+/// Spell for GoogleSQL. BigQuery has exactly one integer width (`INT64`) and one
+/// float width (`FLOAT64`), so the narrower lattice members widen into them. The
+/// two timestamp types are the interesting pair and they map the opposite way round
+/// from the name: `DATETIME` is the wall-clock/naive one and `TIMESTAMP` is the
+/// absolute instant, so [`NormType::Timestamp`] becomes `DATETIME` and
+/// [`NormType::TimestampTz`] becomes `TIMESTAMP`.
+fn spell_bigquery(t: &NormType) -> String {
+    match t {
+        NormType::Bool => "BOOL".to_string(),
+        NormType::Int | NormType::BigInt => "INT64".to_string(),
+        NormType::Real => "FLOAT64".to_string(),
+        NormType::Decimal { precision, scale } => match (precision, scale) {
+            (Some(p), Some(s)) => format!("NUMERIC({p}, {s})"),
+            (Some(p), None) => format!("NUMERIC({p})"),
+            _ => "NUMERIC".to_string(),
+        },
+        // A declared length is dropped rather than spelled as `STRING(L)`: the
+        // parameterized form is a *constraint* BigQuery enforces on write, so
+        // carrying a source engine's cap across would turn a migration into a
+        // rejection at load time.
+        NormType::Text { .. } | NormType::Uuid => "STRING".to_string(),
+        NormType::Blob => "BYTES".to_string(),
+        NormType::Json => "JSON".to_string(),
+        NormType::Date => "DATE".to_string(),
+        NormType::Time => "TIME".to_string(),
+        NormType::Timestamp => "DATETIME".to_string(),
+        NormType::TimestampTz => "TIMESTAMP".to_string(),
+        NormType::Unknown(s) => s.clone(),
     }
 }
 

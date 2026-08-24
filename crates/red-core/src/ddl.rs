@@ -92,7 +92,13 @@ pub fn create_table_sql(
                     DbKind::Mysql => {
                         format!("{} {} AUTO_INCREMENT", quote(&c.name), spell(kind, &nt))
                     }
-                    DbKind::Clickhouse => format!("{} {}", quote(&c.name), spell(kind, &nt)),
+                    // Neither engine has an auto-increment: emit the plain type and
+                    // let the values carry across (future auto-numbering is the loss).
+                    // BigQuery has no identity/sequence column at all -- generated ids
+                    // there are an explicit `GENERATE_UUID()` default, not a counter.
+                    DbKind::Clickhouse | DbKind::Bigquery => {
+                        format!("{} {}", quote(&c.name), spell(kind, &nt))
+                    }
                     // No column/DDL model, no `DatabaseDriver` impl, so this
                     // never sees `DbKind::Redis` (see `typemap::spell`). Degrade
                     // rather than panic on the backend thread if that ever breaks.
