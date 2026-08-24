@@ -270,6 +270,65 @@ pub(super) async fn resolve_sentinel(dsn: &str) -> Result<String> {
     Ok(data.to_string())
 }
 
+/// The data-node DSN for a Sentinel we are **already connected to**, for a
+/// connection string that named no master group.
+///
+/// This is the auto-detected sibling of [`resolve_sentinel`], which needs the group
+/// name up front. It exists because a Sentinel is indistinguishable from a data node
+/// until you ask it something: it answers `PING`, it answers `INFO`, and it refuses
+/// every data command, so a connection to one *looks* healthy and then fails on the
+/// first `SCAN` with `unknown command 'SCAN'`. `INFO server` reporting
+/// `redis_mode:sentinel` is the tell, and by then the connection is open — so the
+/// group is resolved over it rather than by dialling again.
+///
+/// Exactly one monitored master resolves silently, which is the common deployment
+/// and what other clients do. Several is ambiguous and RED will not guess: the error
+/// names them so the user can pick one on the connection.
+///
+/// Credentials ride through [`node_dsn`] onto the data node, which is where they
+/// belong. Note the asymmetry with `resolve_sentinel`: it dials the Sentinel with
+/// credentials *stripped*, because a passwordless Sentinel rejects `AUTH`. Here the
+/// Sentinel connection already succeeded, so any DSN reaching this point had none to
+/// send — a Sentinel that needs its own password still requires the explicit
+/// `?master=` form.
+pub(super) async fn master_dsn_via_sentinel(
+    sentinel_dsn: &str,
+    conn: &mut MultiplexedConnection,
+) -> Result<String> {
+    let reply: redis::Value = redis::cmd("SENTINEL")
+        .arg("MASTERS")
+        .query_async(conn)
+        .await
+        .map_err(|e| {
+            RedError::Connect(format!(
+                "this is a Sentinel, but listing its masters failed: {e}"
+            ))
+        })?;
+    pick_master_dsn(sentinel_dsn, &parse_sentinel_masters(&reply))
+}
+
+/// Choose the data node from a Sentinel's monitored masters: the pure half of
+/// [`master_dsn_via_sentinel`], so the rule can be tested without a Sentinel.
+pub(super) fn pick_master_dsn(sentinel_dsn: &str, masters: &[SentinelMaster]) -> Result<String> {
+    match masters {
+        [] => Err(RedError::Connect(
+            "this address is a Sentinel and it monitors no master, so there is no data \
+             node to browse"
+                .to_string(),
+        )),
+        [only] => node_dsn(sentinel_dsn, &only.host, only.port),
+        many => {
+            let names: Vec<&str> = many.iter().map(|m| m.name.as_str()).collect();
+            Err(RedError::Connect(format!(
+                "this address is a Sentinel monitoring {} masters ({}); name the one to \
+                 connect to in the connection's Sentinel master field",
+                many.len(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
 /// Parse a `SENTINEL MASTERS` reply: an array of masters, each a flat
 /// `[field, value, field, value, ...]` map. Pulls `name`/`ip`/`port`; a
 /// master missing any of those (or with an unparseable port) is skipped.

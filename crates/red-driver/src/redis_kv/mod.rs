@@ -120,7 +120,38 @@ impl RedisDriver {
     /// so no dedicated form field is required.
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         let dsn = resolve_sentinel(dsn).await?;
-        let dsn = dsn.as_str();
+        let driver = Self::dial(&dsn, read_only).await?;
+        // A Sentinel answers `PING` and `INFO` but knows no data command, so dialling
+        // one directly yields a connection that looks healthy and then fails on the
+        // first key read with `unknown command 'SCAN'`. The probe above has just
+        // learned `redis_mode:sentinel`, so resolve the master through the connection
+        // already open rather than handing back a session that cannot read a key.
+        //
+        // Only reached when the DSN named no master group: with `?master=`,
+        // `resolve_sentinel` has already rewritten the address to the data node and
+        // this is a data node's topology.
+        if driver.topology != KvTopology::Sentinel {
+            return Ok(driver);
+        }
+        let mut conn = driver.conn.clone();
+        let data_dsn = master_dsn_via_sentinel(&dsn, &mut conn).await?;
+        let mut resolved = Self::dial(&data_dsn, read_only).await?;
+        // Report *how it was reached* only where that is the whole story. A resolved
+        // master that turns out to be a cluster member keeps `Cluster`, because that
+        // is the topology governing behaviour (slot routing, scan fan-out) and
+        // relabelling it would hide that.
+        if resolved.topology == KvTopology::Standalone {
+            resolved.topology = KvTopology::Sentinel;
+        }
+        Ok(resolved)
+    }
+
+    /// One dial: open the connection and probe what is on the other end.
+    ///
+    /// Split from [`connect`](Self::connect) because a Sentinel address has to be
+    /// dialled *before* RED can know it is one, and the answer is a second dial at a
+    /// different host.
+    async fn dial(dsn: &str, read_only: bool) -> Result<Self> {
         let client = redis::Client::open(dsn).map_err(|e| RedError::Connect(e.to_string()))?;
         let mut conn = client
             .get_multiplexed_async_connection()
@@ -1543,6 +1574,72 @@ mod tests {
         assert_ne!(key_slot("{}.a"), key_slot("{}.b"));
         // Every slot is in range.
         assert!(key_slot("anything") < CLUSTER_SLOTS);
+    }
+
+    #[test]
+    fn a_lone_monitored_master_resolves_without_being_named() {
+        // The reported bug: pointing RED at a Sentinel (`127.0.0.1:26379`) with no
+        // master group set connected, then failed on the first key read with
+        // `unknown command 'SCAN'` -- because a Sentinel answers PING and INFO but
+        // no data command. One monitored master is unambiguous, so it resolves
+        // silently, as other clients do.
+        let masters = vec![SentinelMaster {
+            name: "mymaster".to_string(),
+            host: "10.0.0.7".to_string(),
+            port: 6379,
+        }];
+        let dsn = pick_master_dsn("redis://127.0.0.1:26379", &masters).expect("resolves");
+        assert!(
+            dsn.starts_with("redis://10.0.0.7:6379"),
+            "should point at the data node, got {dsn}"
+        );
+    }
+
+    #[test]
+    fn several_monitored_masters_are_not_guessed_between() {
+        // Picking one would silently browse a database the user did not choose, so
+        // the error names them instead.
+        let masters = vec![
+            SentinelMaster {
+                name: "orders".to_string(),
+                host: "10.0.0.7".to_string(),
+                port: 6379,
+            },
+            SentinelMaster {
+                name: "sessions".to_string(),
+                host: "10.0.0.8".to_string(),
+                port: 6379,
+            },
+        ];
+        let err = pick_master_dsn("redis://127.0.0.1:26379", &masters).expect_err("must not guess");
+        let message = err.to_string();
+        assert!(
+            message.contains("orders") && message.contains("sessions"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_sentinel_monitoring_nothing_says_so() {
+        let err = pick_master_dsn("redis://127.0.0.1:26379", &[]).expect_err("no data node");
+        assert!(err.to_string().contains("no master"), "{err}");
+    }
+
+    #[test]
+    fn resolving_preserves_tls_and_credentials_for_the_data_node() {
+        // Only host and port change: the scheme carries TLS and the credentials
+        // belong to the data node, not to the Sentinel.
+        let masters = vec![SentinelMaster {
+            name: "mymaster".to_string(),
+            host: "10.0.0.7".to_string(),
+            port: 6380,
+        }];
+        let dsn =
+            pick_master_dsn("rediss://user:pw@127.0.0.1:26379/2", &masters).expect("resolves");
+        assert!(dsn.starts_with("rediss://"), "TLS scheme kept: {dsn}");
+        assert!(dsn.contains("user:pw@"), "credentials kept: {dsn}");
+        assert!(dsn.contains("10.0.0.7:6380"), "address swapped: {dsn}");
+        assert!(dsn.ends_with("/2"), "db index kept: {dsn}");
     }
 
     #[test]
