@@ -3,6 +3,9 @@
 //! About tab surfaces so a build is unambiguous in bug reports and update checks
 //!. Best-effort: a source archive with no
 //! git degrades the SHA to "unknown" rather than failing the build.
+//!
+//! On Windows it also embeds `assets/red.ico` as the executable's icon resource
+//! (see [`embed_windows_icon`]).
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,7 +35,51 @@ fn main() {
     // previous strings embedded, which is impossible to tell apart from a broken
     // catalog.
     println!("cargo:rerun-if-changed=../../assets/i18n");
+
+    embed_windows_icon();
 }
+
+/// Embed `assets/red.ico` as the Windows executable's icon resource.
+///
+/// This is what puts an icon on the **window and the taskbar**, not only on the
+/// file in Explorer, and the two are the same mechanism rather than a coincidence:
+/// GPUI's Win32 backend calls `LoadImageW(module, PCWSTR(1), IMAGE_ICON, …)` and
+/// installs the result as the window class icon. Its failure is an
+/// `unwrap_or_default()` to a null handle, which is precisely why an un-decorated
+/// RED.exe produced an un-decorated window and nothing said so. `winresource`
+/// assigns the icon resource id 1, which is the id that call asks for.
+///
+/// **Best-effort, like the git SHA above.** A missing resource compiler warns and
+/// carries on rather than failing the build: `rc.exe` ships with the Windows SDK
+/// and is normally present alongside MSVC, but a machine without it should still be
+/// able to build and run RED. The warning is there because a silently icon-less
+/// build is indistinguishable from this having never been wired up.
+#[cfg(windows)]
+fn embed_windows_icon() {
+    // The *target*, not the host. `cfg(windows)` above is the host (build scripts
+    // run there); a Windows host cross-compiling for Linux must not staple a PE
+    // resource onto an ELF binary.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=../../assets/red.ico");
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("../../assets/red.ico")
+        // Shown in the file's Properties → Details. Worth setting explicitly
+        // because the crate is `red` while the binary is `RED.exe`, so the
+        // package-name defaults would read wrong.
+        .set("ProductName", "RED")
+        .set("FileDescription", "RED — Roughly Enough Data");
+    if let Err(e) = res.compile() {
+        println!(
+            "cargo:warning=RED.exe has no icon: embedding assets/red.ico failed ({e}). \
+             This needs the Windows SDK's resource compiler (rc.exe) on PATH."
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn embed_windows_icon() {}
 
 /// Today's UTC date as `YYYY-MM-DD`. Converts the Unix day count to a civil date
 /// with Howard Hinnant's `days_from_civil` inverse, exact for any date and free

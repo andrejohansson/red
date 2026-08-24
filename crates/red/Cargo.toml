@@ -76,6 +76,14 @@ hex.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+# Gated on the *host* being Windows, not the target: `build-dependencies` under a
+# `cfg` are selected by host, and the resource compiler this drives (`rc.exe`, from
+# the Windows SDK) only exists there. build.rs checks the target separately, so a
+# Windows host cross-compiling for Linux doesn't try to staple a PE resource onto
+# an ELF.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { workspace = true, features = ["font-kit"] }
 gpui_platform = { workspace = true, features = ["font-kit"] }

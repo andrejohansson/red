@@ -147,6 +147,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- Embedded assets (fonts baked into the binary) ---
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 
+# --- Windows executable resources (build-dependency, host-Windows only) ---
+# Embeds `assets/red.ico` as the .exe's icon resource. This decorates the window
+# and taskbar as well as the file in Explorer, and not by coincidence: GPUI's Win32
+# backend loads icon resource **id 1** from the running module and installs it as
+# the window class icon (`gpui_windows`'s `load_icon`, whose failure is a silent
+# `unwrap_or_default()` — which is exactly why RED's window had no icon). `winresource`
+# assigns id 1 by default, so one embed satisfies both.
+winresource = "0.1"
+
 # --- Live config reload (watch settings.toml, re-apply without a restart) ---
 notify = "6"
 

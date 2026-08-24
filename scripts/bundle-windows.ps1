@@ -6,11 +6,11 @@
 #
 # The zip is a first-cut portable install (RED.exe + LICENSE + README + a
 # `.red-portable` marker the self-updater uses to tell a real install from a dev
-# build). The exe carries the default Windows icon for now; embedding
-# assets/red.svg as the .exe icon (via the `winresource` crate in build.rs) and
-# shipping a signed MSI are documented follow-ups — see
-# docs/plans/future/cross-platform.md. Authenticode signing is left to the
-# release pipeline; self-update integrity currently rests on the .sha256 sidecar.
+# build). The exe now carries RED's own icon: crates/red/build.rs embeds
+# assets/red.ico as icon resource id 1, which also decorates the window and the
+# taskbar, since GPUI's Win32 backend loads that id as the window class icon. A
+# signed MSI is still a follow-up. Authenticode signing is left to the release
+# pipeline; self-update integrity currently rests on the .sha256 sidecar.
 param(
   [string]$Version = ""
 )
