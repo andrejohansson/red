@@ -87,10 +87,13 @@ run**: there is no test project yet, so those tests skip.
 Each premise below is load-bearing for the ADR named beside it. Treat them as
 unverified until the live suite runs against a real project.
 
-- **`COUNT(*)` bills 0 bytes through RED's wrapping.** BigQuery answers
-  `COUNT(*)` from metadata, but RED asks it as
-  `SELECT count(*) FROM (SELECT * FROM t) AS _red`. The optimizer should prune to
-  zero columns; if it does not, every browse open pays for a full scan. (ADR-0002)
+- **`COUNT(*)` bills 0 bytes through RED's wrapping** — now only on the fallback
+  path, and so much less load-bearing than it was. BigQuery answers `COUNT(*)`
+  from metadata, but RED asks it as
+  `SELECT count(*) FROM (SELECT * FROM t) AS _red`, and the optimizer has to prune
+  to zero columns for that to stay free. The common path no longer depends on it:
+  a finished job already knows its own `totalRows`, so a cached result's count is
+  a metadata read. The wrap survives only for a cache miss. (ADR-0002)
 - **`startIndex` re-reads a completed job without re-billing.** The whole job
   cache exists for this. If a `getQueryResults` read against a cached job bills a
   scan, offset paging is no cheaper than re-querying. (ADR-0002)
