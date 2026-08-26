@@ -53,6 +53,13 @@ cargo test --workspace
 CI runs the same three checks on every pull request; a PR can't merge until they
 pass.
 
+The Linux and Windows builds are *not* on that path — a cold cache makes them a
+full GPUI compile, which dominated PR wall-clock. They run weekly (and on demand
+from the Actions tab) as
+[`cross-platform.yml`](.github/workflows/cross-platform.yml). If your change
+touches platform-specific code, kick that workflow by hand rather than waiting
+for the release build to find it.
+
 ## Working on Flint and RED together
 
 Flint is pinned by git rev in [`Cargo.toml`](Cargo.toml) so outside contributors
