@@ -4,6 +4,13 @@ All notable changes to RED are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The database-knowledge window opens again. It was laid out one whole
+  window-height below the app, so the command palette, the assistant's buttons
+  and the agent handing back a finished draft all appeared to do nothing.
+
 ## [0.23.0] - 2026-08-21
 
 ### Added
