@@ -10,6 +10,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The database-knowledge window opens again. It was laid out one whole
   window-height below the app, so the command palette, the assistant's buttons
   and the agent handing back a finished draft all appeared to do nothing.
+- AI assistant sign-in: the authorize URL is now read from both of the sign-in command's output streams, not stdout alone - it lands on stderr when stdout is a pipe rather than a terminal, which left the flow stuck on Linux.
+- AI assistant sign-in: when the sign-in command exits before printing a URL, its own error output and exit code are reported instead of a bare "sign-in ended before a URL appeared".
 
 ## [0.23.0] - 2026-08-21
 
