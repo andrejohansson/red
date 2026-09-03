@@ -130,7 +130,7 @@ shortcuts-mongodb_browser-collapse_expand_a_database = [Çöllápsé / éxpáñd
 
 shortcuts-mongodb_browser-open_the_highlighted_collection_document = [Öpéñ thé híghlíghtéd çölléçtíöñ / döçúméñt]
 
-shortcuts-mongodb_browser-focus_collection_tree_document_grid = [Föçús çölléçtíöñ tréé / döçúméñt gríd]
+shortcuts-mongodb_browser-focus_collection_tree_document_grid = [Shöw á júmp kéy öñ évéry páñél, théñ préss ít]
 
 shortcuts-mongodb_browser-search_collections_tree_filter_documents_grid = [Séárçh çölléçtíöñs (tréé) / fíltér döçúméñts (gríd)]
 

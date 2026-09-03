@@ -14,8 +14,8 @@ mod modules;
 
 pub use export::{
     KV_DUMP_MAGIC, KV_EXPORT_CHUNK, KvDumpEntry, KvExportFormat, KvExportOptions, KvExportScope,
-    b64_encode, command_line, commands_header, dump_frame, expire_line, is_lossy_text, json_binary,
-    json_string, quote_arg, read_dump_frame, read_dump_frame_from,
+    MAX_DUMP_FRAME, b64_encode, command_line, commands_header, dump_frame, expire_line,
+    is_lossy_text, json_binary, json_string, quote_arg, read_dump_frame, read_dump_frame_from,
 };
 pub use info::parse_info;
 pub use json::{
@@ -393,6 +393,14 @@ pub enum KvEdit {
         key: String,
         value: String,
         ttl: StringTtl,
+        /// Refuse if the key already exists (`SET … NX`).
+        ///
+        /// `true` for the "New key" form, which is offering to *create* one:
+        /// without it, typing a name that already exists silently replaced that
+        /// key's value, with no confirmation and nothing in the recycle bin.
+        /// `false` for the inspector's edit of a key it is already showing, where
+        /// overwriting is the whole point.
+        create_only: bool,
     },
     SetField {
         key: String,

@@ -818,6 +818,7 @@ mod tests {
             _key: &str,
             _value: String,
             _ttl: red_core::kv::StringTtl,
+            _create_only: bool,
         ) -> red_core::Result<()> {
             unimplemented!()
         }

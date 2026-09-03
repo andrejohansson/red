@@ -28,6 +28,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Releases now run the full test suite, lint and format check on the tag before publishing anything, build with `--locked`, grant `contents: write` per job instead of workflow-wide, and verify the AppImage packaging tool against a pinned digest.
 
 ### Changed
+- `SECURITY.md` now documents the contact route, the supported versions, what RED
+  protects (credentials, destructive statements, the AI gate, transport) and the
+  update trust model, instead of being six lines with none of it.
 - The privacy note in the README now says plainly that RED checks GitHub for updates every six hours, and how to turn that off. It previously claimed no network calls of its own.
 - The driver conformance job in CI runs against ClickHouse, Redis and MongoDB as well as Postgres and MySQL, and fails when an engine is missing instead of skipping and reporting green.
 
@@ -35,6 +38,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The database-knowledge window opens again. It was laid out one whole
   window-height below the app, so the command palette, the assistant's buttons
   and the agent handing back a finished draft all appeared to do nothing.
+- Watch mode grades the statement the grid will actually re-run, not the editor's
+  text. The two differ for a table browse, an FK click-through, or an editor typed
+  into since the run, and the check is repeated each tick.
+- A failed page fetch no longer leaves a permanently blank band in the middle of a
+  result, and a failed clipboard re-fetch no longer swallows every later copy.
+- Redis: a copy of a key to another server reports a name collision instead of
+  overwriting what is there, and the "New key" form refuses a name that already
+  exists rather than replacing that key's value.
+- Redis: exporting lists longer than the read window says so, and an export writes
+  to disk without blocking the backend.
+- ClickHouse: a `SELECT` in a script body no longer pulls its whole result into
+  memory to discard it.
+- AI approval prompts say how much of a payload they are not showing, and label
+  what the agent *claims* a session or client is running as a claim rather than as
+  something RED has checked.
 - TLS to Redis (`rediss://`) or MySQL (`require_ssl`) no longer panics the backend on the first connection.
 - A Redis string value over 8 KiB containing a multibyte or binary byte near the cap no longer panics the backend.
 - A TTL of `inf`, `NaN` or `1e300` in the Redis "New key" form is reported instead of panicking the interface.

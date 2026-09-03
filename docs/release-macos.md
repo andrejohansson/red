@@ -4,11 +4,14 @@
 > → sign with a Developer ID → notarize with Apple → staple → package a `.dmg`,
 > all automated from a `v*` git tag in CI.
 
-This is the canonical release guide. It assumes the repo state as of writing:
-the binary target is **`RED`** (`crates/red/Cargo.toml`), all runtime assets
-(fonts, icons, default settings) are **baked into the binary** via `rust-embed`,
-and there is currently **no `.app` bundle**, so macOS derives the menu title from
-the executable filename. Bundling is the first thing this guide adds.
+This is the canonical release guide, and it describes what **ships today**:
+`.github/workflows/release.yml` builds, signs, notarizes, staples and publishes
+from a `v*` tag, and `scripts/bundle-macos.sh` assembles the `.app`. The binary
+target is **`RED`** (`crates/red/Cargo.toml`) and all runtime assets (fonts,
+icons, default settings) are baked into it via `rust-embed`.
+
+Read this to understand or change that pipeline, or to reproduce it locally. The
+sections below walk it in the order the workflow does.
 
 ## Why this matters
 

@@ -966,9 +966,8 @@ impl MongoView {
         }
     }
 
-    /// The relations diagram *state* shown by the tab at `idx` (the canvas plus
-    /// the evidence), where [`relations`](Self::relations) hands back only the
-    /// canvas the shared ER renderer needs.
+    /// The relations diagram *state* shown by the tab at `idx`: the canvas the
+    /// shared ER renderer draws, plus the evidence panel's own state beside it.
     pub(crate) fn relations_at(&self, idx: usize) -> Option<&RelationsView> {
         match self.tabs.get(idx).map(|t| &t.state)? {
             MongoTabState::Relations(r) => Some(&**r),

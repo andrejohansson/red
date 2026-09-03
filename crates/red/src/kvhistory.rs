@@ -10,7 +10,7 @@
 //! # This is a view
 //!
 //! The third surface extracted under Tier 1 of
-//! `docs/plans/todo/zed-architecture-inspiration.md`, after `KnowledgeEditor`
+//! the view-per-surface extraction, after `KnowledgeEditor`
 //! and the SQL `HistoryPanel`. It owns its search box, focus handle and section
 //! collapse, and holds both stores as handles so it re-derives its rows every
 //! frame and `cx.observe`s them: viewing a key or running a command redraws the

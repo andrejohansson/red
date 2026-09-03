@@ -12,10 +12,7 @@ use red_core::DbKind;
 // gate classifies as one statement is exactly what the engine is handed, and both
 // read-only gates reason over the same stripped copy with the same token lists.
 pub use red_core::sql::Dialect;
-use red_core::sql::{
-    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_call, has_word, is_routine_ddl,
-    split_statements, statement_ranges, strip_noise,
-};
+use red_core::sql::{first_keyword, is_routine_ddl, split_statements, statement_ranges};
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
 pub const KEYWORDS: &[&str] = &[
@@ -527,36 +524,17 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
 /// (`SELECT lo_export(…)`) is an ordinary read as far as grading is concerned, and
 /// auto-running someone else's SQL deserves a narrower gate than running your own.
 ///
-/// This is the UI twin of `red-service`'s `is_read_only_select`, and reasons the
-/// same way: over a `strip_noise` copy so a write word inside a string can't fool it
-/// and a quoted column named like one can't trip it, against the same shared
-/// `WRITE_TOKENS` / `DANGEROUS_FNS`. It stays a separate function because it is
-/// deliberately looser about the *leading* keyword: the editor may auto-run an
-/// `EXPLAIN` or a bare `VALUES`, where the assistant's `run_select` may not. False
-/// positives are fine: a rejected read just doesn't auto-run; the user can still
-/// press Run.
+/// One call into `red_core::sql::classify`, with this surface's own policy for
+/// which leading keywords count as a read. The assistant's gate is the same call
+/// with [`AGENT_READ_LEADING`](red_core::sql::AGENT_READ_LEADING) instead: the
+/// scan, the token lists and the noise-stripping are shared, and the only thing
+/// that differs is the one thing that genuinely does — the editor may auto-run an
+/// `EXPLAIN` or a bare `VALUES`, where `run_select` may not.
+///
+/// False positives are fine: a rejected read just doesn't auto-run; the user can
+/// still press Run.
 pub fn is_read_only(sql: &str, dialect: Dialect) -> bool {
-    let stripped = strip_noise(sql, dialect);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // A `;` (outside a literal, already blanked) could chain a write past the prefix.
-    if trimmed.contains(';') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let read_prefix = ["select", "with", "explain", "values"]
-        .iter()
-        .any(|p| lower.starts_with(p));
-    if !read_prefix {
-        return false;
-    }
-    // Verbs are matched as whole words (they can't be bare identifiers); the
-    // function denylist is matched in call position, because several of its names
-    // (`url`, `file`, `sleep`) are ordinary column names.
-    !WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
-        && !DANGEROUS_FNS.iter().any(|f| has_call(&lower, f))
+    red_core::sql::classify(sql, dialect).is_read(red_core::sql::EDITOR_READ_LEADING)
 }
 
 /// The single `;`-delimited statement to run for a caret at `cursor`: the

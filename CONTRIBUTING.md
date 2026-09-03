@@ -85,12 +85,20 @@ across both repos, not something to do casually in a feature PR.
 
 ## Architecture in brief
 
-- **`red`**: the GPUI application binary; renders all UI on the main thread.
+- **`red`**: the GPUI application binary; renders all UI on the main thread, and
+  hosts the headless CLI (`red query`, `exec`, …).
 - **`red-core`**: shared domain types (`Value`, `QueryResult`, `RedError`, …)
-  with no UI or runtime knowledge.
-- **`red-driver`**: the `DatabaseDriver` trait and engine implementations
-  (SQLite, PostgreSQL, MySQL). The *only* seam to a database engine.
-- **`red-service`**: the Tokio backend thread and the `Command`/`Event` bridge.
+  and the SQL/KV/document vocabularies, with no UI or runtime knowledge.
+- **`red-driver`**: the three engine seams and their implementations —
+  `DatabaseDriver` (SQLite, PostgreSQL, MySQL/MariaDB, ClickHouse), `KvDriver`
+  (Redis/Valkey) and `DocDriver` (MongoDB). The *only* seam to a database engine.
+- **`red-service`**: the Tokio backend thread and the `Command`/`Event` bridge,
+  plus the AI tool gate and the MCP/ACP hosts.
+- **`red-config`**: the saved-connection list, the OS keychain, and the
+  query/saved-query/plan stores. UI-free, so the CLI reads the same files.
+- **`red-ai`**: the Claude Messages API client (streaming, tool use).
+- **`red-acp`**: the Agent Client Protocol client, for a Claude subscription
+  agent run as a subprocess.
 
 The UI never blocks on the backend: it sends `Command`s and observes `Event`s
 over channels. The UI speaks `red-core` types and Commands/Events, **never**

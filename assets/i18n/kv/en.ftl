@@ -48,13 +48,19 @@ kv-commands_ready = { $count } { $unit }(s) ready to run
 
 kv-import_destructive = { $count } destructive command(s) in this file:
 
+kv-import_ack = Run these commands against this server
+
 kv-import_keys = Import keys
 
 kv-export_keys = Export keys
 
 kv-this_cant_be_undone = This can't be undone.
 
+kv-json_delete_cant_be_undone = Deleting inside a JSON document takes no recycle-bin snapshot, so this can't be undone.
+
 kv-delete_key = Delete key
+
+kv-delete_json_node = Delete JSON node
 
 kv-rename_key = Rename key
 
@@ -86,7 +92,9 @@ kv-copied_one_key = Copied 1 key
 
 kv-copied_keys_ok = Copied { $copied } keys
 
-kv-copied_keys = Copied { $copied } key(s), { $failed } failed
+kv-copied_keys_skipped = Copied { $copied } key(s). { $skipped } already existed on the target and were left as they are; delete them there first to replace them.
+
+kv-copied_keys = Copied { $copied } key(s), { $failed } failed, { $skipped } already existed
 
 kv-note = note…
 

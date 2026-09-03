@@ -3534,3 +3534,272 @@ async fn committing_a_manual_transaction_makes_it_durable() {
     send(&handle, Command::Shutdown);
     std::fs::remove_file(&path).ok();
 }
+
+/// Report a live-engine test being skipped, and refuse to skip in CI. A twin of
+/// `red_driver`'s `skip_or_fail`, which is `#[cfg(test)]`-only inside that crate
+/// and so unreachable from here.
+fn skip_or_fail(var: &str, module: &str) {
+    if std::env::var_os("RED_TEST_REQUIRE_LIVE").is_some() {
+        panic!("{module}: {var} is not set, but RED_TEST_REQUIRE_LIVE demands a live engine");
+    }
+    eprintln!("SKIP {module}: {var} not set");
+}
+
+macro_rules! redis_url_or_skip {
+    () => {
+        match std::env::var("RED_TEST_REDIS_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                skip_or_fail("RED_TEST_REDIS_URL", module_path!());
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! mongo_url_or_skip {
+    () => {
+        match std::env::var("RED_TEST_MONGO_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                skip_or_fail("RED_TEST_MONGO_URL", module_path!());
+                return;
+            }
+        }
+    };
+}
+
+/// A Redis connection config from a `redis://` URL, so the test dials the same
+/// way the app does (through `parse_conn_str` + `dsn`) rather than by hand.
+fn redis(url: &str, read_only: bool) -> ConnectionConfig {
+    let parsed = ConnectionConfig::parse_conn_str(url).expect("a redis:// URL");
+    ConnectionConfig {
+        name: "redis-scratch".into(),
+        kind: DbKind::Redis,
+        host: parsed.host,
+        port: parsed.port,
+        user: parsed.user,
+        password: parsed.password,
+        read_only,
+        ..Default::default()
+    }
+}
+
+fn mongo(url: &str, read_only: bool) -> ConnectionConfig {
+    let parsed = ConnectionConfig::parse_conn_str(url).expect("a mongodb:// URL");
+    ConnectionConfig {
+        name: "mongo-scratch".into(),
+        kind: DbKind::Mongo,
+        host: parsed.host,
+        port: parsed.port,
+        user: parsed.user,
+        password: parsed.password,
+        read_only,
+        ..Default::default()
+    }
+}
+
+/// Drain events until one matches `f`, or give up. Kv/Doc arms interleave
+/// progress and refresh events, so a test that asserted on the *next* event would
+/// be testing event ordering rather than the arm.
+async fn wait_for<T>(
+    events: &mut UnboundedReceiver<(Option<SessionId>, Event)>,
+    mut f: impl FnMut(&Event) -> Option<T>,
+) -> T {
+    for _ in 0..64 {
+        let Some(event) = next(events).await else {
+            break;
+        };
+        if let Some(v) = f(&event) {
+            return v;
+        }
+    }
+    panic!("the event never arrived");
+}
+
+/// The Redis write arms end to end through dispatch: set, read back, delete, and
+/// the recycle-bin snapshot the delete takes on the way. None of the `Kv*` arms
+/// had dispatch-level coverage before.
+#[tokio::test]
+async fn redis_edit_arms_write_read_and_recycle() {
+    let url = redis_url_or_skip!();
+    let key = format!("red:test:dispatch:{}", uuid::Uuid::new_v4().simple());
+    let epoch = crate::Epoch::new(1);
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(redis(&url, false)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::KvApplyEdit {
+            epoch,
+            edit: red_core::kv::KvEdit::SetString {
+                key: key.clone(),
+                value: "hello".into(),
+                ttl: red_core::kv::StringTtl::Clear,
+                create_only: true,
+            },
+        },
+    );
+    wait_for(&mut events, |e| {
+        matches!(e, Event::KvEditApplied { .. }).then_some(())
+    })
+    .await;
+
+    send(
+        &handle,
+        Command::KvReadValue {
+            epoch,
+            key: key.clone(),
+        },
+    );
+    let value = wait_for(&mut events, |e| match e {
+        Event::KvValueReady { key: k, value, .. } if *k == key => Some(value.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        matches!(value, Some(red_core::kv::KvValue::Str(_))),
+        "got {value:?}"
+    );
+
+    // `create_only` is what makes "New key" a create: a second one is refused
+    // rather than silently replacing the value.
+    send(
+        &handle,
+        Command::KvApplyEdit {
+            epoch,
+            edit: red_core::kv::KvEdit::SetString {
+                key: key.clone(),
+                value: "replaced".into(),
+                ttl: red_core::kv::StringTtl::Clear,
+                create_only: true,
+            },
+        },
+    );
+    let refusal = wait_for(&mut events, |e| match e {
+        Event::Error(m) => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(refusal.contains("already exists"), "{refusal}");
+
+    // The delete snapshots into the recycle bin first, which is what makes it
+    // undoable.
+    send(
+        &handle,
+        Command::KvApplyEdit {
+            epoch,
+            edit: red_core::kv::KvEdit::Delete {
+                keys: vec![key.clone()],
+            },
+        },
+    );
+    let recycled = wait_for(&mut events, |e| match e {
+        Event::KvKeysRecycled { keys, .. } => Some(keys.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(recycled.len(), 1);
+    assert_eq!(recycled[0].key, key);
+    assert!(
+        !recycled[0].payload.is_empty(),
+        "a snapshot with no payload"
+    );
+
+    send(
+        &handle,
+        Command::KvRestoreKeys {
+            epoch,
+            keys: recycled,
+        },
+    );
+    let count = wait_for(&mut events, |e| match e {
+        Event::KvKeysRestored { count, .. } => Some(*count),
+        _ => None,
+    })
+    .await;
+    assert_eq!(count, 1, "the recycle bin's undo puts the key back");
+
+    send(
+        &handle,
+        Command::KvApplyEdit {
+            epoch,
+            edit: red_core::kv::KvEdit::Delete { keys: vec![key] },
+        },
+    );
+    send(&handle, Command::Shutdown);
+}
+
+/// A read-only Redis connection refuses every write arm at the dispatch layer,
+/// before the driver is asked.
+#[tokio::test]
+async fn a_read_only_redis_session_refuses_writes() {
+    let url = redis_url_or_skip!();
+    let epoch = crate::Epoch::new(1);
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(redis(&url, true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::KvApplyEdit {
+            epoch,
+            edit: red_core::kv::KvEdit::SetString {
+                key: "red:test:ro".into(),
+                value: "nope".into(),
+                ttl: red_core::kv::StringTtl::Clear,
+                create_only: false,
+            },
+        },
+    );
+    let message = wait_for(&mut events, |e| match e {
+        Event::Error(m) => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(message.to_lowercase().contains("read-only"), "{message}");
+
+    send(&handle, Command::Shutdown);
+}
+
+/// The MongoDB read arms end to end through dispatch. The `Doc*` arms had no
+/// dispatch-level coverage either.
+#[tokio::test]
+async fn mongo_arms_list_and_page() {
+    let url = mongo_url_or_skip!();
+    let epoch = crate::Epoch::new(1);
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(mongo(&url, true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(&handle, Command::DocListDatabases { epoch });
+    let databases = wait_for(&mut events, |e| match e {
+        Event::DocDatabases { databases, .. } => Some(databases.clone()),
+        _ => None,
+    })
+    .await;
+    // A fresh server still reports its own admin databases, so this is a real
+    // assertion rather than a tautology.
+    assert!(
+        !databases.is_empty(),
+        "a Mongo server always has at least the admin databases"
+    );
+
+    send(&handle, Command::Shutdown);
+}

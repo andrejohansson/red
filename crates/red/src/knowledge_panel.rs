@@ -19,7 +19,7 @@
 //! renders itself, owns its subscriptions, and reports what happened by emitting
 //! [`KnowledgeEditorEvent`] rather than by reaching into [`AppState`]. It is the
 //! first surface in RED extracted this way (see
-//! `docs/plans/todo/zed-architecture-inspiration.md`, Tier 1), and the pattern
+//! the view-per-surface extraction), and the pattern
 //! the rest should copy:
 //!
 //! - **State and behaviour live together.** Saving is `KnowledgeEditor::save`,

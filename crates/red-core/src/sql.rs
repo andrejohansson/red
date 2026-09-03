@@ -852,6 +852,95 @@ pub fn has_word(haystack: &str, word: &str) -> bool {
         .any(|tok| tok == word)
 }
 
+/// What one piece of SQL *is*, as every gate in RED needs to know it.
+///
+/// The four questions the read gates, the write gate and the risk grading were
+/// each answering separately, in four hand-written scans over four slightly
+/// different token lists. That drift was not theoretical: the `EXPLAIN ANALYZE`
+/// gate asked the risk grading whether a statement was safe, and the risk grading
+/// grades every `SELECT` safe - including `SELECT lo_import('/etc/passwd')` -
+/// because "how much does this destroy" is a different question from "does this
+/// only read".
+///
+/// So the questions are separated here and answered once. A caller composes the
+/// ones it cares about; the *policy* (which leading keywords it will accept) stays
+/// with the caller, because that genuinely differs — the editor may auto-run an
+/// `EXPLAIN`, the assistant's `run_select` may not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// How much this destroys, from [`assess`]. Unchanged semantics: a batch
+    /// grades as its most dangerous member.
+    pub level: RiskLevel,
+    /// Exactly one runnable statement. `false` for a chained batch *and* for
+    /// nothing runnable at all (blank, comment-only), so a caller never has to
+    /// spell both.
+    pub single: bool,
+    /// The leading keyword of the first runnable statement, lower-cased. Empty
+    /// when there is none.
+    pub leading: String,
+    /// A write verb or a side-effecting function survives noise-stripping
+    /// anywhere in the text.
+    ///
+    /// The question `level` cannot answer: `SELECT setval(…)`,
+    /// `WITH x AS (DELETE …) SELECT * FROM x` and `SELECT … INTO t2` all grade
+    /// Safe by blast radius and all write.
+    pub side_effects: bool,
+}
+
+impl Verdict {
+    /// Whether this is a single statement that only reads, and whose leading
+    /// keyword is one the caller accepts.
+    ///
+    /// The one shape both read gates are: they differ *only* in `allowed`, which
+    /// is the policy each owns. Passing it in is what keeps them from drifting
+    /// into two different scans again.
+    pub fn is_read(&self, allowed: &[&str]) -> bool {
+        self.single && !self.side_effects && allowed.contains(&self.leading.as_str())
+    }
+}
+
+/// The leading keywords the **assistant's** read tools accept: a `SELECT`, or a
+/// CTE that resolves to one.
+pub const AGENT_READ_LEADING: &[&str] = &["select", "with"];
+
+/// The leading keywords the **editor** will auto-run: the agent's two, plus the
+/// forms a person legitimately types into a query tab and expects to open in the
+/// grid. Looser on purpose - a false positive here costs an auto-run the user can
+/// still trigger by hand.
+pub const EDITOR_READ_LEADING: &[&str] = &["select", "with", "explain", "values"];
+
+/// Answer every gate's question about `sql` in one pass.
+///
+/// `dialect` must be the engine that will run it: statement boundaries, comment
+/// forms and string escapes differ per engine, and scanning against the wrong
+/// lexing is the drift this module exists to prevent.
+pub fn classify(sql: &str, dialect: Dialect) -> Verdict {
+    let statements: Vec<&str> = split_statements(sql, dialect)
+        .into_iter()
+        .filter(|s| !first_keyword(&strip_noise(s, dialect)).is_empty())
+        .collect();
+    let leading = statements
+        .first()
+        .map(|s| first_keyword(&strip_noise(s, dialect)).to_ascii_lowercase())
+        .unwrap_or_default();
+    // Read over the whole input, not per statement: a caller that has already
+    // established `single` wants one answer, and one that has not is asking
+    // "does anything in here write".
+    let lower = strip_noise(sql, dialect).to_ascii_lowercase();
+    // Verbs are matched as whole words - they are reserved and cannot be bare
+    // identifiers - while the function denylist is matched in call position,
+    // because several of its names (`url`, `file`, `sleep`) are ordinary column
+    // names. See [`has_call`].
+    let side_effects = WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
+        || DANGEROUS_FNS.iter().any(|f| has_call(&lower, f));
+    Verdict {
+        level: assess(sql, dialect).level,
+        single: statements.len() == 1,
+        leading,
+        side_effects,
+    }
+}
+
 /// Whether `sql` is a statement the engine refuses to run inside an explicit
 /// transaction block, so a caller that wraps writes in `BEGIN`/`COMMIT` must run
 /// this one bare.
@@ -939,7 +1028,10 @@ pub fn has_call(haystack: &str, word: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dialect, first_keyword, has_call, has_word, requires_autocommit};
+    use super::{
+        AGENT_READ_LEADING, Dialect, EDITOR_READ_LEADING, RiskLevel, first_keyword, has_call,
+        has_word, requires_autocommit,
+    };
 
     /// Tests that don't probe a dialect difference run under [`Dialect::Generic`];
     /// the dialect-specific behaviours have their own tests below.
@@ -990,6 +1082,56 @@ mod tests {
         );
         assert_eq!(s.len(), 2, "got {s:#?}");
         assert_eq!(s[1].trim(), "SELECT 3");
+    }
+
+    /// One classifier, four questions. The bug this replaces: the
+    /// `EXPLAIN ANALYZE` gate asked the *risk grading* whether a statement was
+    /// safe, and the grading answers "how much does this destroy" - which is
+    /// `Safe` for every `SELECT`, including one that writes a file.
+    #[test]
+    fn classify_separates_blast_radius_from_side_effects() {
+        let v = super::classify("SELECT * FROM t", Dialect::Postgres);
+        assert!(v.single);
+        assert_eq!(v.leading, "select");
+        assert!(!v.side_effects);
+        assert_eq!(v.level, RiskLevel::Safe);
+        assert!(v.is_read(EDITOR_READ_LEADING));
+        assert!(v.is_read(AGENT_READ_LEADING));
+
+        // Graded Safe by blast radius, and it writes a file.
+        let v = super::classify("SELECT lo_export(1, '/tmp/x')", Dialect::Postgres);
+        assert_eq!(v.level, RiskLevel::Safe, "the grading is unchanged");
+        assert!(v.side_effects, "and the read gate sees what it misses");
+        assert!(!v.is_read(EDITOR_READ_LEADING));
+
+        // A data-modifying CTE leads with `with` and writes.
+        let v = super::classify(
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            Dialect::Postgres,
+        );
+        assert_eq!(v.leading, "with");
+        assert!(v.side_effects);
+        assert!(!v.is_read(AGENT_READ_LEADING));
+
+        // A chained batch is not a single statement, whatever it leads with.
+        let v = super::classify("SELECT 1; DROP TABLE users", Dialect::Postgres);
+        assert!(!v.single);
+        assert_eq!(v.leading, "select");
+        assert_eq!(v.level, RiskLevel::Critical, "graded by its worst member");
+        assert!(!v.is_read(EDITOR_READ_LEADING));
+
+        // Nothing runnable is not a single statement either, so no caller has to
+        // spell the empty case.
+        let v = super::classify("  -- just a comment\n", Dialect::Postgres);
+        assert!(!v.single);
+        assert_eq!(v.leading, "");
+        assert!(!v.is_read(EDITOR_READ_LEADING));
+
+        // The two policies differ only in what they lead with, which is the whole
+        // reason `allowed` is a parameter.
+        let v = super::classify("EXPLAIN SELECT * FROM t", Dialect::Postgres);
+        assert!(v.is_read(EDITOR_READ_LEADING), "the editor may auto-run it");
+        assert!(!v.is_read(AGENT_READ_LEADING), "run_select may not");
     }
 
     /// The `BEGIN`/`COMMIT` wrapper every write path uses is exactly what makes

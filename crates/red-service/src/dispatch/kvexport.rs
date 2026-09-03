@@ -11,7 +11,7 @@
 //! because reading every value of every key is much heavier than the scan that
 //! found them.
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,25 +63,33 @@ pub(crate) async fn run_kv_export(
     cancel: &AtomicBool,
     progress: UnboundedSender<u64>,
 ) -> Result<ExportOutcome> {
-    let file = std::fs::File::create(path).map_err(|e| RedError::Driver(e.to_string()))?;
-    let mut out = BufWriter::new(file);
+    let mut sink = FileSink::create(path).await?;
     let mut state = ExportState::default();
 
-    let result = write_all(driver, &mut out, &req, cancel, &progress, &mut state).await;
+    let result = write_all(driver, &mut sink, &req, cancel, &progress, &mut state).await;
 
     match result {
         Ok(()) => {
-            out.flush().map_err(|e| RedError::Driver(e.to_string()))?;
+            sink.finish().await?;
             Ok(ExportOutcome {
                 rows: state.written,
-                shortfall: (state.skipped > 0)
-                    .then_some(ExportShortfall::SkippedKeys(state.skipped)),
+                // One shortfall slot, so the more consequential one wins: a
+                // skipped key is absent and obvious, a truncated list is present
+                // and looks complete.
+                shortfall: (state.truncated_lists > 0)
+                    .then_some(ExportShortfall::TruncatedLists {
+                        keys: state.truncated_lists,
+                        window: LIST_WINDOW,
+                    })
+                    .or_else(|| {
+                        (state.skipped > 0).then_some(ExportShortfall::SkippedKeys(state.skipped))
+                    }),
             })
         }
         Err(e) => {
             // A cancelled or failed export leaves nothing behind, the same
             // promise `CancelExport` already makes for the SQL path.
-            drop(out);
+            drop(sink);
             let _ = std::fs::remove_file(path);
             Err(e)
         }
@@ -95,11 +103,16 @@ struct ExportState {
     written: u64,
     /// Keys a text format could not carry (see `is_lossy_text`).
     skipped: u64,
+    /// Lists longer than [`LIST_WINDOW`], written only as far as the window
+    /// reached. Counted so the export can *say* the file is short: an export that
+    /// silently drops the tail of a million-element list looks like a complete
+    /// backup right up until someone restores from it.
+    truncated_lists: u64,
 }
 
-async fn write_all<W: Write>(
+async fn write_all(
     driver: &Arc<dyn KvDriver>,
-    out: &mut W,
+    sink: &mut FileSink,
     req: &KvExportRequest,
     cancel: &AtomicBool,
     progress: &UnboundedSender<u64>,
@@ -107,6 +120,7 @@ async fn write_all<W: Write>(
 ) -> Result<()> {
     let io = |e: std::io::Error| RedError::Driver(e.to_string());
     let format = req.format;
+    let out = sink.buffer();
     match format {
         KvExportFormat::Commands => {
             out.write_all(
@@ -130,7 +144,18 @@ async fn write_all<W: Write>(
             if cancel.load(Ordering::Relaxed) {
                 return Err(RedError::Interrupted);
             }
-            write_key(driver, out, format, &meta, req.options, cancel, state).await?;
+            write_key(
+                driver,
+                sink.buffer(),
+                format,
+                &meta,
+                req.options,
+                cancel,
+                state,
+            )
+            .await?;
+            // Between keys, never mid-key: a frame has to reach the file whole.
+            sink.spill_if_full().await?;
             if state.written.saturating_sub(last_reported) >= PROGRESS_KEYS {
                 let _ = progress.send(state.written);
                 last_reported = state.written;
@@ -143,9 +168,85 @@ async fn write_all<W: Write>(
     }
 
     if format == KvExportFormat::Json {
-        out.write_all(b"\n]\n").map_err(io)?;
+        sink.buffer().write_all(b"\n]\n").map_err(io)?;
     }
     Ok(())
+}
+
+/// The export's output file, written from the async loop without blocking it.
+///
+/// Bytes accumulate in memory and are handed to `spawn_blocking` in chunks. A
+/// plain `BufWriter<File>` on this path meant every buffer flush was a
+/// synchronous disk write on the single-threaded backend runtime - so a slow or
+/// remote filesystem stalled every other session's fetches, connects and cancels
+/// for as long as the write took. The chunk bound is what keeps the memory flat;
+/// it is drained between keys, never inside one.
+struct FileSink {
+    /// `None` only while a spill is in flight, and between `finish` and drop.
+    file: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+
+/// Bytes to accumulate before handing a chunk to the blocking pool. Large enough
+/// that the hand-off is rare relative to the per-key work, small enough that the
+/// buffer is never a memory concern beside the values themselves.
+const SPILL_BYTES: usize = 256 * 1024;
+
+impl FileSink {
+    async fn create(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || std::fs::File::create(path))
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(Self {
+            file: Some(file),
+            buf: Vec::with_capacity(SPILL_BYTES * 2),
+        })
+    }
+
+    /// The in-memory buffer the writers append to. Synchronous by design: the
+    /// `Write` calls are into memory, and only [`spill_if_full`](Self::spill_if_full)
+    /// touches the disk.
+    fn buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    async fn spill_if_full(&mut self) -> Result<()> {
+        if self.buf.len() < SPILL_BYTES {
+            return Ok(());
+        }
+        self.spill().await
+    }
+
+    async fn spill(&mut self) -> Result<()> {
+        let Some(mut file) = self.file.take() else {
+            return Err(RedError::Driver("the export file is already closed".into()));
+        };
+        let chunk = std::mem::take(&mut self.buf);
+        let (file, result) = tokio::task::spawn_blocking(move || {
+            let result = file.write_all(&chunk);
+            (file, result)
+        })
+        .await
+        .map_err(|e| RedError::Driver(e.to_string()))?;
+        self.file = Some(file);
+        self.buf.reserve(SPILL_BYTES * 2);
+        result.map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    /// Write what is left and close. Consuming, so a caller cannot append after
+    /// the file is complete.
+    async fn finish(mut self) -> Result<()> {
+        self.spill().await?;
+        let Some(file) = self.file.take() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || file.sync_all())
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
 }
 
 /// One page of the scope's keys, and whether the walk is finished.
@@ -221,7 +322,11 @@ async fn write_dump_key<W: Write>(
     state: &mut ExportState,
 ) -> Result<()> {
     let Some((payload, ttl)) = driver.dump_key(&meta.key).await? else {
-        return Ok(()); // vanished between the scan and here
+        // The key vanished between the scan and here, or it is past the driver's
+        // `DUMP` size ceiling. Either way it is *not in the file*, and an export
+        // that quietly omits a key is the failure this count exists to surface.
+        state.skipped += 1;
+        return Ok(());
     };
     let ttl_ms = ttl.map(|d| d.as_millis() as u64).unwrap_or(0);
     out.write_all(&dump_frame(&meta.key, ttl_ms, &payload))
@@ -243,7 +348,7 @@ async fn write_commands_key<W: Write>(
     if options.del_first {
         lines.push(command_line(["DEL", meta.key.as_str()]));
     }
-    if !collect_commands(driver, meta, cancel, &mut lines).await? {
+    if !collect_commands(driver, meta, cancel, &mut lines, state).await? {
         state.skipped += 1;
         return Ok(());
     }
@@ -272,6 +377,7 @@ async fn collect_commands(
     meta: &KeyMeta,
     cancel: &AtomicBool,
     lines: &mut Vec<String>,
+    state: &mut ExportState,
 ) -> Result<bool> {
     let key = meta.key.as_str();
     match meta.kv_type {
@@ -314,7 +420,13 @@ async fn collect_commands(
         KvType::List => {
             // A list has no `LSCAN`; the head window is what the driver offers,
             // and it is read in order so `RPUSH` rebuilds the list as it was.
-            let items = driver.read_list_window(key, true, LIST_WINDOW).await?;
+            // One past the window, so a list that exactly fills it is not reported
+            // as truncated and one that overflows is - without a second round trip.
+            let mut items = driver.read_list_window(key, true, LIST_WINDOW + 1).await?;
+            if items.len() > LIST_WINDOW {
+                items.truncate(LIST_WINDOW);
+                state.truncated_lists += 1;
+            }
             if items.iter().any(|v| is_lossy_text(v)) {
                 return Ok(false);
             }
@@ -450,7 +562,7 @@ async fn write_json_key<W: Write>(
             .unwrap_or_else(|| "null".into()),
     )
     .map_err(io)?;
-    write_json_value(driver, out, meta, cancel).await?;
+    write_json_value(driver, out, meta, cancel, state).await?;
     out.write_all(b"}").map_err(io)?;
     state.written += 1;
     Ok(())
@@ -461,6 +573,7 @@ async fn write_json_value<W: Write>(
     out: &mut W,
     meta: &KeyMeta,
     cancel: &AtomicBool,
+    state: &mut ExportState,
 ) -> Result<()> {
     let io = |e: std::io::Error| RedError::Driver(e.to_string());
     let key = meta.key.as_str();
@@ -520,7 +633,11 @@ async fn write_json_value<W: Write>(
             out.write_all(close.as_bytes()).map_err(io)?;
         }
         KvType::List => {
-            let items = driver.read_list_window(key, true, LIST_WINDOW).await?;
+            let mut items = driver.read_list_window(key, true, LIST_WINDOW + 1).await?;
+            if items.len() > LIST_WINDOW {
+                items.truncate(LIST_WINDOW);
+                state.truncated_lists += 1;
+            }
             out.write_all(b"[").map_err(io)?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {

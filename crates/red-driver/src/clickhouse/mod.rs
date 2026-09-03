@@ -1218,10 +1218,15 @@ impl DatabaseDriver for ClickhouseDriver {
             .get("x-clickhouse-summary")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body = resp.bytes().await.map_err(driver_err)?;
         if !status.is_success() {
-            return Err(ch_error(&body));
+            return Err(ch_error(&read_error_body(resp).await));
         }
+        // Drained, not collected. A write's body is a few bytes, but script mode
+        // routes *reads* through here too (a `SELECT` in a script body runs for
+        // its effect and its rows are discarded), and `resp.bytes()` pulled that
+        // whole result into memory first - the one place in the driver that
+        // materialised an unbounded result.
+        drain(resp).await?;
         Ok(summary.as_deref().and_then(parse_written_rows).unwrap_or(0))
     }
 
@@ -2504,6 +2509,36 @@ fn parse_written_rows(summary: &str) -> Option<u64> {
 /// Map a ClickHouse error body to a [`RedError`]: a query that was killed becomes
 /// the distinct [`RedError::Interrupted`]; anything else is a [`RedError::Query`]
 /// carrying the server's (cleaned) message.
+/// Read an error body, bounded.
+///
+/// An error is text and [`clean_error`] shows the first 500 characters of it, so
+/// there is no reason to hold more than enough to find the code and the message -
+/// and a server that answers a failure with a very long body should not be able to
+/// turn that into RED's memory problem.
+async fn read_error_body(resp: reqwest::Response) -> Vec<u8> {
+    /// Comfortably more than `clean_error`'s window, so nothing a human would read
+    /// is ever cut here.
+    const MAX: usize = 64 * 1024;
+    let mut resp = resp;
+    let mut body = Vec::new();
+    while body.len() < MAX {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            // A truncated error body is still the error; report what arrived.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body
+}
+
+/// Consume a response body without keeping it, so the request completes and the
+/// connection can be reused.
+async fn drain(resp: reqwest::Response) -> Result<()> {
+    let mut resp = resp;
+    while resp.chunk().await.map_err(driver_err)?.is_some() {}
+    Ok(())
+}
+
 fn ch_error(body: &[u8]) -> RedError {
     let text = String::from_utf8_lossy(body);
     if is_cancel_error(&text) {

@@ -36,8 +36,8 @@ pub const WRITE_TOKENS: &[&str] = &[
 /// read as reads (`SELECT lo_import('/etc/passwd')`, `SELECT dblink_exec(…)`).
 ///
 /// A denylist, so it is a mitigation and not a guarantee; the complete answer is an
-/// engine-level read-only connection. Matched with [`has_call`] rather than
-/// [`has_word`]: several of these (`url`, `file`, `sleep`, `remote`, `benchmark`)
+/// engine-level read-only connection. Matched with [`has_call`](super::has_call)
+/// rather than [`has_word`]: several of these (`url`, `file`, `sleep`, `remote`, `benchmark`)
 /// are ordinary column names, and only the call form is the hole.
 pub const DANGEROUS_FNS: &[&str] = &[
     // Postgres: file read/write, large objects, remote exec, WAL, admin file ops.

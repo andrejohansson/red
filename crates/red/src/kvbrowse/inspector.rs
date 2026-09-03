@@ -519,6 +519,9 @@ impl AppState {
             key,
             value,
             ttl: red_core::kv::StringTtl::Keep,
+            // Editing the key the inspector is already showing; replacing its
+            // value is the whole action.
+            create_only: false,
         };
         self.service
             .send_to(session, Command::KvApplyEdit { epoch, edit });
@@ -1131,7 +1134,16 @@ impl AppState {
                     };
                     red_core::kv::StringTtl::Set(ttl)
                 };
-                KvEdit::SetString { key, value, ttl }
+                // The "New key" form offers to *create* one, so a name that
+                // already exists is reported rather than silently overwritten -
+                // there is no confirmation on this path and no recycle-bin entry
+                // for what it would replace.
+                KvEdit::SetString {
+                    key,
+                    value,
+                    ttl,
+                    create_only: true,
+                }
             }
             KvType::Hash => {
                 if field.is_empty() {
@@ -1238,7 +1250,9 @@ impl AppState {
         // fresh read instead; the request is issued after the borrow ends.
         let mut refetch = None;
         match edit {
-            KvEdit::SetString { key, value, ttl } => {
+            KvEdit::SetString {
+                key, value, ttl, ..
+            } => {
                 if let Some(inspector) = &mut browse.inspector
                     && inspector.key == key
                 {

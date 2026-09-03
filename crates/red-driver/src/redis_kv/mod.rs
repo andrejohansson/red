@@ -1005,12 +1005,21 @@ impl KvDriver for RedisDriver {
         }
     }
 
-    async fn set_string(&self, key: &str, value: String, ttl: StringTtl) -> Result<()> {
+    async fn set_string(
+        &self,
+        key: &str,
+        value: String,
+        ttl: StringTtl,
+        create_only: bool,
+    ) -> Result<()> {
         self.check_writable()?;
         Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         let mut cmd = redis::cmd("SET");
         cmd.arg(key).arg(value);
+        if create_only {
+            cmd.arg("NX");
+        }
         match ttl {
             // `KEEPTTL` retains the server's actual remaining expiry exactly, so
             // editing a value never resets the countdown (nor rounds a
@@ -1027,9 +1036,19 @@ impl KvDriver for RedisDriver {
                 cmd.arg("PX").arg((d.as_millis() as u64).max(1));
             }
         }
-        cmd.query_async(&mut conn)
+        // `SET … NX` answers nil when the key exists, which redis-rs decodes as
+        // `Option::None` rather than an error. That is the whole point of the
+        // flag, so it is turned into one the caller can show.
+        let applied: Option<String> = cmd
+            .query_async(&mut conn)
             .await
-            .map_err(|e| RedError::Driver(e.to_string()))
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        if create_only && applied.is_none() {
+            return Err(RedError::Query(format!(
+                "`{key}` already exists. Open it to change its value, or delete it first."
+            )));
+        }
+        Ok(())
     }
 
     async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()> {
@@ -1933,7 +1952,7 @@ mod tests {
         assert_eq!(driver.topology(), KvTopology::Standalone);
         let key = tag("sentinel");
         driver
-            .set_string(&key, "v".into(), StringTtl::Clear)
+            .set_string(&key, "v".into(), StringTtl::Clear, false)
             .await
             .unwrap();
         assert!(driver.probe_key(&key).await.unwrap().is_some());
@@ -1968,7 +1987,12 @@ mod tests {
         let n = 300usize;
         for i in 0..n {
             driver
-                .set_string(&format!("{prefix}:{i}"), "v".into(), StringTtl::Clear)
+                .set_string(
+                    &format!("{prefix}:{i}"),
+                    "v".into(),
+                    StringTtl::Clear,
+                    false,
+                )
                 .await
                 .unwrap();
         }
@@ -3144,7 +3168,7 @@ mod tests {
         let key = tag("readonly-refused");
         assert!(
             driver
-                .set_string(&key, "v".into(), StringTtl::Clear)
+                .set_string(&key, "v".into(), StringTtl::Clear, false)
                 .await
                 .is_err()
         );
@@ -3175,6 +3199,7 @@ mod tests {
                 &key,
                 "hello".into(),
                 StringTtl::Set(Duration::from_secs(60)),
+                false,
             )
             .await
             .unwrap();

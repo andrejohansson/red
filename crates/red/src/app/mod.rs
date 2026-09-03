@@ -2004,8 +2004,12 @@ impl AppState {
             Event::KvKeysRestored { epoch, count } => {
                 self.on_kv_keys_restored(session, epoch, count, cx);
             }
-            Event::KvKeysCopied { copied, failed } => {
-                self.on_kv_keys_copied(copied, failed, cx);
+            Event::KvKeysCopied {
+                copied,
+                failed,
+                skipped,
+            } => {
+                self.on_kv_keys_copied(copied, failed, skipped, cx);
             }
             Event::KvImportDone {
                 ok,
@@ -2184,6 +2188,10 @@ impl AppState {
                 // the in-flight flag and computes the change flashes + row delta.
                 self.watch_rows_landed(session, epoch, cx);
             }
+            Event::ResultPageFailed { offset, epoch } => {
+                self.on_result_page_failed(session, offset, epoch, cx)
+            }
+            Event::CopyRowsFailed { id } => self.on_copy_rows_failed(id, cx),
             Event::ResultRunFailed { epoch, seq } => {
                 self.on_result_run_failed(session, epoch, seq, cx);
                 self.watch_run_failed(session, epoch, cx);

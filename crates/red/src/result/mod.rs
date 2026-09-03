@@ -94,8 +94,8 @@ pub(in crate::result) const AUTO_FIT_MAX: f32 = 520.0;
 const CHAR_W: f32 = 7.2;
 
 /// Horizontal padding a cell adds around its text (`px_2p5` each side, plus a
-/// little slack). Headers do their own arithmetic — see [`header_width`]
-/// (ResultGrid::header_width) — because they draw more than text.
+/// little slack). Headers do their own arithmetic — see
+/// [`ResultGrid::header_width`] — because they draw more than text.
 const CELL_PADDING: f32 = 26.0;
 
 /// A monospace advance, as a fraction of the font size. Both fonts RED ships
@@ -818,6 +818,17 @@ impl ResultGrid {
             self.open_joins(),
             old_epoch,
         )
+    }
+
+    /// The SQL a re-open of this grid would run: the statement the result was
+    /// opened with, before the paging wrap, sort and filter are layered on.
+    ///
+    /// What watch mode has to grade. Not the editor's text: a table browse, an FK
+    /// click-through and a script's trailing read all open a grid whose SQL the
+    /// editor never held, and an editor the user has typed into since the run
+    /// holds SQL the grid will not run.
+    pub(crate) fn base_sql(&self) -> &str {
+        &self.base_sql
     }
 
     /// A data column's `(name, declared type)`, for the inspector header.
@@ -2202,6 +2213,34 @@ impl AppState {
             && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
             grid.read(cx).buffer.borrow_mut().run_failed(seq);
+        }
+    }
+
+    /// An offset page fetch failed: free its in-flight mark so the window can be
+    /// asked for again. The error itself arrives separately as `Event::Error`.
+    pub(crate) fn on_result_page_failed(
+        &mut self,
+        session: Option<SessionId>,
+        offset: usize,
+        epoch: red_service::Epoch,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
+        {
+            grid.read(cx).buffer.borrow_mut().page_failed(offset);
+        }
+    }
+
+    /// A `CopyRows` re-fetch failed: drop the pending copy so the next one is not
+    /// silently discarded as belonging to someone else.
+    pub(crate) fn on_copy_rows_failed(&mut self, id: OpId, cx: &mut Context<Self>) {
+        if self.pending_copy.take_if(|p| p.id == id).is_some() {
+            self.notify(
+                ToastVariant::Error,
+                "Couldn't re-read the selection to copy it",
+                cx,
+            );
         }
     }
 

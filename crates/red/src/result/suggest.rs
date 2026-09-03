@@ -32,7 +32,7 @@ const FK_ENUM_CACHE_CAP: usize = 256;
 
 /// The open in-cell FK picker: the fetched id/label rows for one FK target, plus the
 /// live filter query and highlighted row. Single-instance app state (one editor open),
-/// held on [`AppState::cell_suggest`] beside the editor it decorates.
+/// held on the grid's own `cell_suggest` beside the editor it decorates.
 pub(crate) struct CellSuggest {
     /// The result epoch the editor belongs to (drops a stale `LookupReady`).
     pub(crate) epoch: red_service::Epoch,

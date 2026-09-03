@@ -2156,7 +2156,7 @@ impl ActiveConn {
     /// The one place that leases the grid entity: call sites were reshaped into
     /// this closure form *before* `result` became an `Entity<ResultGrid>`, so the
     /// flip changed this body alone. See
-    /// `docs/plans/todo/zed-architecture-inspiration.md` (Stage A.5).
+    /// the view-per-surface extraction.
     pub(crate) fn with_active_result<R>(
         &mut self,
         cx: &mut App,

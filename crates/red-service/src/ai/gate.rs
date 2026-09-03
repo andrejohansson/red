@@ -10,7 +10,9 @@
 //! so the gate the user sees and the gate the write rides cannot drift apart.
 
 use red_ai::ToolDef;
-use red_core::sql::{DANGEROUS_FNS, Dialect, WRITE_TOKENS, has_call, has_word, strip_noise};
+use red_core::sql::{
+    AGENT_READ_LEADING, DANGEROUS_FNS, Dialect, classify, has_call, has_word, strip_noise,
+};
 use red_core::{AiPolicy, AiTier};
 use serde_json::Value as Json;
 
@@ -18,7 +20,7 @@ use super::doc::write::{assess_doc_write, is_doc_write_tool};
 use super::kv::write::{assess_kv_write, is_kv_write_tool};
 use super::sql::format::qualified;
 use super::sql::tools::index_args;
-use super::util::truncate_summary;
+use super::util::truncate_for_approval;
 
 /// Apply the two membership gates every seam's catalog shares: the tier decides
 /// which tools exist at all, and any write tool is additionally withheld on a
@@ -54,41 +56,20 @@ pub(super) fn narrow_to_subagent(catalog: Vec<ToolDef>) -> Vec<ToolDef> {
 /// check is not enough: Postgres executes **data-modifying CTEs**
 /// (`WITH x AS (DELETE … RETURNING …) SELECT * FROM x`), and `SELECT … INTO` /
 /// `INTO OUTFILE` and sequence-advancing functions also write while leading with
-/// SELECT. So, like [`write_shape`], we reason about a **noise-stripped** copy
-/// (literals/quoted-identifiers/comments blanked) and reject any surviving write
-/// keyword. The stripping, the whole-word test, and both token lists live in
-/// `red_core::sql`, so this gate, the UI's `is_read_only`, and [`write_shape`] cannot
-/// drift apart. False positives (a rejected legitimate read) are acceptable: the user can
+/// SELECT. So the whole judgement lives in `red_core::sql::classify`, which reasons
+/// about a **noise-stripped** copy (literals, quoted identifiers and comments
+/// blanked) and answers the three separate questions this gate composes: is it one
+/// statement, what does it lead with, and does anything in it write. This gate,
+/// the UI's `is_read_only` and [`write_shape`] are three *policies* over that one
+/// scan, which is what keeps them from drifting apart the way four hand-written
+/// scans did.
+///
+/// False positives (a rejected legitimate read) are acceptable: the user can
 /// always run such a query by hand in a query tab. (Defense in depth: opening the
 /// AI's reads on an engine-level read-only connection would make this belt-and-
 /// suspenders: a worthwhile follow-up, but it needs a per-call driver seam.)
 pub(in crate::ai) fn is_read_only_select(sql: &str, dialect: Dialect) -> bool {
-    let stripped = strip_noise(sql, dialect);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // No embedded statement terminator (a `;` could chain a write past the prefix).
-    if trimmed.contains(';') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower.starts_with("select") || lower.starts_with("with")) {
-        return false;
-    }
-    // A statement that *starts* SELECT/WITH can still write. Reject if any write
-    // keyword survives noise-stripping as a whole-word token: the data-modifying
-    // CTE verbs (Postgres runs these), `INTO` (`SELECT … INTO new_table` /
-    // `INTO OUTFILE`/`DUMPFILE`), and the sequence-advancing functions. These verbs
-    // are reserved words, so they can't be bare column names in a real read; a
-    // column legitimately named one of them would be quoted, and quoting blanks it
-    // out before this check. (`FOR UPDATE` locking reads trip `update` and are
-    // rejected too; fine, the assistant browses, it doesn't lock.)
-    // Verbs are matched as whole words (they can't be bare identifiers); the
-    // function denylist is matched in call position, because several of its names
-    // (`url`, `file`, `sleep`) are ordinary column names.
-    !WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
-        && !DANGEROUS_FNS.iter().any(|f| has_call(&lower, f))
+    classify(sql, dialect).is_read(AGENT_READ_LEADING)
 }
 /// Whether a write tool's effect is actually contained by the review-mode
 /// transaction.
@@ -366,13 +347,22 @@ fn assess_kill_session(input: &Json) -> WriteAssessment {
     if mode == red_core::KillMode::Terminate {
         op.push_str("\n\u{26a0} Terminating rolls back this session's open transaction.");
     }
+    // The agent's claim, labelled as one. The executor kills by `key` and never
+    // checks `user`/`statement` against the session it stops, so presenting the
+    // statement as verified would make a wrong (or invented) one the thing the
+    // user approved on - and "stop this harmless-looking SELECT" is exactly the
+    // shape that gets waved through.
     match input
         .get("statement")
         .and_then(Json::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(sql) => op.push_str(&format!("\nRunning: {}", truncate_summary(sql, 300))),
+        Some(sql) => op.push_str(&format!(
+            "\nThe agent says it is running: {}\n(RED has not checked this against the server; \
+             read server_sessions to confirm.)",
+            truncate_for_approval(sql, 300)
+        )),
         None => op.push_str(
             "\nThe agent did not say what this session is running; read server_sessions before \
              allowing.",
@@ -466,17 +456,18 @@ enum WriteShape {
 /// fool the gate; e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
 /// blocked, and a `;` inside a string isn't read as statement chaining.
 fn write_shape(sql: &str, dialect: Dialect) -> WriteShape {
-    let stripped = strip_noise(sql, dialect);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
+    // The same one scan the read gates ride, asked its own questions. See
+    // `red_core::sql::classify`.
+    let verdict = classify(sql, dialect);
+    if verdict.leading.is_empty() {
         return WriteShape::Blocked("the statement is empty");
     }
     // No embedded terminator: a real `;` chains a second statement past the keyword
     // check (and past the user's eyes).
-    if trimmed.contains(';') {
+    if !verdict.single {
         return WriteShape::Blocked("multiple statements are not allowed; submit one at a time");
     }
-    let lower = trimmed.to_ascii_lowercase();
+    let lower = strip_noise(sql, dialect).to_ascii_lowercase();
     // A side-effecting function reads as an ordinary part of any statement -
     // `UPDATE t SET x = pg_read_file('/etc/passwd') WHERE …` is a well-formed
     // qualified UPDATE - and the approval prompt shows the user a sentence about
@@ -499,8 +490,7 @@ fn write_shape(sql: &str, dialect: Dialect) -> WriteShape {
             }
         });
     }
-    let first = lower.split_whitespace().next().unwrap_or("");
-    match first {
+    match verdict.leading.as_str() {
         "select" | "with" => WriteShape::NotWrite,
         "insert" => WriteShape::Ok,
         "update" | "delete" => {

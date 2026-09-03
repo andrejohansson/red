@@ -49,7 +49,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # SSH tunnels for jump-host DB connections — pure-Rust client (no system libssh),
 # bundles key parsing, known_hosts checks, and an ssh-agent client.
 russh = "0.61"
-# Redis/Valkey — the KvDriver seam (docs/plans/redis.md), not one more
+# Redis/Valkey — the `KvDriver` seam in `red-driver`, not one more
 # DatabaseDriver arm. `tokio-rustls-comp` (not separate tokio-comp+tls-rustls
 # — that pair alone is missing the tokio-rustls glue and fails to build) gives
 # the async multiplexed connection plus TLS (`rediss://`) over the same
@@ -60,7 +60,7 @@ redis = { version = "1", default-features = false, features = ["tokio-rustls-com
 # rebuild per-master cluster DSNs (host+port swap, credentials/scheme/TLS
 # preserved) without hand-rolling URL surgery.
 url = "2"
-# MongoDB — the DocDriver seam (docs/plans/todo/doc-driver.md), the one place the
+# MongoDB — the `DocDriver` seam in `red-driver`, the one place the
 # minimal-dependency instinct is knowingly relaxed: OP_MSG + BSON + SCRAM + SRV
 # discovery aren't hand-rollable the way RESP was. Isolated behind the `DocDriver`
 # trait, so `mongodb`/`bson` never leak past `red-driver` (the `DocValue` mirror is
@@ -168,7 +168,7 @@ red-service = { path = "crates/red-service" }
 red-ai = { path = "crates/red-ai" }
 red-acp = { path = "crates/red-acp" }
 
-# --- Workspace-wide lint policy (see docs/guidelines/tooling.md) ---
+# --- Workspace-wide lint policy (see docs/conventions.md) ---
 # Centralised once here; every crate opts in with `[lints] workspace = true`.
 # The panic-hygiene family is `warn` (promoted to error by CI's `-D warnings`),
 # so a stray unwrap/expect/panic in a *shipped* path fails the build. Test code

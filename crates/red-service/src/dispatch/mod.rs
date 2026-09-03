@@ -429,6 +429,104 @@ fn require_doc_driver_mut<'a>(
     Some((state, driver))
 }
 
+/// Drop every open result's checkpoint index for this session.
+///
+/// A checkpoint index maps ordinals to key values so a deep jump can seek instead
+/// of scanning. Any write may have moved rows under it, which makes those keys
+/// point at the wrong ordinals — a jump would land somewhere plausible and wrong,
+/// which is worse than being slow. Cleared here and rebuilt lazily on the next
+/// deep jump.
+///
+/// Called after *every* write path, including a partially applied batch: some ops
+/// landed, so the indexes are exactly as stale as after a complete one.
+fn invalidate_checkpoints(results: &paging::ResultMap) {
+    for spec in lock(results).values() {
+        let mut idx = lock(&spec.checkpoints);
+        idx.points.clear();
+        idx.status = BuildStatus::Idle;
+    }
+}
+
+/// Resolve the SQL driver for a read handler: the session must exist and be a SQL
+/// connection, else the matching `Event::Error` is emitted and `None` returned.
+///
+/// The SQL twin of [`require_kv_driver`]. The prologue it replaces was written out
+/// ~25 times in the loop below, which is not only noise: a guard repeated by hand
+/// is a guard that can be forgotten by hand, and the arms that *did* forget one
+/// are what the read-only refusals below exist to catch.
+fn require_sql_driver<'a>(
+    sessions: &'a HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<(
+    &'a SessionState,
+    std::sync::Arc<dyn red_driver::DatabaseDriver>,
+)> {
+    let state = require_session(sessions, session_id, events)?;
+    match state.driver.as_sql().cloned() {
+        Some(driver) => Some((state, driver)),
+        None => {
+            emit(
+                events,
+                session_id,
+                Event::Error("not a SQL connection".into()),
+            );
+            None
+        }
+    }
+}
+
+/// Like [`require_sql_driver`], but hands back the live session mutably — for the
+/// arms that go on to register an abort or supersede an in-flight fetch.
+fn require_sql_driver_mut<'a>(
+    sessions: &'a mut HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<(
+    &'a mut SessionState,
+    std::sync::Arc<dyn red_driver::DatabaseDriver>,
+)> {
+    let id = session_id?;
+    if !sessions.contains_key(&id) {
+        emit(events, session_id, Event::Error("not connected".into()));
+        return None;
+    }
+    let state = sessions.get_mut(&id)?;
+    let Some(driver) = state.driver.as_sql().cloned() else {
+        emit(
+            events,
+            session_id,
+            Event::Error("not a SQL connection".into()),
+        );
+        return None;
+    };
+    Some((state, driver))
+}
+
+/// Refuse a write on a read-only connection, emitting the refusal and answering
+/// `true` when the caller should stop.
+///
+/// Defense in depth: every driver enforces its own read-only posture, and this is
+/// the friendly half — a clean refusal *before* any work starts, rather than a
+/// mid-operation driver error with rows already attempted. Written out verbatim a
+/// dozen times before, which is exactly how the SQL editor arms came to be the
+/// ones missing it.
+fn refuse_if_read_only(
+    state: &SessionState,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> bool {
+    if !state.read_only {
+        return false;
+    }
+    emit(
+        events,
+        session_id,
+        Event::Error("this connection is read-only".into()),
+    );
+    true
+}
+
 /// Turn a parsed extended-JSON value into a single [`Document`], or a `Query`
 /// error when it isn't a JSON object.
 fn parse_one_document(value: red_core::doc::DocValue) -> red_core::Result<red_core::doc::Document> {
@@ -1451,17 +1549,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 joins,
                 namespace,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_sql_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let driver = driver.scoped(namespace.as_deref());
@@ -1724,17 +1814,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 limit,
                 epoch,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_sql_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // The tab closed or re-sorted (its epoch is gone); skip the stale
@@ -1794,8 +1876,20 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             },
                         ),
                         // Superseded mid-flight: a clean cancel, not an error toast.
+                        // The grid clears its `requested` marker when the epoch is
+                        // replaced, so there is nothing stranded.
                         Err(RedError::Interrupted) => {}
-                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        Err(e) => {
+                            // Terminal, so the grid frees the page it has marked
+                            // `requested`; without it that window stays blank and is
+                            // never asked for again.
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ResultPageFailed { offset, epoch },
+                            );
+                            emit(&events, session_id, Event::Error(e.to_string()));
+                        }
                     }
                 });
             }
@@ -1806,17 +1900,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 limit,
                 seq,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_sql_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
@@ -1911,17 +1997,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 epoch,
                 id,
             } => {
-                let Some(sid) = session_id else { continue };
-                let Some(state) = sessions.get(&sid) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
@@ -1969,7 +2046,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 rows: page.rows,
                             },
                         ),
-                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        Err(e) => {
+                            // Terminal, so the UI drops the pending copy. Left
+                            // occupied, its slot swallowed every later copy of a
+                            // display-clipped selection as "not mine".
+                            emit(&events, session_id, Event::CopyRowsFailed { id });
+                            emit(&events, session_id, Event::Error(e.to_string()));
+                        }
                     }
                 });
             }
@@ -2434,12 +2517,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 // Defense in depth alongside the driver's own refusal (see
                 // `KvApplyEdit`): reject before touching the engine.
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -2653,12 +2731,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -2768,12 +2841,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 // A read-only connection can't import (every command that writes
                 // would be refused anyway); reject the whole batch up front.
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -2930,12 +2998,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // Defense in depth alongside the driver's own refusal (see
                 // `RedisDriver::check_writable`): reject here too, before
                 // even touching the engine.
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -2951,8 +3014,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let events = events.clone();
                 tokio::spawn(async move {
                     let result = match &edit {
-                        KvEdit::SetString { key, value, ttl } => {
-                            driver.set_string(key, value.clone(), *ttl).await
+                        KvEdit::SetString {
+                            key,
+                            value,
+                            ttl,
+                            create_only,
+                        } => {
+                            driver
+                                .set_string(key, value.clone(), *ttl, *create_only)
+                                .await
                         }
                         KvEdit::SetField { key, field, value } => {
                             driver.set_field(key, field, value.clone()).await
@@ -3044,12 +3114,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -3136,14 +3201,21 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let _dst_pin = PinGuard::new(dst_busy);
                     let mut copied = 0u64;
                     let mut failed = 0u64;
+                    let mut skipped = 0u64;
                     for k in &keys {
-                        // DUMP on the source, RESTORE ... REPLACE on the target: a
-                        // vanished key or a failed restore counts as a failure but
-                        // never aborts the batch.
+                        // DUMP on the source, RESTORE on the target - *without*
+                        // `REPLACE`. A key of that name already on the target is
+                        // reported, not overwritten: this is a menu item on one
+                        // key, the target is a different server, and there is no
+                        // undo over there. A vanished key or a failed restore
+                        // counts as a failure but never aborts the batch.
                         match src.dump_key(k).await {
                             Ok(Some((payload, ttl))) => {
-                                match dst.restore_key(k, ttl, &payload, true).await {
+                                match dst.restore_key(k, ttl, &payload, false).await {
                                     Ok(()) => copied += 1,
+                                    // Redis answers a collision with `BUSYKEY`,
+                                    // which is an outcome rather than a fault.
+                                    Err(e) if e.to_string().contains("BUSYKEY") => skipped += 1,
                                     Err(_) => failed += 1,
                                 }
                             }
@@ -3151,7 +3223,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         }
                     }
                     // Global (None) session so the toast survives a ⌘P switch.
-                    emit(&events, None, Event::KvKeysCopied { copied, failed });
+                    emit(
+                        &events,
+                        None,
+                        Event::KvKeysCopied {
+                            copied,
+                            failed,
+                            skipped,
+                        },
+                    );
                 });
             }
 
@@ -3280,12 +3360,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -3341,12 +3416,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -3473,12 +3543,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                if state.read_only {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("this connection is read-only".into()),
-                    );
+                if refuse_if_read_only(state, session_id, &events) {
                     continue;
                 }
                 let Some(driver) = state.driver.as_kv().cloned() else {
@@ -4493,17 +4558,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 column,
                 flags,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_sql_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Reuse the result's stored (already-wrapped, filtered) SQL so the
@@ -4775,17 +4832,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 label_column,
                 limit,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_sql_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // A newer lookup for this epoch (editing moved to another FK column)
@@ -4924,11 +4973,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // here, before the await: the session no longer holds a
                 // transaction, so the indexes are already stale whatever the commit
                 // reports.
-                for spec in lock(&state.results).values() {
-                    let mut idx = lock(&spec.checkpoints);
-                    idx.points.clear();
-                    idx.status = BuildStatus::Idle;
-                }
+                invalidate_checkpoints(&state.results);
                 // The transaction came out of the session *before* the await, so a
                 // command arriving mid-commit sees autocommit rather than one that
                 // is already resolving - which is also what lets this be spawned.
@@ -5100,11 +5145,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     lock(&writes).remove(&write_id);
                     // The script may have moved rows under any open result, so
                     // drop the checkpoint indexes (same reason as `Execute`).
-                    for spec in lock(&results).values() {
-                        let mut idx = lock(&spec.checkpoints);
-                        idx.points.clear();
-                        idx.status = BuildStatus::Idle;
-                    }
+                    invalidate_checkpoints(&results);
                     emit(
                         &events,
                         session_id,
@@ -5121,17 +5162,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::Execute { sql, namespace } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Inside a manual transaction every write runs on the pinned
@@ -5318,11 +5350,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             // A write may have shifted rows under any open result, so
                             // drop the checkpoint indexes; they rebuild lazily on the
                             // next deep jump rather than serving from stale keys.
-                            for spec in lock(&results).values() {
-                                let mut idx = lock(&spec.checkpoints);
-                                idx.points.clear();
-                                idx.status = BuildStatus::Idle;
-                            }
+                            invalidate_checkpoints(&results);
                             emit(
                                 &events,
                                 session_id,
@@ -5390,13 +5418,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // deep jump rather than served from stale keys. Done for a
                     // *partial* batch too: some ops landed, so the indexes are just
                     // as stale.
-                    let drop_checkpoints = || {
-                        for spec in lock(&results).values() {
-                            let mut idx = lock(&spec.checkpoints);
-                            idx.points.clear();
-                            idx.status = BuildStatus::Idle;
-                        }
-                    };
+                    let drop_checkpoints = || invalidate_checkpoints(&results);
                     match mode {
                         // The relational contract: one transaction, each op asserted
                         // to touch exactly one row, all-or-nothing. The failure is
@@ -5453,17 +5475,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     Command::KillMutation { table, id } => Some((table, id)),
                     _ => None,
                 };
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((_state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // A kill is followed by the same listing, so the panel reflects it
@@ -5489,17 +5502,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::PreflightBatch { epoch, ops } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((_state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Reads only: this is what makes the confirm dialog able to show the
@@ -5528,17 +5532,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 analyze,
                 epoch,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((_state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // A plan is one bounded round-trip: no cursor, no windowing. The
@@ -5567,17 +5562,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 epoch,
                 id,
             } => {
-                let Some(sid) = session_id else { continue };
-                let Some(state) = sessions.get(&sid) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let Some((sql, namespace)) = lock(&state.results)
@@ -5686,17 +5672,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 chunk_size,
                 id,
             } => {
-                let Some(sid) = session_id else { continue };
-                let Some(state) = sessions.get(&sid) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
+                let Some((state, driver)) = require_sql_driver(&sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Defense in depth, matching `CopyToTable`. The driver enforces

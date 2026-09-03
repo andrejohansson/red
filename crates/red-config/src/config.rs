@@ -39,13 +39,13 @@ pub struct StoredConnection {
     /// omitted from the file when unset so pre-pin configs round-trip unchanged.
     pub pinned: bool,
     /// This connection's password is still the legacy plaintext one from the
-    /// config file, because [`migrate_secrets`] could not reach the keychain.
+    /// config file, because `migrate_secrets` could not reach the keychain.
     ///
     /// It is the *only* thing that lets [`save`] write a password, and it is set
     /// exactly where the alternative is losing one: without it, a failed migration
     /// left the password in memory while every later save (a pin toggle, a connect
     /// stamping `last_accessed`) rewrote the file through the password-free
-    /// [`WriteConnection`] and silently dropped it. Cleared the moment the
+    /// `WriteConnection` shape and silently dropped it. Cleared the moment the
     /// keychain takes the secret, after which the keychain is the only copy.
     ///
     /// Deliberately *not* "the password field is non-empty": that is also true

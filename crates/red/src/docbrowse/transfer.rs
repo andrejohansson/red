@@ -147,7 +147,7 @@ pub(crate) struct DocCopyState {
     pub(crate) drop_ack: bool,
 }
 
-/// The "Export documents" modal's state, held on [`MongoView`] for the life of the
+/// The "Export documents" modal's state, held on [`MongoView`](super::MongoView) for the life of the
 /// dialog.
 pub(crate) struct DocExportState {
     /// The namespace being exported, captured at open so a tab switch behind the
