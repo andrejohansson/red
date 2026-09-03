@@ -9,7 +9,7 @@
 //! data loaders).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use red_core::kv::RedisAnalysis;
@@ -85,30 +85,12 @@ impl AnalysisStore {
 
 /// Serialize `reports` to `path` via a temp file + rename, owner-only on Unix
 /// (the same crash-safe discipline as `history.rs`).
-fn save(path: &PathBuf, reports: &HashMap<String, RedisAnalysis>) -> Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating the config directory")?;
-    }
+fn save(path: &Path, reports: &HashMap<String, RedisAnalysis>) -> Result<()> {
     let file = AnalysisFile {
         reports: reports.clone(),
     };
     let contents = serde_json::to_string_pretty(&file).context("serializing redis analysis")?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).context("creating the analysis temp file")?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path).context("renaming the analysis temp file")?;
-    Ok(())
+    red_config::atomic::write_private(path, contents.as_bytes())
 }
 
 #[cfg(test)]

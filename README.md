@@ -48,7 +48,7 @@ It's built on GPUI and renders on the GPU, so there's no Electron or embedded br
 **Editing and moving data**
 
 * Inline editing with staged, reviewable batch changes
-* Export to CSV, JSON, SQL `INSERT` statements, or a self-contained HTML report; import from CSV, JSONL, or a JSON array
+* Export to CSV, JSON, XLSX, SQL `INSERT` statements, or a self-contained HTML report; import from CSV, JSONL, or a JSON array
 * Copy a table to another connection, or migrate a set of tables into a new database
 * Diff data between two tables, and compare schemas with reconciling DDL generated into a query tab
 
@@ -69,10 +69,10 @@ It's built on GPUI and renders on the GPU, so there's no Electron or embedded br
 
 * AI assistant sidebar with grounded chat over your schema, via the Claude API or a Claude subscription
 * SSH tunneling through a jump host, SOCKS5 / HTTP proxies, and TLS
-* Import saved connections from DBeaver and DBGate
+* Import saved connections from DBeaver, DBGate, DataGrip and RedisInsight
 * Multiple connections with a quick connection switcher and pinned favourites
 * Themes (One Dark, GitHub Dark, Ayu Dark, Ayu Light, High Contrast) and a fully customizable keymap
-* Headless CLI (`red query`, `exec`, `copy`, `migrate`, `test`, `connections`) and an MCP server (`red mcp`)
+* Headless CLI (`red query`, `exec`, `copy`, `migrate`, `transfer`, `test`, `connections`, `reset`) and an MCP server (`red mcp`)
 
 Default shortcuts are listed in [`docs/keyboard.md`](docs/keyboard.md), and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -90,7 +90,9 @@ On first launch RED seeds a small, read-only **Sample database** so you can expl
 
 ## Privacy
 
-RED has no telemetry and makes no network calls of its own. Connection credentials are stored in your operating system's keychain, never in plaintext. The AI assistant is opt-in and only talks to the provider you configure.
+RED has no telemetry. Connection credentials are stored in your operating system's keychain, never in plaintext. The AI assistant is opt-in and only talks to the provider you configure.
+
+The only network calls RED makes on its own are update checks: it asks GitHub for the latest release every six hours. Turn them off with `auto_update = false` under `[update]` in `settings.toml`, and RED makes no requests at all beyond the databases you connect to.
 
 ## Architecture
 

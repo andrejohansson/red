@@ -59,7 +59,7 @@ pub fn create_table_sql(
     kind: DbKind,
     quote: impl Fn(&str) -> String,
 ) -> String {
-    use crate::typemap::{NormType, normalize, spell};
+    use crate::typemap::{NormType, normalize, spell, spell_keyed};
     let qualify = qualify_table(table, &quote);
     let pk_count = columns.iter().filter(|c| c.primary_key).count();
     // SQLite expresses a sole-INTEGER-PK auto-increment column *inline* as
@@ -108,7 +108,14 @@ pub fn create_table_sql(
                     }
                 }
             } else {
-                let ty = spell(kind, &nt);
+                // A key column is spelled for indexability: MySQL refuses a
+                // `TEXT`/`BLOB` primary key outright (error 1170), which failed the
+                // whole create for any table whose PK arrived as unbounded text.
+                let ty = if c.primary_key {
+                    spell_keyed(kind, &nt)
+                } else {
+                    spell(kind, &nt)
+                };
                 let null = if c.not_null { " NOT NULL" } else { "" };
                 let default = match c.default.as_deref().map(str::trim) {
                     Some(d) if !d.is_empty() => format!(" DEFAULT {d}"),

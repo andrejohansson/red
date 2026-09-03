@@ -6986,6 +6986,7 @@ dependencies = [
  "redis",
  "reqwest",
  "rusqlite",
+ "rustls",
  "serde_json",
  "tokio",
  "tokio-postgres",

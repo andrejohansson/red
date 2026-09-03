@@ -13,8 +13,8 @@ use red_core::DbKind;
 // read-only gates reason over the same stripped copy with the same token lists.
 pub use red_core::sql::Dialect;
 use red_core::sql::{
-    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_word, is_routine_ddl, split_statements,
-    statement_ranges, strip_noise,
+    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_call, has_word, is_routine_ddl,
+    split_statements, statement_ranges, strip_noise,
 };
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
@@ -552,10 +552,11 @@ pub fn is_read_only(sql: &str, dialect: Dialect) -> bool {
     if !read_prefix {
         return false;
     }
-    !WRITE_TOKENS
-        .iter()
-        .chain(DANGEROUS_FNS)
-        .any(|w| has_word(&lower, w))
+    // Verbs are matched as whole words (they can't be bare identifiers); the
+    // function denylist is matched in call position, because several of its names
+    // (`url`, `file`, `sleep`) are ordinary column names.
+    !WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
+        && !DANGEROUS_FNS.iter().any(|f| has_call(&lower, f))
 }
 
 /// The single `;`-delimited statement to run for a caret at `cursor`: the
@@ -619,7 +620,10 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
     if trimmed.contains(';') {
         return None;
     }
-    Some(format!("{trimmed} LIMIT {n}"))
+    // On its own line, not appended to the last one: a statement ending in a
+    // line comment (`SELECT * FROM t -- rows`) would otherwise carry the LIMIT
+    // inside the comment, and the rail would silently do nothing.
+    Some(format!("{trimmed}\nLIMIT {n}"))
 }
 
 /// The single physical table a hand-typed `SELECT * FROM <table>` reads, as an
@@ -1561,12 +1565,22 @@ mod tests {
     fn auto_limit_appends_to_bare_select() {
         assert_eq!(
             auto_limit("SELECT * FROM users", 1000).as_deref(),
-            Some("SELECT * FROM users LIMIT 1000")
+            Some("SELECT * FROM users\nLIMIT 1000")
         );
         // A trailing terminator is stripped before the LIMIT is appended.
         assert_eq!(
             auto_limit("select id from t ;", 50).as_deref(),
-            Some("select id from t LIMIT 50")
+            Some("select id from t\nLIMIT 50")
+        );
+        // On its own line, so a trailing line comment cannot swallow it: appended
+        // to the same line this read `-- rows LIMIT 50` and limited nothing.
+        assert_eq!(
+            auto_limit("SELECT * FROM t -- rows", 50).as_deref(),
+            Some("SELECT * FROM t -- rows\nLIMIT 50")
+        );
+        assert_eq!(
+            auto_limit("SELECT * FROM t # rows", 50).as_deref(),
+            Some("SELECT * FROM t # rows\nLIMIT 50")
         );
     }
 

@@ -175,24 +175,18 @@ pub(in crate::ai) async fn run_tool(
                 .get("analyze")
                 .and_then(Json::as_bool)
                 .unwrap_or(false);
-            // `EXPLAIN ANALYZE` *executes* on Postgres and MySQL 8.0.18+, so an
-            // analyze request is a run request and is graded as one. Anything above
-            // `Safe` is refused outright rather than prompted: the model asked to
-            // read a plan, and a user asked to approve a write here would be
-            // approving something they did not request. `risk::assess` handles both
-            // a bare statement and one the model already wrapped in EXPLAIN.
-            if analyze {
-                let verdict = red_core::sql::risk::assess(sql, dialect);
-                if verdict.level != red_core::sql::risk::RiskLevel::Safe {
-                    return (
-                        "error: EXPLAIN ANALYZE executes the statement, and this one is not a \
-                         read. Explain it without `analyze` to see the plan, or run the change \
-                         yourself in a query tab."
-                            .into(),
-                        false,
-                    );
-                }
-            }
+            // The text goes to the engine either way, so it is vetted either way.
+            // `EXPLAIN ANALYZE` executes on Postgres and MySQL 8.0.18+ and the model
+            // can write that `ANALYZE` itself whatever `analyze` says; MySQL's text
+            // protocol runs a whole `;`-separated batch. `risk::assess` is not
+            // enough here (it grades every `SELECT` Safe, including
+            // `SELECT lo_import(…)`), so this is the same gate `run_select` rides.
+            // Refused outright rather than prompted: the model asked to read a plan,
+            // and a user asked to approve a write here would be approving something
+            // they did not request.
+            let Some(sql) = crate::ai::gate::vet_explain_target(sql, dialect) else {
+                return (crate::ai::gate::EXPLAIN_REFUSED.into(), false);
+            };
             // Bound the wait like run_select. The trait gives `explain` no abort
             // seam, so on timeout we hand the model a clean error while the engine's
             // call winds down on its own; the read-only gate above is what keeps an
@@ -340,7 +334,7 @@ pub(in crate::ai) async fn run_tool(
         }
         "diff_schema" => diff_schema(driver, input, limits).await,
         "diff_data" => diff_data(driver, input, limits).await,
-        "suggest_index" => suggest_index(driver, input, limits).await,
+        "suggest_index" => suggest_index(driver, input, limits, dialect).await,
         "kill_session" => kill_session(driver, input).await,
         "create_index" => {
             let (table, name, columns, unique) = match index_args(input) {
@@ -587,12 +581,14 @@ mod tests {
         );
     }
 
-    /// `EXPLAIN ANALYZE` executes on Postgres and MySQL 8.0.18+, so an `analyze`
-    /// over a write must be refused. Asserted **per dialect**: the lexing differs,
-    /// and grading against the wrong one is the exact drift `risk.rs` exists to
-    /// prevent.
+    /// The `explain` text reaches the engine either way — `EXPLAIN ANALYZE`
+    /// executes on Postgres and MySQL 8.0.18+, the model can write that `ANALYZE`
+    /// itself whatever the flag said, and MySQL's text protocol runs a whole
+    /// `;`-separated batch — so it is vetted as a read either way. Asserted **per
+    /// dialect**: the lexing differs, and grading against the wrong one is the
+    /// exact drift `risk.rs` exists to prevent.
     #[tokio::test]
-    async fn explain_analyze_refuses_anything_that_is_not_a_read() {
+    async fn explain_refuses_anything_that_is_not_a_read() {
         let db = std::env::temp_dir().join(format!("red-xa-{}.db", uuid::Uuid::new_v4().simple()));
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
@@ -631,20 +627,31 @@ mod tests {
                 "UPDATE t SET x = 1",
                 "DELETE FROM t WHERE id = 1",
                 "DROP TABLE t",
-                // Already wrapped by the model: `risk::assess` grades the inner
-                // statement, so this must be refused too.
+                // Already wrapped by the model: the body is what is graded, so
+                // this must be refused too — and the `analyze` the model wrote
+                // counts as much as the argument it passed.
                 "EXPLAIN ANALYZE DELETE FROM t WHERE id = 1",
+                "EXPLAIN (ANALYZE, BUFFERS) UPDATE t SET x = 1",
+                // A chained statement: MySQL's text protocol runs every one.
+                "SELECT 1; DROP TABLE t",
             ] {
-                let (content, ok) = explain(sql, true, dialect).await;
-                assert!(!ok, "{dialect:?} / {sql} must be refused, got: {content}");
-                assert!(content.contains("executes the statement"), "{content}");
+                // Neither flag makes the text safe, so both are refused.
+                for analyze in [false, true] {
+                    let (content, ok) = explain(sql, analyze, dialect).await;
+                    assert!(
+                        !ok,
+                        "{dialect:?} / analyze={analyze} / {sql} must be refused, got: {content}"
+                    );
+                    assert!(content.contains("plans a single read"), "{content}");
+                }
             }
-            // Without `analyze` the same statement only plans, so it is allowed.
-            let (_, ok) = explain("UPDATE t SET x = 1", false, dialect).await;
-            assert!(ok, "{dialect:?}: plain explain of a write must still plan");
         }
-        // A read with actuals is the point of the flag, and is allowed.
-        let (content, ok) = explain("SELECT * FROM t", true, Dialect::Sqlite).await;
+        // A read, with and without actuals, is what the tool is for.
+        for analyze in [false, true] {
+            let (content, ok) = explain("SELECT * FROM t", analyze, Dialect::Sqlite).await;
+            assert!(ok, "{content}");
+        }
+        let (content, ok) = explain("EXPLAIN SELECT * FROM t", false, Dialect::Sqlite).await;
         assert!(ok, "{content}");
     }
 

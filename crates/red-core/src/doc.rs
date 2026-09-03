@@ -51,6 +51,24 @@ pub enum DocValue {
     Array(Vec<DocValue>),
     /// A sub-document; field order preserved, like BSON.
     Document(Vec<(String, DocValue)>),
+    /// A BSON type with no dedicated mirror arm, carried **opaquely** as the
+    /// extended-JSON object that spells it: `$symbol`, `$code`,
+    /// `$codeWithScope`, `$minKey`, `$maxKey`, `$undefined`, `$dbPointer`.
+    ///
+    /// These are the legacy and sentinel types. They are rare enough not to earn a
+    /// variant each and common enough in old collections to matter, and folding
+    /// them to strings (which is what happened before) was not a display
+    /// compromise: RED's document writes are whole-document `replace`s, so opening
+    /// a document that contained a `MinKey` and saving *any* field rewrote that
+    /// `MinKey` as the string `"MinKey"`. Kept as text, they round-trip through the
+    /// driver's extended-JSON parser unchanged.
+    ///
+    /// `tag` is the `$`-key (without the `$`), for the type label; `json` is the
+    /// whole object, ready to emit verbatim.
+    Other {
+        tag: String,
+        json: String,
+    },
 }
 
 impl DocValue {
@@ -79,6 +97,7 @@ impl DocValue {
             DocValue::Regex { .. } => DocType::Regex,
             DocValue::Array(_) => DocType::Array,
             DocValue::Document(_) => DocType::Object,
+            DocValue::Other { .. } => DocType::Other,
         }
     }
 
@@ -93,6 +112,12 @@ impl DocValue {
     /// JSON-lossy types wrap in a `$`-tagged object). Round-trippable back to a
     /// `DocValue` by the driver's parser, and what the tree widget / `Json` lens
     /// display. Hand-rolled to avoid a `serde_json` dependency in `red-core`.
+    ///
+    /// "Round-trippable" is load-bearing, and is why the number arms are not purely
+    /// relaxed: relaxed extjson writes every number bare, and reading one back
+    /// re-infers its type from the text, so a small `Int64` and an integral
+    /// `Double` came back as `Int32`. Those two cases carry their `$numberLong` /
+    /// `$numberDouble` tag; every other number stays bare.
     pub fn to_extended_json(&self) -> String {
         let mut out = String::new();
         self.write_extjson(&mut out);
@@ -106,12 +131,32 @@ impl DocValue {
             DocValue::Int32(n) => {
                 let _ = write!(out, "{n}");
             }
+            // Tagged only when the bare spelling would come back as a *different*
+            // BSON type. Relaxed extended JSON writes numbers bare, and the parser
+            // re-infers: a JSON integer becomes `Int32` when it fits in one, a JSON
+            // float becomes `Double`. So an `Int64(5)` written as `5` returned as
+            // `Int32(5)`, and a `Double(3.0)` - which prints as `3` - returned as
+            // `Int32(3)`. Editing one field of a document rewrote the *types* of
+            // every other one, silently, on save. Tagging only the ambiguous cases
+            // keeps the common document readable, which is the whole point of the
+            // relaxed form.
             DocValue::Int64(n) => {
-                let _ = write!(out, "{n}");
+                if i32::try_from(*n).is_ok() {
+                    let _ = write!(out, "{{\"$numberLong\":\"{n}\"}}");
+                } else {
+                    let _ = write!(out, "{n}");
+                }
             }
             DocValue::Double(x) => {
                 if x.is_finite() {
-                    let _ = write!(out, "{x}");
+                    let text = format!("{x}");
+                    // No `.` or exponent means it renders as an integer, and would
+                    // be read back as one.
+                    if text.contains(['.', 'e', 'E']) {
+                        out.push_str(&text);
+                    } else {
+                        let _ = write!(out, "{{\"$numberDouble\":\"{text}\"}}");
+                    }
                 } else {
                     // Non-finite doubles have no bare-number JSON form; relaxed
                     // extjson keeps the canonical `$numberDouble` wrapper for them.
@@ -128,6 +173,9 @@ impl DocValue {
             DocValue::Decimal128(s) => {
                 let _ = write!(out, "{{\"$numberDecimal\":\"{s}\"}}");
             }
+            // Already the extended-JSON object that spells this type; emitted
+            // verbatim so it round-trips through the driver's parser unchanged.
+            DocValue::Other { json, .. } => out.push_str(json),
             DocValue::Str(s) => write_json_string(out, s),
             DocValue::ObjectId(bytes) => {
                 out.push_str("{\"$oid\":\"");
@@ -218,7 +266,7 @@ impl DocValue {
             DocValue::Regex { pattern, options } => {
                 Value::capped_text(&format!("/{pattern}/{options}"), max_bytes)
             }
-            DocValue::Array(_) | DocValue::Document(_) => {
+            DocValue::Array(_) | DocValue::Document(_) | DocValue::Other { .. } => {
                 Value::capped_text(&self.to_extended_json(), max_bytes)
             }
         }
@@ -740,6 +788,8 @@ pub enum DocType {
     Regex,
     Array,
     Object,
+    /// A legacy or sentinel BSON type carried opaquely; see [`DocValue::Other`].
+    Other,
 }
 
 impl DocType {
@@ -760,6 +810,10 @@ impl DocType {
             DocType::Regex => "regex",
             DocType::Array => "array",
             DocType::Object => "object",
+            // The label the *value* carries is more useful than "other", but
+            // `label` is `&'static str`; the schema panel groups these together
+            // and the inspector shows the value's own tag.
+            DocType::Other => "other",
         }
     }
 }
@@ -1549,7 +1603,23 @@ mod tests {
         assert_eq!(DocValue::Null.to_extended_json(), "null");
         assert_eq!(DocValue::Bool(true).to_extended_json(), "true");
         assert_eq!(DocValue::Int32(42).to_extended_json(), "42");
-        assert_eq!(DocValue::Int64(-7).to_extended_json(), "-7");
+        // An `Int64` that fits in an `i32` is tagged, or the parser reads it back
+        // as an `Int32` and the edit narrows the field's type.
+        assert_eq!(
+            DocValue::Int64(-7).to_extended_json(),
+            r#"{"$numberLong":"-7"}"#
+        );
+        // One that does not fit is unambiguous bare.
+        assert_eq!(
+            DocValue::Int64(5_000_000_000).to_extended_json(),
+            "5000000000"
+        );
+        // A `Double` that prints as an integer is tagged for the same reason.
+        assert_eq!(
+            DocValue::Double(3.0).to_extended_json(),
+            r#"{"$numberDouble":"3"}"#
+        );
+        assert_eq!(DocValue::Double(3.5).to_extended_json(), "3.5");
         assert_eq!(
             DocValue::Str("a\"b\nc".into()).to_extended_json(),
             r#""a\"b\nc""#

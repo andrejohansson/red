@@ -146,31 +146,13 @@ pub(crate) fn load() -> Vec<Conversation> {
 /// can't leave a partial file. Re-saving the same stem overwrites in place; the
 /// caller keeps the stem stable across a conversation's turns.
 pub(crate) fn save(stem: &str, conv: &Conversation) -> Result<PathBuf> {
-    use std::io::Write;
-
     let dir = conversations_dir().context("no config directory for conversations")?;
-    std::fs::create_dir_all(&dir).context("creating the conversations directory")?;
     let dest = dir.join(format!("{stem}.json"));
-
     let contents = serde_json::to_string_pretty(conv).context("serializing the conversation")?;
-    let tmp = dest.with_extension(format!("json.tmp.{}", std::process::id()));
-    // Owner-only (0o600) on Unix: a transcript can quote query results the user
-    // asked about, so it's confidential even though no credentials land here; the
-    // same posture as the AI report/audit files. `rename` preserves the mode.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts
-        .open(&tmp)
-        .context("creating the conversation temp file")?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, &dest).context("renaming the conversation temp file")?;
+    // Owner-only on Unix, which `write_private` guarantees: a transcript can quote
+    // query results the user asked about, so it is confidential even though no
+    // credentials land here - the same posture as the AI report/audit files.
+    red_config::atomic::write_private(&dest, contents.as_bytes())?;
     Ok(dest)
 }
 

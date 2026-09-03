@@ -13,8 +13,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use red_core::DbKind;
 use red_core::valuefmt::{
-    csv_cell, csv_record, html_cell, html_escape, json_string, json_value, sql_ident, sql_value,
+    SqlFlavor, csv_cell, csv_record, html_cell, html_escape, json_string, json_value,
+    sql_ident_for, sql_value_for,
 };
 use red_core::{ExportFormat, ExportOutcome, ExportShortfall, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -97,8 +99,9 @@ enum Framing {
     Csv,
     Json,
     Html,
-    /// Target table name for the `INSERT` statements, from the destination stem.
-    Sql(String),
+    /// Target table name for the `INSERT` statements, from the destination stem,
+    /// and the flavour to spell them in.
+    Sql(String, SqlFlavor),
     Xlsx(crate::xlsx::XlsxSheet),
 }
 
@@ -106,11 +109,16 @@ impl<W: Write> ExportWriter<W> {
     /// Begin an export: write the CSV header row, the opening JSON `[`, or the HTML
     /// document head + table header. `table` names the target for SQL `INSERT`
     /// exports and is ignored by every other format.
+    ///
+    /// `kind` is the engine the rows came from, which the SQL format needs and the
+    /// rest ignore: an `INSERT` file is meant to be re-run, and identifier quoting
+    /// and string escaping are not portable between MySQL and everything else.
     pub(crate) fn begin(
         mut out: W,
         format: ExportFormat,
         names: Vec<String>,
         dest: &Path,
+        kind: DbKind,
     ) -> io::Result<Self> {
         let framing = match format {
             ExportFormat::Csv => {
@@ -130,7 +138,7 @@ impl<W: Write> ExportWriter<W> {
             }
             // The INSERT stream needs no preamble; each row is a standalone
             // statement carrying the table name and column list.
-            ExportFormat::Sql => Framing::Sql(sql_table_name(dest)),
+            ExportFormat::Sql => Framing::Sql(sql_table_name(dest), SqlFlavor::of(kind)),
             // Nothing reaches `out` until `finish`: the sheet spools to disk and
             // the archive is assembled once every entry's size is known.
             ExportFormat::Xlsx => Framing::Xlsx(crate::xlsx::XlsxSheet::begin(dest, &names)?),
@@ -177,20 +185,21 @@ impl<W: Write> ExportWriter<W> {
                 }
                 writeln!(self.out, "</tr>")?;
             }
-            Framing::Sql(table) => {
-                write!(self.out, "INSERT INTO {} (", sql_ident(table))?;
+            Framing::Sql(table, flavor) => {
+                let flavor = *flavor;
+                write!(self.out, "INSERT INTO {} (", sql_ident_for(table, flavor))?;
                 for (i, name) in self.names.iter().enumerate() {
                     if i > 0 {
                         write!(self.out, ", ")?;
                     }
-                    write!(self.out, "{}", sql_ident(name))?;
+                    write!(self.out, "{}", sql_ident_for(name, flavor))?;
                 }
                 write!(self.out, ") VALUES (")?;
                 for (i, value) in cells.iter().enumerate() {
                     if i > 0 {
                         write!(self.out, ", ")?;
                     }
-                    write!(self.out, "{}", sql_value(value))?;
+                    write!(self.out, "{}", sql_value_for(value, flavor))?;
                 }
                 writeln!(self.out, ");")?;
             }
@@ -215,7 +224,7 @@ impl<W: Write> ExportWriter<W> {
         match self.framing {
             Framing::Json => write!(self.out, "\n]\n")?,
             Framing::Html => write!(self.out, "{}", html_foot(self.written))?,
-            Framing::Csv | Framing::Sql(_) => {}
+            Framing::Csv | Framing::Sql(..) => {}
             // The archive is written here, in one pass, now that the sheet's
             // checksum and length are known.
             Framing::Xlsx(sheet) => {
@@ -347,6 +356,7 @@ mod tests {
             ExportFormat::Html,
             vec!["name".to_string(), "note".to_string()],
             Path::new("report.html"),
+            DbKind::Sqlite,
         )
         .unwrap();
         w.write_row(&[Value::Text("<script>".into()), Value::Null])
@@ -374,21 +384,60 @@ mod tests {
         assert_eq!(html_cell(&Value::Blob(vec![0u8; 5])), "&lt;5 bytes&gt;");
     }
 
-    /// A SQL literal doubles both quotes and backslashes, so a hostile cell can't
-    /// break out of the string when the dump is reloaded into MySQL/ClickHouse.
+    /// The literal has to terminate on the engine that will read it back, and
+    /// carry the value it started with. Those are the same requirement spelled two
+    /// ways: MySQL reads `\` as an escape (so it must be doubled, or a trailing
+    /// backslash swallows the close quote), and Postgres/SQLite do not (so doubling
+    /// it there would reload `C:\` as `C:\\`).
     #[test]
-    fn sql_string_escapes_quotes_and_backslashes() {
-        // A trailing backslash: without doubling it would escape the close quote.
+    fn sql_string_escapes_per_engine() {
+        let my = |v: &Value| sql_value_for(v, SqlFlavor::MySql);
+        let ansi = |v: &Value| sql_value_for(v, SqlFlavor::Ansi);
+        assert_eq!(my(&Value::Text("C:\\".into())), "'C:\\\\'");
         assert_eq!(
-            sql_value(&Value::Text("C:\\".into())),
-            "'C:\\\\'",
-            "trailing backslash must be doubled"
+            ansi(&Value::Text("C:\\".into())),
+            "'C:\\'",
+            "Postgres reads the backslash literally, so doubling it alters the data"
         );
-        // The injection payload from the review: the literal must terminate.
+        // The injection payload from the review: the literal must terminate on the
+        // engine that honours the escape.
         assert_eq!(
-            sql_value(&Value::Text("\\', 1); DROP TABLE users; -- ".into())),
+            my(&Value::Text("\\', 1); DROP TABLE users; -- ".into())),
             "'\\\\'', 1); DROP TABLE users; -- '"
         );
+        // Embedded single quotes double on both.
+        assert_eq!(my(&Value::Text("it's".into())), "'it''s'");
+        assert_eq!(ansi(&Value::Text("it's".into())), "'it''s'");
+    }
+
+    /// A `<12 bytes>` placeholder in a file whose purpose is to be re-run loads
+    /// that *string* into a binary column: silent data loss reported as success.
+    #[test]
+    fn sql_export_writes_real_blob_literals() {
+        assert_eq!(
+            sql_value_for(&Value::Blob(vec![0x00, 0xff, 0x10]), SqlFlavor::Ansi),
+            "'\\x00ff10'"
+        );
+        assert_eq!(
+            sql_value_for(&Value::Blob(vec![0x00, 0xff, 0x10]), SqlFlavor::MySql),
+            "0x00ff10"
+        );
+        // `0x` alone is not a literal on older MySQL; the empty string is.
+        assert_eq!(
+            sql_value_for(&Value::Blob(Vec::new()), SqlFlavor::MySql),
+            "''"
+        );
+    }
+
+    /// MySQL's default `sql_mode` has no `ANSI_QUOTES`, so `"orders"` is a string
+    /// literal there and the exported `INSERT` does not parse.
+    #[test]
+    fn sql_export_quotes_identifiers_per_engine() {
+        assert_eq!(sql_ident_for("orders", SqlFlavor::MySql), "`orders`");
+        assert_eq!(sql_ident_for("orders", SqlFlavor::Ansi), r#""orders""#);
+        // And the quote character itself is escaped by doubling, either way.
+        assert_eq!(sql_ident_for("a`b", SqlFlavor::MySql), "`a``b`");
+        assert_eq!(sql_ident_for("a\"b", SqlFlavor::Ansi), r#""a""b""#);
     }
 
     /// Non-finite floats are unparseable as bare `NaN`/`inf`; export writes a
@@ -397,11 +446,12 @@ mod tests {
     fn non_finite_floats_export_safely() {
         assert_eq!(json_value(&Value::Real(f64::NAN)), "null");
         assert_eq!(json_value(&Value::Real(f64::INFINITY)), "null");
-        assert_eq!(sql_value(&Value::Real(f64::NAN)), "'NaN'");
-        assert_eq!(sql_value(&Value::Real(f64::INFINITY)), "'Infinity'");
-        assert_eq!(sql_value(&Value::Real(f64::NEG_INFINITY)), "'-Infinity'");
+        let sql = |v: &Value| sql_value_for(v, SqlFlavor::Ansi);
+        assert_eq!(sql(&Value::Real(f64::NAN)), "'NaN'");
+        assert_eq!(sql(&Value::Real(f64::INFINITY)), "'Infinity'");
+        assert_eq!(sql(&Value::Real(f64::NEG_INFINITY)), "'-Infinity'");
         // A finite float is still bare.
-        assert_eq!(sql_value(&Value::Real(1.5)), "1.5");
+        assert_eq!(sql(&Value::Real(1.5)), "1.5");
     }
 
     /// SQL export emits one `INSERT` per row with quoted identifiers, ANSI string
@@ -414,6 +464,7 @@ mod tests {
             ExportFormat::Sql,
             vec!["id".to_string(), "name".to_string()],
             Path::new("users.sql"),
+            DbKind::Sqlite,
         )
         .unwrap();
         w.write_row(&[Value::Integer(1), Value::Text("O'Brien".into())])

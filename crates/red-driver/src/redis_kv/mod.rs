@@ -41,6 +41,16 @@ const MAX_SCAN_NODE_RETRIES: u32 = 3;
 /// fetch, not a per-cell grid budget, so it gets its own constant.
 const STRING_PREVIEW_CAP: usize = 8 * 1024;
 
+/// Ceiling on a key RED will serialise whole with `DUMP`.
+///
+/// `DUMP` is used for the recycle-bin snapshot, cross-server copy and the
+/// `.rdbdump` export, and it has no windowed form: the payload arrives as one
+/// buffer. Past this the key is reported as un-dumpable rather than allocated -
+/// which for the recycle bin means the delete still happens and simply is not
+/// undoable, the trade the caller already makes for a key that cannot be dumped
+/// for any other reason.
+const DUMP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// How many leading bytes of a string value a value search reads (`GETRANGE 0
 /// CAP-1`). Bounds the cost of scanning values; a match past this offset in a
 /// very large value is missed (an accepted limitation for a bounded search).
@@ -77,6 +87,9 @@ struct ClusterState {
     /// One connection per master, in `CLUSTER SLOTS` discovery order. The
     /// scan walks these in order; `slot_owner` indexes into this vec.
     masters: Vec<MultiplexedConnection>,
+    /// `host:port` per master, positionally aligned with `masters`, so a scan
+    /// that gives up on a shard can name it (see `KvScanPage::skipped_nodes`).
+    addrs: Vec<String>,
     /// `slot_owner[slot]` is the index into `masters` that owns that slot.
     /// Length is exactly [`CLUSTER_SLOTS`]; an unassigned slot (only in a
     /// mid-resharding cluster) maps to master `0` as a best-effort fallback.
@@ -191,6 +204,32 @@ impl RedisDriver {
         crate::refuse_if_read_only(self.read_only)
     }
 
+    /// Refuse a write whose key, field or member name came back from a **lossy**
+    /// byte decode.
+    ///
+    /// Redis names are binary-safe; RED's `KeyMeta`/`KvElement` are `String`, so a
+    /// non-UTF-8 name is decoded with replacement characters to keep one bad key
+    /// from failing a whole page (see `parse::lossy_utf8`). That is fine for
+    /// *display* and catastrophic for a write: the U+FFFD text is not the name the
+    /// server knows, so a `DEL`/`SREM`/`HDEL` on it silently removes nothing, a
+    /// `SET` creates a *second* key beside the real one, and cluster slot routing
+    /// sends the command to the wrong node.
+    ///
+    /// The check is the same heuristic `kv::export`'s already uses for values: a
+    /// literal U+FFFD the user really stored is refused too, and that false
+    /// positive costs an error message rather than data.
+    fn refuse_lossy(names: &[&str]) -> Result<()> {
+        match names.iter().find(|n| red_core::kv::is_lossy_text(n)) {
+            Some(_) => Err(RedError::Query(
+                "this name contains bytes that are not valid UTF-8, so RED cannot address it \
+                 exactly; a write would miss it or create a second key beside it. Use the \
+                 console with an escaped argument instead."
+                    .into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Value search over a scanned page: keep only string keys whose value
     /// contains `needle` (case-insensitive). Reads each string key's value with
     /// `GETRANGE 0 CAP` (bounded — a match past [`VALUE_SEARCH_CAP`] is missed);
@@ -273,6 +312,8 @@ impl RedisDriver {
             keys,
             next_cursor: ScanCursor::Single(cur),
             exhausted,
+            // One server, one scan: there is nothing to have skipped.
+            skipped_nodes: Vec::new(),
         })
     }
 
@@ -298,6 +339,7 @@ impl RedisDriver {
         };
         let deadline = Instant::now() + budget.wall_clock;
         let mut keys: Vec<KeyMeta> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         // Retries against the current master at the current cursor. Only reset
         // when we make forward progress (a fully successful round trip) or give
         // up and advance to the next master.
@@ -327,6 +369,15 @@ impl RedisDriver {
                     tracing::warn!(
                         "Redis cluster scan skipped master {node} after {} retries: {e}",
                         node_retries - 1
+                    );
+                    // Reported, not just logged: the caller is about to render this
+                    // page as "the keyspace", and a shard's worth of keys silently
+                    // missing from it is the failure that reads as success.
+                    skipped.push(
+                        cl.addrs
+                            .get(node)
+                            .cloned()
+                            .unwrap_or_else(|| format!("master {node}")),
                     );
                     node_retries = 0;
                     node += 1;
@@ -378,6 +429,7 @@ impl RedisDriver {
             keys,
             next_cursor,
             exhausted,
+            skipped_nodes: skipped,
         })
     }
 }
@@ -888,6 +940,17 @@ impl KvDriver for RedisDriver {
         if self.read_only && red_core::kv::classify_command(argv) != OpClass::Read {
             self.check_writable()?;
         }
+        // Refused at the driver as well as at the console (defense in depth, and
+        // this seam is also what the AI `kv_command` tool and the batch runner
+        // reach): every one of these re-points or re-shapes `self.conn`, which is
+        // the *one* multiplexed connection the browser, the inspector and every
+        // background panel share. `SELECT 3` moves all of them to another
+        // database; `MULTI` queues their commands into a transaction nobody will
+        // `EXEC`; `SUBSCRIBE`/`MONITOR` leave the connection in a mode that
+        // refuses ordinary commands until it is torn down.
+        if let Some(why) = red_core::kv::connection_state_refusal(argv) {
+            return Err(RedError::Query(why));
+        }
         let mut cmd = redis::cmd(name);
         for arg in &argv[1..] {
             cmd.arg(arg);
@@ -944,6 +1007,7 @@ impl KvDriver for RedisDriver {
 
     async fn set_string(&self, key: &str, value: String, ttl: StringTtl) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         let mut cmd = redis::cmd("SET");
         cmd.arg(key).arg(value);
@@ -970,6 +1034,7 @@ impl KvDriver for RedisDriver {
 
     async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key, field])?;
         let mut conn = self.route(key);
         redis::cmd("HSET")
             .arg(key)
@@ -982,6 +1047,8 @@ impl KvDriver for RedisDriver {
 
     async fn hash_delete(&self, key: &str, fields: &[String]) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
+        Self::refuse_lossy(&fields.iter().map(String::as_str).collect::<Vec<_>>())?;
         if fields.is_empty() {
             return Ok(0);
         }
@@ -998,6 +1065,8 @@ impl KvDriver for RedisDriver {
 
     async fn set_add(&self, key: &str, members: &[String]) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
+        Self::refuse_lossy(&members.iter().map(String::as_str).collect::<Vec<_>>())?;
         if members.is_empty() {
             return Ok(0);
         }
@@ -1014,6 +1083,8 @@ impl KvDriver for RedisDriver {
 
     async fn set_remove(&self, key: &str, members: &[String]) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
+        Self::refuse_lossy(&members.iter().map(String::as_str).collect::<Vec<_>>())?;
         if members.is_empty() {
             return Ok(0);
         }
@@ -1030,6 +1101,7 @@ impl KvDriver for RedisDriver {
 
     async fn set_replace(&self, key: &str, old: &str, new: &str) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key, old, new])?;
         let mut conn = self.route(key);
         // One `MULTI`/`EXEC` so the remove+add commit together: a failure
         // between them can't leave the set missing both members. Both commands
@@ -1051,6 +1123,7 @@ impl KvDriver for RedisDriver {
 
     async fn zset_add(&self, key: &str, member: &str, score: f64) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key, member])?;
         let mut conn = self.route(key);
         redis::cmd("ZADD")
             .arg(key)
@@ -1063,6 +1136,8 @@ impl KvDriver for RedisDriver {
 
     async fn zset_remove(&self, key: &str, members: &[String]) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
+        Self::refuse_lossy(&members.iter().map(String::as_str).collect::<Vec<_>>())?;
         if members.is_empty() {
             return Ok(0);
         }
@@ -1079,6 +1154,7 @@ impl KvDriver for RedisDriver {
 
     async fn list_set(&self, key: &str, index: i64, value: String) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         redis::cmd("LSET")
             .arg(key)
@@ -1091,6 +1167,7 @@ impl KvDriver for RedisDriver {
 
     async fn list_push(&self, key: &str, value: String, head: bool) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         redis::cmd(if head { "LPUSH" } else { "RPUSH" })
             .arg(key)
@@ -1102,6 +1179,7 @@ impl KvDriver for RedisDriver {
 
     async fn list_remove(&self, key: &str, count: i64, value: String) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         redis::cmd("LREM")
             .arg(key)
@@ -1114,6 +1192,7 @@ impl KvDriver for RedisDriver {
 
     async fn list_remove_at(&self, key: &str, index: i64) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         // Atomic positional delete: LSET a unique sentinel at `index`, then LREM
         // it, wrapped in one MULTI/EXEC so no concurrent client observes the
@@ -1141,6 +1220,7 @@ impl KvDriver for RedisDriver {
 
     async fn set_ttl(&self, key: &str, ttl: Option<Duration>) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[key])?;
         let mut conn = self.route(key);
         match ttl {
             // `PEXPIRE` (milliseconds), not `EXPIRE`, so a sub-second TTL keeps
@@ -1161,6 +1241,7 @@ impl KvDriver for RedisDriver {
 
     async fn rename_key(&self, from: &str, to: &str) -> Result<()> {
         self.check_writable()?;
+        Self::refuse_lossy(&[from, to])?;
         // Route by `from`; under a cluster, `RENAME` requires both keys in the
         // same slot, so a cross-slot rename surfaces Redis's own `CROSSSLOT`
         // error (an inherent cluster constraint, not something to paper over).
@@ -1186,6 +1267,7 @@ impl KvDriver for RedisDriver {
 
     async fn delete_keys(&self, keys: &[String]) -> Result<u64> {
         self.check_writable()?;
+        Self::refuse_lossy(&keys.iter().map(String::as_str).collect::<Vec<_>>())?;
         if keys.is_empty() {
             return Ok(0);
         }
@@ -1233,6 +1315,23 @@ impl KvDriver for RedisDriver {
 
     async fn dump_key(&self, key: &str) -> Result<Option<(Vec<u8>, Option<Duration>)>> {
         let mut conn = self.route(key);
+        // `MEMORY USAGE` first, because `DUMP` has no windowing: a two-gigabyte
+        // list serialised into a two-gigabyte `Vec<u8>` in RED's heap - held for
+        // the life of the recycle-bin entry - before the `DEL` it was snapshotting
+        // even ran. It is sampled and cheap; a server that refuses it (or an older
+        // one that lacks it) answers `None`, which reads as "unknown" and lets the
+        // dump through rather than refusing a delete over a missing diagnostic.
+        let approx: Option<u64> = redis::cmd("MEMORY")
+            .arg("USAGE")
+            .arg(key)
+            .arg("SAMPLES")
+            .arg(5)
+            .query_async(&mut conn)
+            .await
+            .ok();
+        if approx.is_some_and(|n| n > DUMP_MAX_BYTES) {
+            return Ok(None);
+        }
         // DUMP + PTTL in one pipeline: the serialized value and its remaining
         // expiry, atomic enough for a snapshot (a value edit between the two is
         // a non-issue — undo restores whatever DUMP saw).
@@ -1438,6 +1537,20 @@ impl KvDriver for RedisDriver {
 
 #[cfg(test)]
 mod tests {
+
+    /// Redis names are binary-safe and RED's are `String`, so a non-UTF-8 name
+    /// arrives with replacement characters. Written back, that text addresses a
+    /// *different* key: the delete misses and the set creates a second one.
+    #[test]
+    fn a_lossy_name_is_refused_rather_than_written_to_the_wrong_key() {
+        assert!(RedisDriver::refuse_lossy(&["user:1", "field"]).is_ok());
+        assert!(RedisDriver::refuse_lossy(&[]).is_ok());
+        let lossy = super::parse::lossy_utf8(vec![b'k', 0xff]);
+        let err = RedisDriver::refuse_lossy(&[&lossy]).expect_err("a lossy name is refused");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        // Refused wherever it appears, not just as the key.
+        assert!(RedisDriver::refuse_lossy(&["ok", &lossy]).is_err());
+    }
     use red_core::kv::{JsonDoc, JsonKind, JsonSeg};
 
     use super::*;
@@ -1489,7 +1602,7 @@ mod tests {
             match test_url() {
                 Some(u) => u,
                 None => {
-                    eprintln!("SKIP {}: RED_TEST_REDIS_URL not set", module_path!());
+                    crate::conformance::skip_or_fail("RED_TEST_REDIS_URL", module_path!());
                     return;
                 }
             }
@@ -1801,10 +1914,7 @@ mod tests {
     #[tokio::test]
     async fn sentinel_lists_masters_and_resolves_the_data_node() {
         let Some(url) = sentinel_url() else {
-            eprintln!(
-                "SKIP {}: RED_TEST_REDIS_SENTINEL_URL not set",
-                module_path!()
-            );
+            crate::conformance::skip_or_fail("RED_TEST_REDIS_SENTINEL_URL", module_path!());
             return;
         };
         // Discovery lists the monitored master(s).
@@ -1840,10 +1950,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_scan_fans_out_across_every_master() {
         let Some(url) = cluster_url() else {
-            eprintln!(
-                "SKIP {}: RED_TEST_REDIS_CLUSTER_URL not set",
-                module_path!()
-            );
+            crate::conformance::skip_or_fail("RED_TEST_REDIS_CLUSTER_URL", module_path!());
             return;
         };
         let driver = RedisDriver::connect(&url, false).await.unwrap();

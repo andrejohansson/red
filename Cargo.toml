@@ -39,6 +39,13 @@ tokio-postgres = "0.7"
 # MySQL / MariaDB — pure-Rust async client (no system libmysqlclient).
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
 futures-util = { version = "0.3", default-features = false }
+# TLS is used by four independent subtrees (mysql_async, redis, mongodb, reqwest)
+# and rustls 0.23 resolves with *both* its `ring` and `aws-lc-rs` backends
+# enabled, which makes the process-wide default provider ambiguous:
+# `ClientConfig::builder()` then panics rather than picking one. Declared
+# directly so `red_driver::install_crypto_provider` can install `ring` at startup
+# and settle it. No default features: the provider choice is the whole point.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # SSH tunnels for jump-host DB connections — pure-Rust client (no system libssh),
 # bundles key parsing, known_hosts checks, and an ssh-agent client.
 russh = "0.61"

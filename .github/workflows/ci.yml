@@ -13,6 +13,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only by default: nothing here publishes, and a job that cannot write
+# cannot be turned into one by a compromised third-party action.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -45,19 +50,19 @@ jobs:
         run: python3 scripts/i18n-extract.py --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Catches broken/dangling intra-doc links (see [workspace.lints.rustdoc]).
       # RUSTDOCFLAGS is the rustdoc twin of the global RUSTFLAGS=-D warnings above;
       # --no-deps keeps it to our crates.
       - name: Docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   drivers:
-    name: network driver conformance (pg · mysql)
+    name: network driver conformance (pg · mysql · clickhouse · redis · mongo)
     # The network drivers (Postgres/MySQL) live in `red-driver`/`red-service`,
     # which don't depend on GPUI — so they build + test on the cheap Linux runner,
     # where GitHub Actions service containers are available (they aren't on macOS).
@@ -89,9 +94,47 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
+      # The other three engines RED ships. Without them their batteries printed
+      # `SKIP` and the job went green, so "conformance passes" said nothing about
+      # ClickHouse, Redis or MongoDB - the three newest seams, and the two
+      # (`KvDriver`, `DocDriver`) that no other job covers at all.
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     env:
       RED_TEST_POSTGRES_URL: host=127.0.0.1 user=postgres password=red dbname=red_test
       RED_TEST_MYSQL_URL: mysql://root:red@127.0.0.1:3306/red_test
+      RED_TEST_CLICKHOUSE_URL: clickhouse://default@127.0.0.1:8123/default
+      RED_TEST_REDIS_URL: redis://127.0.0.1:6379
+      RED_TEST_MONGO_URL: mongodb://127.0.0.1:27017
+      # Turn a missing engine from a `SKIP` line into a failure. This job exists to
+      # verify the drivers against real servers; a container that did not come up
+      # must fail it rather than quietly reduce it to a compile check.
+      RED_TEST_REQUIRE_LIVE: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -111,7 +154,7 @@ jobs:
       # Only the engine-facing crates — no GPUI build on Linux. `--nocapture` so a
       # missing service surfaces the `SKIP …` line instead of a silent pass.
       - name: Test (red-driver · red-service, live engines)
-        run: cargo test -p red-driver -p red-service -- --nocapture
+        run: cargo test -p red-driver -p red-service --locked -- --nocapture
 
   deny:
     name: cargo-deny (supply chain)

@@ -12,11 +12,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use red_core::sql::Dialect;
 use red_core::{AiLimits, FkEdge, RedError, TableRef};
 use red_driver::{AbortSignal, DatabaseDriver, PageCap};
 use serde_json::Value as Json;
 
-use super::super::gate::kill_mode;
+use super::super::gate::{EXPLAIN_REFUSED, kill_mode, vet_explain_target};
 use super::super::util::{cap_result_bytes, guard_timeout};
 use super::format::{fk_side, format_page, format_plan, qualified};
 
@@ -273,6 +274,7 @@ pub(in crate::ai) async fn suggest_index(
     driver: &Arc<dyn DatabaseDriver>,
     input: &Json,
     limits: &AiLimits,
+    dialect: Dialect,
 ) -> (String, bool) {
     let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
     let schema = input.get("schema").and_then(Json::as_str).unwrap_or("");
@@ -283,6 +285,12 @@ pub(in crate::ai) async fn suggest_index(
             false,
         );
     }
+    // Same channel as `explain`: the text reaches the engine behind a prepended
+    // `EXPLAIN`, so it is vetted as a read before it goes anywhere. See
+    // `gate::is_read_only_explain`.
+    let Some(sql) = vet_explain_target(sql, dialect) else {
+        return (EXPLAIN_REFUSED.into(), false);
+    };
     let explain = driver.explain(sql, false);
     let plan = match limits.statement_timeout_ms {
         0 => explain.await,

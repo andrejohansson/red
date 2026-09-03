@@ -3366,3 +3366,171 @@ async fn create_namespace_is_refused_where_it_is_meaningless() {
     drop(handle);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A manual transaction holds a pinned connection: a write inside it must not be
+/// visible to anything else until commit, and a rollback must undo it. The whole
+/// arm had no coverage before, which is how it came to run on the pump with no
+/// registered cancel and no timeout.
+#[tokio::test]
+async fn a_manual_transaction_isolates_and_rolls_back() {
+    let path = std::env::temp_dir().join(format!("red_svc_tx_{}.db", std::process::id()));
+    std::fs::remove_file(&path).ok();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO t VALUES (1, 'before');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(&handle, Command::BeginTransaction { namespace: None });
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::TransactionState {
+            open: true,
+            writes: 0
+        })
+    ));
+
+    send(
+        &handle,
+        Command::Execute {
+            sql: "UPDATE t SET note = 'inside' WHERE id = 1".into(),
+            namespace: None,
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { affected: 1, .. })
+    ));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::TransactionState {
+            open: true,
+            writes: 1
+        })
+    ));
+    // Nothing is durable yet: a reader outside the transaction still sees the old
+    // row. (SQLite serialises writers, so this read is the honest check.)
+    let outside = rusqlite::Connection::open(&path).unwrap();
+    let note: String = outside
+        .query_row("SELECT note FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(note, "before", "an uncommitted write must not be visible");
+
+    // A script cannot be routed into the transaction, so it is refused rather than
+    // autocommitted beside it.
+    send(
+        &handle,
+        Command::RunScript {
+            statements: vec!["INSERT INTO t VALUES (2, 'script')".into()],
+            namespace: None,
+            stop: red_core::ScriptStop::OnError,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::Error(e)) => assert!(e.contains("transaction is open"), "{e}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    send(&handle, Command::RollbackTransaction);
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::TransactionState { open: false, .. })
+    ));
+    // Give the spawned rollback a moment to land before reading.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let note: String = outside
+        .query_row("SELECT note FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(note, "before", "rollback undoes the write");
+    let rows: i64 = outside
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the refused script inserted nothing");
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The other half: committing is what makes it durable, and the session returns
+/// to autocommit afterwards.
+#[tokio::test]
+async fn committing_a_manual_transaction_makes_it_durable() {
+    let path = std::env::temp_dir().join(format!("red_svc_tx_commit_{}.db", std::process::id()));
+    std::fs::remove_file(&path).ok();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO t VALUES (1, 'before');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(&handle, Command::BeginTransaction { namespace: None });
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::TransactionState { open: true, .. })
+    ));
+    send(
+        &handle,
+        Command::Execute {
+            sql: "UPDATE t SET note = 'after' WHERE id = 1".into(),
+            namespace: None,
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { .. })
+    ));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::TransactionState { open: true, .. })
+    ));
+    send(&handle, Command::CommitTransaction);
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::TransactionState { open: false, .. })
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let outside = rusqlite::Connection::open(&path).unwrap();
+    let note: String = outside
+        .query_row("SELECT note FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(note, "after");
+
+    // Back in autocommit: a second commit has nothing to close.
+    send(&handle, Command::CommitTransaction);
+    match next(&mut events).await {
+        Some(Event::TransactionFailed(e)) => assert!(e.contains("no transaction"), "{e}"),
+        other => panic!("expected TransactionFailed, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}

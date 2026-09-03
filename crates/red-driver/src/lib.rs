@@ -49,6 +49,31 @@ pub use postgres::PostgresDriver;
 pub use redis_kv::{RedisDriver, SentinelMaster, sentinel_masters};
 pub use sqlite::SqliteDriver;
 
+/// Settle rustls' process-wide crypto provider, once, before anything dials TLS.
+///
+/// Four independent subtrees here speak TLS (`mysql_async`, `redis`, `mongodb`,
+/// `reqwest`), and between them rustls 0.23 resolves with *both* its `ring` and
+/// `aws-lc-rs` backends compiled in. rustls only auto-selects a default when
+/// exactly one is present; with two it has no basis to choose, and
+/// `ClientConfig::builder()` panics ("no process-level CryptoProvider available")
+/// on the first `rediss://` or `require_ssl` connection - on the backend thread,
+/// taking the process with it. Cargo features are additive, so a dependency
+/// pulling in the second backend is not something this crate can prevent; naming
+/// the provider is.
+///
+/// `ring` rather than `aws-lc-rs`: it needs no C toolchain or CMake at build time,
+/// which keeps the cross-platform release builds honest.
+///
+/// Idempotent and safe to call from anywhere: a provider already installed (by an
+/// earlier call, or by a dependency) is left alone. Call it as early in `main` as
+/// possible - before the CLI dispatch, which dials databases of its own.
+pub fn install_crypto_provider() {
+    // `install_default` returns `Err` when one is already installed, which is a
+    // fine outcome and not something to report: the invariant this function exists
+    // to establish (there *is* a default) holds either way.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Default bytes of a non-key cell's content a *display* fetch keeps; past it,
 /// text is truncated to a [`Value::Capped`] prefix and a blob to its length only.
 /// The resident-cell budget that keeps the grid's RAM flat over fat `TEXT`/`BLOB`
@@ -495,6 +520,35 @@ pub(crate) fn eq_clause(
 ///
 /// An empty `preds` returns an empty string; the caller (the service) treats that
 /// as "no filter" rather than emitting an invalid `WHERE ()`.
+/// The SQL boolean literal for a comparison against a boolean column, or `None`
+/// when this is not that case.
+///
+/// A boolean cell decodes to `Integer(0|1)` on every engine RED speaks (Postgres
+/// `BOOL` is a byte on the wire, MySQL's is a `TINYINT(1)`, SQLite has no boolean
+/// type at all), which is right for display and wrong for a predicate: Postgres
+/// has no int→bool cast, so `"active" = 1` is a bare 42883 the moment anyone uses
+/// "Filter by value" on a boolean column. `TRUE`/`FALSE` are keywords every engine
+/// here accepts, so this needs no per-engine hook.
+///
+/// Keyed on the *declared type*, not the value, so an ordinary integer column
+/// holding 0 or 1 is untouched.
+fn bool_literal(value: &Value, decl_type: Option<&str>) -> Option<&'static str> {
+    let declared = decl_type?.trim().to_ascii_lowercase();
+    // The spellings the catalogs report: `information_schema.udt_name` says
+    // `bool`, `format_type` and MySQL say `boolean`/`tinyint(1)`, ClickHouse says
+    // `Bool`, SQLite reports whatever the DDL wrote.
+    if !matches!(declared.as_str(), "bool" | "boolean" | "tinyint(1)") {
+        return None;
+    }
+    match value {
+        Value::Integer(0) => Some("FALSE"),
+        Value::Integer(1) => Some("TRUE"),
+        // Anything else against a boolean column is not a boolean comparison the
+        // caller meant; render it as written and let the engine say so.
+        _ => None,
+    }
+}
+
 pub(crate) fn cmp_clause(
     preds: &[ColumnPredicate],
     quote: impl Fn(&str) -> String,
@@ -532,11 +586,10 @@ pub(crate) fn cmp_clause(
                 ),
                 (op, _) => {
                     let value = p.value.as_ref().unwrap_or(&Value::Null);
-                    format!(
-                        "{col} {} {}",
-                        cmp_op_sql(op),
-                        sql_literal(value, backslash_escapes)
-                    )
+                    let literal = bool_literal(value, p.decl_type.as_deref())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| sql_literal(value, backslash_escapes));
+                    format!("{col} {} {literal}", cmp_op_sql(op))
                 }
             }
         })
@@ -1875,13 +1928,14 @@ pub(crate) fn now_unix() -> i64 {
 /// Seconds from a server, as a `Duration`. Every engine reports an uptime or a
 /// lag as a float, and every one of them can hand back a negative or a NaN
 /// (a clock stepped backwards, a `NULL` coalesced through a division); a
-/// `Duration` cannot hold either, and `from_secs_f64` *panics* on both.
+/// `Duration` cannot hold either - nor a finite-but-enormous `1e300` - and
+/// `from_secs_f64` *panics* on all three.
 pub(crate) fn secs_to_duration(secs: f64) -> std::time::Duration {
-    if secs.is_finite() && secs > 0.0 {
-        std::time::Duration::from_secs_f64(secs)
-    } else {
-        std::time::Duration::ZERO
-    }
+    // `try_from_secs_f64` rather than a finite/positive check plus
+    // `from_secs_f64`: a finite, positive `1e300` overflows `Duration` and panics
+    // just as NaN does, and this is the only conversion that reports both rather
+    // than one of them.
+    std::time::Duration::try_from_secs_f64(secs).unwrap_or(std::time::Duration::ZERO)
 }
 
 /// A byte count a human reads at a glance, for finding prose. Binary units, since
@@ -1903,6 +1957,21 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The bug this guards: with both rustls backends compiled in there is no
+    /// default provider, and the *first* TLS connection panics rather than
+    /// failing. Building a `ClientConfig` is what every TLS-speaking dependency
+    /// here does internally, so it is the honest probe.
+    #[test]
+    fn installing_the_crypto_provider_makes_a_tls_config_buildable() {
+        super::install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        // Idempotent: a second call must not panic or unseat the first.
+        super::install_crypto_provider();
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
+
     use super::*;
 
     fn col(name: &str, type_name: Option<&str>) -> ColumnMeta {
@@ -2086,6 +2155,7 @@ mod tests {
             column: column.into(),
             op,
             value,
+            decl_type: None,
         }
     }
 
@@ -2112,6 +2182,31 @@ mod tests {
             cmp_clause(&preds, |c| format!("\"{c}\""), cast, "ILIKE", false, true),
             r#""a" = 1 AND "a" <> 1 AND "a" < 1 AND "a" <= 1 AND "a" > 1 AND "a" >= 1"#
         );
+    }
+
+    /// A boolean column decodes as `Integer(0|1)`, and Postgres has no int→bool
+    /// cast: `"active" = 1` is a bare 42883, which is what "Filter by value" on a
+    /// boolean column used to produce.
+    #[test]
+    fn cmp_clause_compares_a_boolean_column_as_a_boolean() {
+        let pred = |decl: Option<&str>, n: i64| ColumnPredicate {
+            column: "active".into(),
+            op: CmpOp::Eq,
+            value: Some(Value::Integer(n)),
+            decl_type: decl.map(str::to_string),
+        };
+        let render = |p: ColumnPredicate| {
+            cmp_clause(&[p], |c| format!("\"{c}\""), cast, "LIKE", false, false)
+        };
+        assert_eq!(render(pred(Some("bool"), 1)), r#""active" = TRUE"#);
+        assert_eq!(render(pred(Some("boolean"), 0)), r#""active" = FALSE"#);
+        assert_eq!(render(pred(Some("tinyint(1)"), 1)), r#""active" = TRUE"#);
+        // An ordinary integer column holding 0 or 1 is untouched.
+        assert_eq!(render(pred(Some("int4"), 1)), r#""active" = 1"#);
+        assert_eq!(render(pred(None, 1)), r#""active" = 1"#);
+        // And a value that is not a boolean is rendered as written, so the engine
+        // reports it rather than RED guessing.
+        assert_eq!(render(pred(Some("bool"), 7)), r#""active" = 7"#);
     }
 
     #[test]

@@ -93,6 +93,7 @@ fn parse(xml: &str) -> ImportReport {
                 ssh: None,
                 proxy: None,
                 sentinel_master: String::new(),
+                srv: false,
             },
             source_name: name,
             folder: None,

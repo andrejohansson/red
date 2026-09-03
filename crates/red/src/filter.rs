@@ -563,6 +563,7 @@ impl AppState {
                 column: column.name.clone(),
                 op: bar.op,
                 value: None,
+                decl_type: column.decl_type.clone(),
             });
         }
         let text = bar.value.read(cx).content().to_string();
@@ -576,6 +577,7 @@ impl AppState {
             column: column.name.clone(),
             op: bar.op,
             value: Some(value),
+            decl_type: column.decl_type.clone(),
         })
     }
 
@@ -678,6 +680,9 @@ impl AppState {
             column: column.name,
             op,
             value: op.takes_value().then_some(value),
+            // The column's own type, so a boolean cell filters as `= TRUE` rather
+            // than as the `= 1` Postgres refuses.
+            decl_type: column.decl_type,
         };
         let mut terms = match (and_join, self.active_result_filter(cx)) {
             (true, Some(ResultFilter::Cmp(existing))) => existing,
@@ -1533,6 +1538,7 @@ mod tests {
             column: column.into(),
             op,
             value,
+            decl_type: None,
         }
     }
 

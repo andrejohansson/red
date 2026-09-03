@@ -128,25 +128,9 @@ pub fn save(name: &str, description: Option<&str>, sql: &str) -> Result<PathBuf>
 /// Unix: a saved query can embed literal credentials or PII in a predicate, the
 /// same content class as the query history.
 fn write_query_file(file_name: &str, contents: &str) -> Result<PathBuf> {
-    use std::io::Write;
-
     let dir = queries_dir().context("no config directory for saved queries")?;
-    std::fs::create_dir_all(&dir).context("creating the queries directory")?;
     let dest = dir.join(file_name);
-    let tmp = dir.join(format!("{file_name}.tmp.{}", std::process::id()));
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp).context("creating the query temp file")?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, &dest).context("renaming the query temp file")?;
+    crate::atomic::write_private(&dest, contents.as_bytes())?;
     Ok(dest)
 }
 

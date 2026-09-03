@@ -1125,7 +1125,10 @@ impl AppState {
             .as_ref()
             .map(ImportPayload::unit)
             .unwrap_or("command");
-        let can_import = count > 0 && !imp.running;
+        // A file holding destructive commands needs the acknowledgement below;
+        // otherwise the button is live as soon as there is something to run.
+        let can_import =
+            count > 0 && !imp.running && (imp.destructive.is_empty() || imp.destructive_ack);
 
         let choose_view = view.clone();
         let choose_label = if imp.path.is_some() {
@@ -1233,7 +1236,24 @@ impl AppState {
                         .child(format!("… and {} more", total - SHOWN)),
                 );
             }
-            warn
+            // The gate. The whole file runs on one click and these lines are not
+            // reversible, so the click has to be a second decision rather than the
+            // same one that chose the file.
+            let ack_view = view.clone();
+            warn.child(
+                div().pt_1().child(
+                    Checkbox::new("kv-import-ack", imp.destructive_ack)
+                        .label(crate::i18n::tr!(
+                            "kv.import_ack",
+                            "Run these commands against this server"
+                        ))
+                        .on_change(move |_, _, cx| {
+                            ack_view
+                                .update(cx, |this, cx| this.kv_toggle_import_ack(session, cx))
+                                .ok();
+                        }),
+                ),
+            )
         });
 
         let body = div()
@@ -1492,12 +1512,28 @@ impl AppState {
             .active_browse()?
             .inspector
             .as_ref()?;
-        if !inspector.confirm_delete {
-            return None;
-        }
+        let target = inspector.confirm_delete.as_ref()?;
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
         let key = inspector.key.clone();
+
+        // The two deletes this modal covers are not the same promise: a key goes
+        // to the recycle bin and can be put back, a JSON sub-document cannot.
+        let (question, consequence) = match target {
+            super::KvDeleteTarget::Key => (
+                format!("Delete \"{key}\"?"),
+                crate::i18n::tr!("kv.this_cant_be_undone", "This can't be undone.").to_string(),
+            ),
+            super::KvDeleteTarget::JsonNode(path) => (
+                format!("Delete {} from \"{key}\"?", path.expr()),
+                crate::i18n::tr!(
+                    "kv.json_delete_cant_be_undone",
+                    "Deleting inside a JSON document takes no recycle-bin snapshot, so this \
+                     can't be undone."
+                )
+                .to_string(),
+            ),
+        };
 
         let body = div()
             .flex()
@@ -1507,16 +1543,13 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.5))
                     .text_color(theme.text)
-                    .child(format!("Delete \"{key}\"?")),
+                    .child(question),
             )
             .child(
                 div()
                     .text_size(theme.scale(11.))
                     .text_color(theme.text_muted)
-                    .child(crate::i18n::tr!(
-                        "kv.this_cant_be_undone",
-                        "This can't be undone."
-                    )),
+                    .child(consequence),
             )
             .children(self.confirm_policy().allow_quiet.then(|| {
                 div().pt_1().child(self.dont_ask_destructive_checkbox(
@@ -1555,7 +1588,14 @@ impl AppState {
 
         Some(
             Modal::new("kv-delete-key")
-                .title(crate::i18n::tr!("kv.delete_key", "Delete key"))
+                .title(match target {
+                    super::KvDeleteTarget::Key => {
+                        crate::i18n::tr!("kv.delete_key", "Delete key")
+                    }
+                    super::KvDeleteTarget::JsonNode(_) => {
+                        crate::i18n::tr!("kv.delete_json_node", "Delete JSON node")
+                    }
+                })
                 .width(px(380.))
                 .focus_handle(self.modal_focus.clone())
                 .on_close(move |_, cx| {

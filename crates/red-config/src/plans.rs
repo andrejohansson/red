@@ -95,10 +95,7 @@ pub fn read_file(path: &Path) -> Result<SavedPlan> {
 /// can embed a `WHERE` clause with literal values, the same content class as the
 /// query history and the saved queries.
 pub fn save(name: &str, plan: &TransferPlan) -> Result<PathBuf> {
-    use std::io::Write;
-
     let dir = plans_dir().context("no config directory for saved plans")?;
-    std::fs::create_dir_all(&dir).context("creating the plans directory")?;
     let dest = dir.join(format!("{}.json", crate::queries::slug(name)));
 
     let file = PlanFile {
@@ -106,21 +103,7 @@ pub fn save(name: &str, plan: &TransferPlan) -> Result<PathBuf> {
         plan: plan.clone(),
     };
     let contents = serde_json::to_string_pretty(&file).context("encoding the plan")?;
-
-    let tmp = dest.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).context("creating the plan temp file")?;
-    f.write_all(contents.as_bytes())?;
-    f.write_all(b"\n")?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, &dest).context("renaming the plan temp file")?;
+    crate::atomic::write_private(&dest, format!("{contents}\n").as_bytes())?;
     Ok(dest)
 }
 

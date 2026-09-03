@@ -15,7 +15,7 @@ mod modules;
 pub use export::{
     KV_DUMP_MAGIC, KV_EXPORT_CHUNK, KvDumpEntry, KvExportFormat, KvExportOptions, KvExportScope,
     b64_encode, command_line, commands_header, dump_frame, expire_line, is_lossy_text, json_binary,
-    json_string, quote_arg, read_dump_frame,
+    json_string, quote_arg, read_dump_frame, read_dump_frame_from,
 };
 pub use info::parse_info;
 pub use json::{
@@ -170,6 +170,13 @@ pub struct KvScanPage {
     pub keys: Vec<KeyMeta>,
     pub next_cursor: ScanCursor,
     pub exhausted: bool,
+    /// Cluster masters this scan gave up on after exhausting its retries, so the
+    /// keys they hold are **missing** from `keys`.
+    ///
+    /// A browse that quietly returns 900 of 1000 keys and reports itself finished
+    /// is worse than one that fails: the user reads the list as the keyspace. Empty
+    /// on a standalone server, and on a cluster scan that reached every shard.
+    pub skipped_nodes: Vec<String>,
 }
 
 /// The three collection types pageable via a `*SCAN` command. Lists aren't
@@ -776,6 +783,51 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "SETRANGE",
     "RESTORE",
     "COPY",
+    "SMOVE",
+    "LMOVE",
+    "BLMOVE",
+    "RPOPLPUSH",
+    "BRPOPLPUSH",
+    // The blocking pop variants remove the same elements the non-blocking ones
+    // do; they just wait first.
+    "BLPOP",
+    "BRPOP",
+    "BLMPOP",
+    "LMPOP",
+    "BZPOPMIN",
+    "BZPOPMAX",
+    "BZMPOP",
+    "ZMPOP",
+    "ZPOPMIN",
+    "ZPOPMAX",
+    // The `*STORE` family writes its result to a destination key, overwriting
+    // whatever is there. The name says "intersect"; the effect is a `SET` on a
+    // key the command mentions almost in passing. (`SORT`/`GEORADIUS` are the
+    // same shape but only *with* a `STORE` argument, so they live in
+    // [`DESTRUCTIVE_WITH_ARG`].)
+    "SINTERSTORE",
+    "SUNIONSTORE",
+    "SDIFFSTORE",
+    "ZINTERSTORE",
+    "ZUNIONSTORE",
+    "ZDIFFSTORE",
+    "ZRANGESTORE",
+    "GEOSEARCHSTORE",
+    "BITOP",
+    "XAUTOCLAIM",
+    // Expiry *is* deletion on a short enough horizon, and `EXPIRE k 0` deletes
+    // outright - with no recycle-bin snapshot, unlike `DEL`. The whole family is
+    // here rather than only the zero form: the argument is not always a literal,
+    // and "expires in one second" is not meaningfully less destructive.
+    "EXPIRE",
+    "PEXPIRE",
+    "EXPIREAT",
+    "PEXPIREAT",
+    "PERSIST",
+    // Server-wide: `SAVE` blocks the whole server for the length of the dump, and
+    // `BGREWRITEAOF` rewrites the durability log under it.
+    "SAVE",
+    "BGREWRITEAOF",
     // RedisJSON removals. `JSON.DEL`/`JSON.FORGET` at path `$` delete the key
     // outright, and `JSON.CLEAR`/`ARRPOP`/`ARRTRIM` discard data in place.
     "JSON.DEL",
@@ -796,6 +848,20 @@ const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("CONFIG", "REWRITE"),
     ("CLIENT", "KILL"),
     ("CLIENT", "UNPAUSE"),
+    ("CLIENT", "PAUSE"),
+    ("SCRIPT", "KILL"),
+    ("FUNCTION", "KILL"),
+    ("CLUSTER", "ADDSLOTS"),
+    ("CLUSTER", "DELSLOTS"),
+    ("CLUSTER", "ADDSLOTSRANGE"),
+    ("CLUSTER", "DELSLOTSRANGE"),
+    ("CLUSTER", "BUMPEPOCH"),
+    ("CLUSTER", "MEET"),
+    ("CLUSTER", "REPLICATE"),
+    ("CLUSTER", "FLUSHSLOTS"),
+    ("LATENCY", "RESET"),
+    ("MEMORY", "PURGE"),
+    ("SLOWLOG", "RESET"),
     ("ACL", "SETUSER"),
     ("ACL", "DELUSER"),
     ("ACL", "LOAD"),
@@ -815,6 +881,179 @@ const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("MODULE", "UNLOAD"),
 ];
 
+/// Commands that are destructive only when a particular argument is present, so
+/// the plain read form of the same command does not raise a confirm nobody needs.
+///
+/// `SORT key` and `GEORADIUS …` are reads; the same commands with `STORE` write
+/// their result over a destination key. `GETEX key` is a read; with any expiry
+/// option it changes when the key dies. Gating the whole verb would put a modal in
+/// front of an ordinary browse, and a confirm users learn to click through is
+/// worse than no confirm.
+const DESTRUCTIVE_WITH_ARG: &[(&str, &[&str])] = &[
+    ("SORT", &["STORE"]),
+    ("SORT_RO", &["STORE"]),
+    ("GEORADIUS", &["STORE", "STOREDIST"]),
+    ("GEORADIUSBYMEMBER", &["STORE", "STOREDIST"]),
+    ("GEOSEARCH", &["STORE", "STOREDIST"]),
+    ("GETEX", &["EX", "PX", "EXAT", "PXAT", "PERSIST"]),
+];
+
+/// Commands that change the *connection's* own state rather than the data.
+///
+/// RED's Redis sessions run over one multiplexed connection shared by the browser,
+/// the inspector, the console and every background panel, so a console line that
+/// re-points or re-shapes that connection silently re-points everything else:
+/// `SELECT 3` moves the whole session to another database, `MULTI` queues every
+/// other panel's commands into a transaction nobody will `EXEC`, `HELLO 3` changes
+/// the protocol mid-stream, `CLIENT REPLY OFF` stops replies arriving at all,
+/// `SUBSCRIBE`/`MONITOR` put the connection into a mode where ordinary commands
+/// are refused, and `RESET`/`QUIT` discard or close it.
+///
+/// Refused rather than confirmed: there is nothing here a user could usefully
+/// approve, because the damage is to a connection they cannot see.
+pub const CONNECTION_STATE_COMMANDS: &[&str] = &[
+    "SELECT",
+    "SWAPDB",
+    "MULTI",
+    "EXEC",
+    "DISCARD",
+    "WATCH",
+    "UNWATCH",
+    "HELLO",
+    "AUTH",
+    "RESET",
+    "QUIT",
+    "SUBSCRIBE",
+    "PSUBSCRIBE",
+    "SSUBSCRIBE",
+    "UNSUBSCRIBE",
+    "PUNSUBSCRIBE",
+    "SUNSUBSCRIBE",
+    "MONITOR",
+];
+
+/// `(command, subcommand)` pairs in the same class as [`CONNECTION_STATE_COMMANDS`]:
+/// the read forms of these commands are fine, one form is not.
+pub const CONNECTION_STATE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("CLIENT", "REPLY"),
+    ("CLIENT", "NO-EVICT"),
+    ("CLIENT", "NO-TOUCH"),
+    ("CLIENT", "SETNAME"),
+    ("CLIENT", "TRACKING"),
+    ("CLIENT", "UNPAUSE"),
+];
+
+/// Why a console command is refused outright, if it is: the connection-state
+/// reason to show the user, or `None` when the command is fine to run.
+///
+/// Separate from [`classify_command`] because it is a different kind of answer: a
+/// destructive command is *allowed* behind a confirm, while these are not offered
+/// at all.
+pub fn connection_state_refusal(argv: &[String]) -> Option<String> {
+    let name = argv.first()?.to_ascii_uppercase();
+    let sub = argv.get(1).map(|s| s.to_ascii_uppercase());
+    let hit = CONNECTION_STATE_COMMANDS.contains(&name.as_str())
+        || sub
+            .as_deref()
+            .is_some_and(|s| CONNECTION_STATE_SUBCOMMANDS.contains(&(name.as_str(), s)));
+    if !hit {
+        return None;
+    }
+    // The one with an obvious alternative gets it named; the rest share a reason.
+    let hint = match name.as_str() {
+        "SELECT" => " Use the database switcher in the toolbar instead.",
+        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" => " Use the Keyspace panel instead.",
+        "MONITOR" => " Use the Monitor panel instead.",
+        "AUTH" | "HELLO" => " Credentials belong in the connection settings.",
+        _ => "",
+    };
+    Some(format!(
+        "`{name}` changes the state of the connection itself, which RED shares \
+         between the browser, the inspector and every panel, so it is not run from \
+         the console.{hint}"
+    ))
+}
+
+/// The placeholder a redacted argument is replaced with, so a persisted line still
+/// reads as the command it was.
+pub const REDACTED: &str = "<redacted>";
+
+/// A copy of `argv` with any credential argument replaced by [`REDACTED`], or
+/// `None` when the line carries none.
+///
+/// The console's history is persisted to `history.json` and read back by the
+/// History dock *and* handed to the assistant as grounding, so a line that
+/// carries a password writes it to disk in clear and then quotes it into a model's
+/// context. The command still has to be recognisable afterwards - "the AUTH I ran
+/// at 14:02" is the useful part - so the verb and the shape stay and only the
+/// secret goes.
+///
+/// Positional rather than pattern-matched on the whole line: each entry knows
+/// which of *its* arguments is the secret, because `AUTH pass` and
+/// `AUTH user pass` differ only in arity.
+pub fn redact_secrets(argv: &[String]) -> Option<Vec<String>> {
+    let name = argv.first()?.to_ascii_uppercase();
+    let mut out = argv.to_vec();
+    let mut redacted = false;
+    let mut hide = |out: &mut Vec<String>, i: usize| {
+        if let Some(a) = out.get_mut(i) {
+            *a = REDACTED.to_string();
+            redacted = true;
+        }
+    };
+    match name.as_str() {
+        // `AUTH password` | `AUTH username password`.
+        "AUTH" => hide(&mut out, argv.len().saturating_sub(1)),
+        // `HELLO [ver [AUTH user pass] [SETNAME name]]`: the password follows the
+        // username, which follows the `AUTH` token.
+        "HELLO" => {
+            if let Some(at) = argv.iter().position(|a| a.eq_ignore_ascii_case("AUTH")) {
+                hide(&mut out, at + 2);
+            }
+        }
+        // `MIGRATE host port key db timeout [AUTH pass] [AUTH2 user pass]`.
+        "MIGRATE" => {
+            for (at, a) in argv.iter().enumerate() {
+                if a.eq_ignore_ascii_case("AUTH") {
+                    hide(&mut out, at + 1);
+                } else if a.eq_ignore_ascii_case("AUTH2") {
+                    hide(&mut out, at + 2);
+                }
+            }
+        }
+        // `CONFIG SET requirepass <secret>` (and the replica-side equivalents),
+        // possibly several pairs in one call since Redis 7.
+        "CONFIG" if argv.get(1).is_some_and(|s| s.eq_ignore_ascii_case("SET")) => {
+            const SECRET_PARAMS: [&str; 3] = ["requirepass", "masterauth", "primaryauth"];
+            let mut at = 2;
+            while at + 1 < argv.len() {
+                if SECRET_PARAMS
+                    .iter()
+                    .any(|p| argv[at].eq_ignore_ascii_case(p))
+                {
+                    hide(&mut out, at + 1);
+                }
+                at += 2;
+            }
+        }
+        // `ACL SETUSER <name> … >password …`: the rule itself embeds the secret,
+        // so the whole rule goes rather than a following argument.
+        "ACL"
+            if argv
+                .get(1)
+                .is_some_and(|s| s.eq_ignore_ascii_case("SETUSER")) =>
+        {
+            for (at, rule) in argv.iter().enumerate().skip(2) {
+                if rule.starts_with('>') || rule.starts_with('#') {
+                    hide(&mut out, at);
+                }
+            }
+        }
+        _ => {}
+    }
+    redacted.then_some(out)
+}
+
 /// Classify a raw console command line for the read-only gate and the
 /// destructive-command confirm.
 /// Unknown commands default to [`OpClass::Write`] (the safer default under a
@@ -829,7 +1068,15 @@ pub fn classify_command(argv: &[String]) -> OpClass {
     let destructive = DESTRUCTIVE_COMMANDS.contains(&upper.as_str())
         || sub
             .as_deref()
-            .is_some_and(|s| DESTRUCTIVE_SUBCOMMANDS.contains(&(upper.as_str(), s)));
+            .is_some_and(|s| DESTRUCTIVE_SUBCOMMANDS.contains(&(upper.as_str(), s)))
+        || DESTRUCTIVE_WITH_ARG
+            .iter()
+            .filter(|(cmd, _)| *cmd == upper)
+            .any(|(_, markers)| {
+                argv[1..]
+                    .iter()
+                    .any(|a| markers.iter().any(|m| a.eq_ignore_ascii_case(m)))
+            });
     if destructive {
         OpClass::Destructive
     } else if READ_COMMANDS.contains(&upper.as_str())
@@ -1339,6 +1586,118 @@ fn summarize_template(pattern: String, rows: &[&KeySegments<'_>]) -> KeyTemplate
 mod tests {
     use super::*;
 
+    fn argv(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// The confirm gate is only worth having if it covers the commands that
+    /// actually destroy data. `EXPIRE k 0` deletes outright, the blocking pops
+    /// remove the same elements their non-blocking twins do, and the `*STORE`
+    /// family overwrites a destination key the command barely mentions.
+    #[test]
+    fn destructive_covers_deletion_by_effect() {
+        let d = |line: &str| classify_command(&argv(line)) == OpClass::Destructive;
+        assert!(d("EXPIRE k 0"));
+        assert!(d("PEXPIRE k 1"));
+        assert!(d("PERSIST k"));
+        assert!(d("BLPOP q 0"));
+        assert!(d("BRPOPLPUSH a b 0"));
+        assert!(d("ZMPOP 1 z MIN"));
+        assert!(d("SMOVE a b m"));
+        assert!(d("SINTERSTORE dest a b"));
+        assert!(d("BITOP AND dest a b"));
+        assert!(d("CLIENT PAUSE 10000"));
+        assert!(d("SCRIPT KILL"));
+        assert!(d("SAVE"));
+        assert!(d("SLOWLOG RESET"));
+        assert!(d("CLUSTER ADDSLOTS 1 2 3"));
+    }
+
+    /// ...and only worth having if it stays quiet on the reads. A confirm users
+    /// learn to click through protects nothing.
+    #[test]
+    fn destructive_stays_quiet_on_the_read_forms() {
+        let d = |line: &str| classify_command(&argv(line)) == OpClass::Destructive;
+        assert!(!d("SORT mylist"));
+        assert!(d("SORT mylist STORE dest"));
+        assert!(!d("GETEX k"));
+        assert!(d("GETEX k EX 60"));
+        assert!(!d("GEORADIUS k 15 37 200 km"));
+        assert!(d("GEORADIUS k 15 37 200 km STORE dest"));
+        assert!(!d("CONFIG GET maxmemory"));
+        assert!(!d("CLIENT LIST"));
+        assert!(!d("SLOWLOG GET 10"));
+    }
+
+    /// One multiplexed connection carries the browser, the inspector and every
+    /// panel, so a console line that re-points it re-points all of them.
+    #[test]
+    fn connection_state_commands_are_refused_with_a_reason() {
+        for line in [
+            "SELECT 3",
+            "MULTI",
+            "HELLO 3",
+            "RESET",
+            "SUBSCRIBE news",
+            "MONITOR",
+            "CLIENT REPLY OFF",
+        ] {
+            assert!(
+                connection_state_refusal(&argv(line)).is_some(),
+                "{line} must be refused"
+            );
+        }
+        // The reads of the same commands are untouched.
+        assert!(connection_state_refusal(&argv("CLIENT LIST")).is_none());
+        assert!(connection_state_refusal(&argv("GET k")).is_none());
+        assert!(connection_state_refusal(&[]).is_none());
+        // The one with an obvious alternative names it.
+        let why = connection_state_refusal(&argv("SELECT 3")).unwrap();
+        assert!(why.contains("database switcher"), "{why}");
+    }
+
+    /// Console history is persisted to disk and handed to the assistant as
+    /// grounding, so a line carrying a password must not be stored verbatim - but
+    /// must still be recognisable as the command it was.
+    #[test]
+    fn secrets_are_redacted_from_a_persisted_line() {
+        let red = |line: &str| redact_secrets(&argv(line)).map(|v| v.join(" "));
+        assert_eq!(red("AUTH hunter2").as_deref(), Some("AUTH <redacted>"));
+        assert_eq!(
+            red("AUTH alice hunter2").as_deref(),
+            Some("AUTH alice <redacted>")
+        );
+        assert_eq!(
+            red("HELLO 3 AUTH alice hunter2 SETNAME red").as_deref(),
+            Some("HELLO 3 AUTH alice <redacted> SETNAME red")
+        );
+        assert_eq!(
+            red("CONFIG SET requirepass hunter2").as_deref(),
+            Some("CONFIG SET requirepass <redacted>")
+        );
+        assert_eq!(
+            red("CONFIG SET maxmemory 100mb masterauth hunter2").as_deref(),
+            Some("CONFIG SET maxmemory 100mb masterauth <redacted>")
+        );
+        assert_eq!(
+            red("MIGRATE h 6379 k 0 5000 AUTH hunter2").as_deref(),
+            Some("MIGRATE h 6379 k 0 5000 AUTH <redacted>")
+        );
+        assert_eq!(
+            red("MIGRATE h 6379 k 0 5000 AUTH2 alice hunter2").as_deref(),
+            Some("MIGRATE h 6379 k 0 5000 AUTH2 alice <redacted>")
+        );
+        assert_eq!(
+            red("ACL SETUSER alice on >hunter2 ~* +@all").as_deref(),
+            Some("ACL SETUSER alice on <redacted> ~* +@all")
+        );
+        // A line with no secret is left alone, so the caller can tell the two apart.
+        assert_eq!(red("GET k"), None);
+        assert_eq!(red("CONFIG SET maxmemory 100mb"), None);
+        assert_eq!(red("CONFIG GET requirepass"), None);
+        assert_eq!(redact_secrets(&[]), None);
+    }
+
     #[test]
     fn key_templates_collapse_ids_and_keep_literals() {
         let mut keys = Vec::new();
@@ -1580,14 +1939,15 @@ mod tests {
             classify_command(&["FUNCTION".into(), "LOAD".into(), "…".into()]),
             OpClass::Destructive
         );
-        // MEMORY is read only in its introspection forms; PURGE mutates.
+        // MEMORY is read only in its introspection forms; PURGE releases memory
+        // back to the allocator and stalls the server doing it.
         assert_eq!(
             classify_command(&["MEMORY".into(), "USAGE".into(), "k".into()]),
             OpClass::Read
         );
         assert_eq!(
             classify_command(&["MEMORY".into(), "PURGE".into()]),
-            OpClass::Write
+            OpClass::Destructive
         );
     }
 

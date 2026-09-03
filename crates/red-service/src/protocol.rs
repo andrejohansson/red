@@ -933,12 +933,22 @@ pub enum Command {
     /// editor commits together on every engine whose transactions cover DDL. Replied
     /// with `Executed`.
     /// Open a manual transaction on this session, pinning a connection for its
-    /// lifetime. Every later `Execute` / `RunScript` / result open runs inside it
-    /// until `CommitTransaction` or `RollbackTransaction`.
+    /// lifetime. Every later `Execute` runs inside it until `CommitTransaction` or
+    /// `RollbackTransaction`.
     ///
     /// Refused on an engine without transactions (ClickHouse) and on a read-only
-    /// connection, where holding one could only ever end in a rollback.
-    BeginTransaction,
+    /// connection, where holding one could only ever end in a rollback. Refused
+    /// too for the write paths that cannot be routed into it - `RunScript`,
+    /// `ApplyBatch`, `Import`, `CopyToTable` - which would otherwise autocommit
+    /// *beside* the transaction while the UI showed one open.
+    ///
+    /// `namespace` binds the transaction's connection to the tab's database for
+    /// its whole life; a later `Execute` naming a different one is refused rather
+    /// than run against the wrong schema. `None` on the engines whose namespace is
+    /// fixed at connect.
+    BeginTransaction {
+        namespace: Option<String>,
+    },
     /// Commit the open transaction and return to autocommit.
     CommitTransaction,
     /// Discard the open transaction and return to autocommit.

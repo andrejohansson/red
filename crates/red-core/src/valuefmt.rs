@@ -78,9 +78,57 @@ pub fn json_value(value: &Value) -> String {
 /// A SQL identifier (table or column) in portable ANSI form: double-quoted with
 /// any embedded `"` doubled. Works for SQLite / Postgres / ClickHouse and for
 /// MySQL under `ANSI_QUOTES`; a deliberately dialect-neutral default for text
-/// the user carries elsewhere.
+/// the user carries elsewhere with no engine in mind (the clipboard).
 pub fn sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A SQL identifier for a **named** engine.
+///
+/// The ANSI double quote above is not portable to MySQL, whose default
+/// `sql_mode` has no `ANSI_QUOTES`: an exported `INSERT INTO "orders" ("id")`
+/// reads `"orders"` as a string literal and fails to parse. When the export knows
+/// which engine produced it, it can spell the identifier that engine's way.
+pub fn sql_ident_for(name: &str, dialect: SqlFlavor) -> String {
+    match dialect {
+        SqlFlavor::MySql => format!("`{}`", name.replace('`', "``")),
+        SqlFlavor::Ansi => sql_ident(name),
+    }
+}
+
+/// The two spellings a generated SQL file has to choose between: MySQL's
+/// backtick identifiers and backslash string escapes, or the ANSI/standard form
+/// every other engine RED speaks uses.
+///
+/// Deliberately coarse. This is not a dialect model - it is the two decisions an
+/// `INSERT` statement's *text* depends on, and giving it a name keeps the export
+/// from having to reason about engines at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlFlavor {
+    /// Double-quoted identifiers, `\` literal inside a string, `X'…'` blobs.
+    /// Postgres, SQLite, and ClickHouse's `\`-less reading of a re-imported file.
+    Ansi,
+    /// Backtick identifiers, `\` as an escape inside a string, `0x…` blobs.
+    MySql,
+}
+
+impl SqlFlavor {
+    /// The flavour an engine's generated SQL should be written in.
+    pub fn of(kind: crate::DbKind) -> Self {
+        match kind {
+            crate::DbKind::Mysql => SqlFlavor::MySql,
+            // ClickHouse also honours `\` inside a literal, but it takes
+            // double-quoted identifiers, and doubling a backslash there is the
+            // safe direction (the value reloads with one backslash either way
+            // *because* the escape is honoured).
+            _ => SqlFlavor::Ansi,
+        }
+    }
+
+    /// Whether `\` is an escape character inside a `'…'` literal on this flavour.
+    fn backslash_escapes(self) -> bool {
+        matches!(self, SqlFlavor::MySql)
+    }
 }
 
 /// Single-quote a string literal, doubling embedded quotes **and** backslashes.
@@ -94,6 +142,23 @@ pub fn sql_ident(name: &str) -> String {
 /// data-fidelity nit is the deliberate price of injection safety.
 pub fn sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// [`sql_string`] for a **named** engine: the backslash is doubled only where the
+/// engine reads it as an escape.
+///
+/// The blanket doubling above is the right default for text with no engine
+/// attached (the clipboard), because the failure it prevents is an injection and
+/// the failure it causes is a cosmetic one. In a file that says which engine wrote
+/// it, the cosmetic failure is real data loss - a Windows path `C:\Users\` reloads
+/// into Postgres as `C:\\Users\\` - and there is no injection to prevent, because
+/// Postgres does not honour the escape in the first place.
+pub fn sql_string_for(s: &str, dialect: SqlFlavor) -> String {
+    let mut lit = s.replace('\'', "''");
+    if dialect.backslash_escapes() {
+        lit = s.replace('\\', "\\\\").replace('\'', "''");
+    }
+    format!("'{lit}'")
 }
 
 /// A SQL literal for one cell: NULL keyword, bare numbers, single-quoted
@@ -119,6 +184,34 @@ pub fn sql_value(value: &Value) -> String {
         Value::Text(s) => sql_string(s),
         Value::Blob(b) => sql_string(&format!("<{} bytes>", b.len())),
         Value::Capped(_) => sql_string(&value.to_string()),
+    }
+}
+
+/// [`sql_value`] for a **named** engine: correct quoting for that engine, and a
+/// real blob literal instead of the `'<N bytes>'` placeholder.
+///
+/// The placeholder is right for a clipboard preview and wrong for a file whose
+/// whole purpose is to be re-run: `INSERT … VALUES ('<12 bytes>')` loads the
+/// *string* `<12 bytes>` into a binary column, which is silent data loss dressed
+/// up as a successful import.
+pub fn sql_value_for(value: &Value, dialect: SqlFlavor) -> String {
+    match value {
+        Value::Text(s) => sql_string_for(s, dialect),
+        Value::Blob(b) => {
+            let hex: String = b.iter().map(|c| format!("{c:02x}")).collect();
+            match dialect {
+                // MySQL's `0x…` needs no quotes and is empty-safe as `0x` only
+                // from 8.0; the `X'…'` form is accepted by MySQL, SQLite,
+                // Postgres (as a bit string, not bytea) and ClickHouse, so the two
+                // spellings below are the widest each flavour accepts.
+                SqlFlavor::MySql if !b.is_empty() => format!("0x{hex}"),
+                SqlFlavor::MySql => "''".to_string(),
+                SqlFlavor::Ansi => format!("'\\x{hex}'"),
+            }
+        }
+        Value::Capped(_) => sql_string_for(&value.to_string(), dialect),
+        // Numbers and NULL are spelled the same everywhere.
+        other => sql_value(other),
     }
 }
 
@@ -226,6 +319,10 @@ pub struct ClipboardWriter {
     names: Vec<String>,
     /// The table name for [`ClipboardFormat::Sql`], already quoted-safe input.
     table: String,
+    /// How to spell identifiers and string literals for [`ClipboardFormat::Sql`].
+    /// The copied text is meant to be pasted back into a query tab on the same
+    /// engine, so it is written that engine's way.
+    flavor: SqlFlavor,
     out: String,
     written: usize,
 }
@@ -233,7 +330,13 @@ pub struct ClipboardWriter {
 impl ClipboardWriter {
     /// Begin a copy. `names` are the *selected* columns in order; `table` names
     /// the source table for the SQL form and is ignored by every other format.
-    pub fn begin(format: ClipboardFormat, names: Vec<String>, table: Option<&str>) -> Self {
+    /// `kind` is the engine the rows came from, which only the SQL form uses.
+    pub fn begin(
+        format: ClipboardFormat,
+        names: Vec<String>,
+        table: Option<&str>,
+        kind: crate::DbKind,
+    ) -> Self {
         let mut out = String::new();
         match format {
             ClipboardFormat::TsvHeaders => {
@@ -257,6 +360,7 @@ impl ClipboardWriter {
             format,
             names,
             table: table.unwrap_or("exported_table").to_string(),
+            flavor: SqlFlavor::of(kind),
             out,
             written: 0,
         }
@@ -298,20 +402,23 @@ impl ClipboardWriter {
                 self.out.push('}');
             }
             ClipboardFormat::Sql => {
-                self.out
-                    .push_str(&format!("INSERT INTO {} (", sql_ident(&self.table)));
+                let flavor = self.flavor;
+                self.out.push_str(&format!(
+                    "INSERT INTO {} (",
+                    sql_ident_for(&self.table, flavor)
+                ));
                 for (i, name) in self.names.iter().enumerate() {
                     if i > 0 {
                         self.out.push_str(", ");
                     }
-                    self.out.push_str(&sql_ident(name));
+                    self.out.push_str(&sql_ident_for(name, flavor));
                 }
                 self.out.push_str(") VALUES (");
                 for (i, value) in cells.iter().enumerate() {
                     if i > 0 {
                         self.out.push_str(", ");
                     }
-                    self.out.push_str(&sql_value(value));
+                    self.out.push_str(&sql_value_for(value, flavor));
                 }
                 self.out.push_str(");\n");
             }
@@ -358,7 +465,7 @@ mod tests {
     /// Render `rows` in `format` through the writer, the way both copy paths do.
     fn render(format: ClipboardFormat, rows: &[&[Value]]) -> String {
         let names = vec!["id".to_string(), "name".to_string()];
-        let mut w = ClipboardWriter::begin(format, names, Some("users"));
+        let mut w = ClipboardWriter::begin(format, names, Some("users"), crate::DbKind::Sqlite);
         for row in rows {
             w.write_row(row);
         }

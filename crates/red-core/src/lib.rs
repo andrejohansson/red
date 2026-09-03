@@ -1296,6 +1296,16 @@ pub struct ConnectionConfig {
     /// a direct (non-Sentinel) connection.
     #[cfg_attr(feature = "serde", serde(default))]
     pub sentinel_master: String,
+    /// MongoDB only: the connection string is a **DNS seedlist**
+    /// (`mongodb+srv://cluster.example.net/`) rather than a host list.
+    ///
+    /// It cannot be recovered from the other fields, which is why it is stored:
+    /// the SRV form carries no port (the driver looks the replica-set members up
+    /// in DNS), so rebuilding the DSN as `mongodb://host:27017` pointed at a name
+    /// that does not resolve to a mongod at all. That is every Atlas connection
+    /// string. Implies TLS, which the driver reads off the scheme.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub srv: bool,
 }
 
 /// Render a secret for `Debug`: `<unset>` when empty, `<redacted>` otherwise, so
@@ -1362,6 +1372,9 @@ impl ConnectionConfig {
         let scheme = match (self.kind, self.tls) {
             (DbKind::Redis, true) => "rediss",
             (DbKind::Clickhouse, true) => "clickhouses",
+            // The DNS-seedlist form is a different scheme, not a flag on the
+            // ordinary one.
+            _ if self.kind == DbKind::Mongo && self.srv => "mongodb+srv",
             _ => self.kind.url_scheme(),
         };
         let mut url = format!("{scheme}://");
@@ -1378,7 +1391,9 @@ impl ConnectionConfig {
             url.push('@');
         }
         url.push_str(&bracket_host(self.effective_host()));
-        if let Some(port) = self.port {
+        // A `mongodb+srv` URI must carry no port: the port comes from the SRV
+        // records, and the driver rejects the URI outright if one is written.
+        if let Some(port) = self.port.filter(|_| !self.srv) {
             url.push(':');
             url.push_str(&port.to_string());
         }
@@ -1505,14 +1520,19 @@ impl ConnectionConfig {
                 None => (hostport.to_string(), None),
             }
         };
+        // The seedlist form carries no port at all; inventing the default one
+        // would be written back into the DSN and rejected by the driver.
+        let srv = scheme.eq_ignore_ascii_case("mongodb+srv");
         Some(ParsedDsn {
             kind,
             host,
-            port: port.or_else(|| kind.default_port()),
+            port: port.or_else(|| (!srv).then(|| kind.default_port()).flatten()),
             user,
             password,
             database: decode(&database),
-            tls,
+            // `mongodb+srv` implies TLS.
+            tls: tls || srv,
+            srv,
         })
     }
 }
@@ -1536,6 +1556,9 @@ pub struct ParsedDsn {
     /// `sslmode`/`require_ssl`/`ssl=true` query flag), used to pre-check the
     /// form's TLS toggle.
     pub tls: bool,
+    /// Whether the DSN used MongoDB's DNS-seedlist scheme (`mongodb+srv`), which
+    /// has to survive the round-trip or an Atlas string becomes unusable.
+    pub srv: bool,
 }
 
 impl std::fmt::Debug for ParsedDsn {
@@ -1548,6 +1571,7 @@ impl std::fmt::Debug for ParsedDsn {
             .field("password", &"<redacted>")
             .field("database", &self.database)
             .field("tls", &self.tls)
+            .field("srv", &self.srv)
             .finish()
     }
 }
@@ -1562,6 +1586,7 @@ impl ParsedDsn {
             password: String::new(),
             database: String::new(),
             tls: false,
+            srv: false,
         }
     }
 }
@@ -1902,6 +1927,13 @@ pub struct ColumnPredicate {
     pub op: CmpOp,
     /// The compared value. `None` exactly when [`CmpOp::takes_value`] is false.
     pub value: Option<Value>,
+    /// The column's declared type, as the engine spells it, when the caller knows
+    /// it. Carried for the same reason [`ColumnValue`] carries it: the *value*
+    /// alone does not always say how to render the comparison. A Postgres
+    /// `boolean` decodes as `Integer(0|1)`, and `"active" = 1` is a 42883 there
+    /// because Postgres has no int→bool cast, so the renderer needs the column's
+    /// type to write `= false` instead.
+    pub decl_type: Option<String>,
 }
 
 /// A single guarded data edit, keyed on a result's row identity. Built by
@@ -2278,6 +2310,17 @@ pub fn coerce_edit_value(
             .parse::<f64>()
             .map(Value::Real)
             .map_err(|_| format!("‘{text}’ is not a valid number"));
+    }
+    // An exact numeric is still validated as a number - a typo must be caught at
+    // the editor, not by the engine after the preview - but it is *carried* as
+    // text, because `f64` cannot hold what the column can. See
+    // [`is_exact_numeric_type`].
+    if decl_type.is_some_and(is_exact_numeric_type) {
+        let trimmed = text.trim();
+        if trimmed.parse::<f64>().is_err() {
+            return Err(format!("‘{text}’ is not a valid number"));
+        }
+        return Ok(Value::Text(Arc::from(trimmed)));
     }
     Ok(Value::Text(Arc::from(text)))
 }
@@ -2796,15 +2839,33 @@ fn is_int_type(type_name: &str) -> bool {
     )
 }
 
-/// Whether a declared type is a floating/decimal numeric column, for edit-value
-/// coercion (parse to [`Value::Real`]). Best-effort across the three engines.
+/// Whether a declared type is an **approximate** (binary floating point) numeric
+/// column, for edit-value coercion (parse to [`Value::Real`]). Best-effort across
+/// the engines.
+///
+/// `numeric`/`decimal` are deliberately absent: they are *exact* types, and `f64`
+/// is not. Coercing them here silently rewrote every edited value that did not
+/// happen to be representable in binary floating point - a price of `19.99` became
+/// `19.989999999999998`, and a 38-digit identifier lost its tail - with the engine
+/// storing the rounded number without complaint. [`is_exact_numeric_type`] routes
+/// them to [`Value::Text`] instead, which every driver binds or casts back to the
+/// column's own type with no round trip through a float.
 fn is_real_type(type_name: &str) -> bool {
+    let t = type_name.to_ascii_lowercase();
+    let base = t.split(['(', ' ']).next().unwrap_or("");
+    matches!(base, "real" | "double" | "float" | "float4" | "float8")
+}
+
+/// Whether a declared type is an exact fixed-point numeric column, whose value can
+/// hold more precision than an `f64` and must not pass through one. See
+/// [`is_real_type`].
+fn is_exact_numeric_type(type_name: &str) -> bool {
     let t = type_name.to_ascii_lowercase();
     let base = t.split(['(', ' ']).next().unwrap_or("");
     matches!(
         base,
-        "real" | "double" | "float" | "float4" | "float8" | "numeric" | "decimal" | "dec"
-    )
+        "numeric" | "decimal" | "dec" | "money" | "smallmoney" | "number" | "bigdecimal"
+    ) || base.starts_with("decimal")
 }
 
 /// One bounded window of rows pulled from a streaming cursor. The streaming path
@@ -3082,6 +3143,14 @@ pub enum RedError {
         fingerprint: String,
         key: String,
     },
+    /// The connection died under an operation that had already been established:
+    /// the server closed an idle connection, or the link was reset (a NAT/firewall
+    /// timeout, the machine sleeping, a server restart). Distinct from
+    /// [`RedError::Driver`] because it says nothing about the work itself - the
+    /// statement never ran, or was cut off mid-flight - so a caller can re-dial and
+    /// retry instead of reporting a failure the user cannot act on.
+    #[error("connection lost: {0}")]
+    ConnectionLost(String),
     #[error("query failed: {0}")]
     Query(String),
     /// The query names no database and the session has none bound, so the engine
@@ -3659,6 +3728,53 @@ mod conn_tests {
         }
     }
 
+    /// An Atlas connection string is a `mongodb+srv` DNS seedlist, and the
+    /// seedlist form carries no port. Rebuilding it as `mongodb://host:27017`
+    /// pointed at a name that resolves to no mongod at all - every Atlas
+    /// connection failed to dial.
+    #[test]
+    fn a_mongodb_srv_dsn_round_trips() {
+        let parsed = ConnectionConfig::parse_conn_str(
+            "mongodb+srv://alice:pw@cluster0.abcd.mongodb.net/shop",
+        )
+        .expect("parses");
+        assert_eq!(parsed.kind, DbKind::Mongo);
+        assert!(parsed.srv, "the seedlist form has to survive the parse");
+        assert!(parsed.tls, "mongodb+srv implies TLS");
+        assert_eq!(parsed.port, None, "a seedlist URI carries no port");
+        assert_eq!(parsed.host, "cluster0.abcd.mongodb.net");
+        assert_eq!(parsed.database, "shop");
+
+        let config = ConnectionConfig {
+            kind: DbKind::Mongo,
+            host: parsed.host.clone(),
+            port: parsed.port,
+            user: parsed.user.clone(),
+            password: parsed.password.clone(),
+            database: parsed.database.clone(),
+            tls: parsed.tls,
+            srv: parsed.srv,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.dsn(),
+            "mongodb+srv://alice:pw@cluster0.abcd.mongodb.net/shop?tls=true"
+        );
+
+        // The ordinary host-list form is unchanged, port and all.
+        let plain = ConnectionConfig::parse_conn_str("mongodb://db:27018/shop").expect("parses");
+        assert!(!plain.srv);
+        assert_eq!(plain.port, Some(27018));
+        let config = ConnectionConfig {
+            kind: DbKind::Mongo,
+            host: plain.host.clone(),
+            port: plain.port,
+            database: plain.database.clone(),
+            ..Default::default()
+        };
+        assert_eq!(config.dsn(), "mongodb://db:27018/shop");
+    }
+
     #[test]
     fn dsn_round_trips_through_parse() {
         let cfg = ConnectionConfig {
@@ -3797,7 +3913,7 @@ mod edit_tests {
             Ok(Value::Integer(42))
         );
         assert_eq!(
-            coerce_edit_value("3.5", Some("numeric")),
+            coerce_edit_value("3.5", Some("double precision")),
             Ok(Value::Real(3.5))
         );
         assert_eq!(
@@ -3808,6 +3924,34 @@ mod edit_tests {
         assert_eq!(coerce_edit_value("x", None), Ok(Value::Text("x".into())));
         // A non-numeric value on an integer column is a coercion error (no preview).
         assert!(coerce_edit_value("abc", Some("int")).is_err());
+    }
+
+    /// An exact numeric column holds more precision than an `f64`, so routing an
+    /// edit through one silently rewrote the value: `19.99` stored as
+    /// `19.989999999999998`, a long identifier truncated to 17 digits. It stays
+    /// text, and the driver casts it back to the column's own type.
+    #[test]
+    fn an_exact_numeric_edit_keeps_every_digit() {
+        for decl in ["numeric", "numeric(38,10)", "decimal(10,2)", "DEC", "money"] {
+            assert_eq!(
+                coerce_edit_value("19.99", Some(decl)),
+                Ok(Value::Text("19.99".into())),
+                "{decl} must not round-trip through f64"
+            );
+        }
+        // The digits an `f64` cannot represent survive verbatim.
+        let long = "123456789012345678901234567890.123456789";
+        assert_eq!(
+            coerce_edit_value(long, Some("numeric(39,9)")),
+            Ok(Value::Text(long.into()))
+        );
+        // Still validated: a typo is caught in the editor, not by the engine.
+        assert!(coerce_edit_value("nineteen", Some("numeric")).is_err());
+        // Surrounding whitespace is trimmed, as it is for the other numeric arms.
+        assert_eq!(
+            coerce_edit_value("  1.5  ", Some("decimal")),
+            Ok(Value::Text("1.5".into()))
+        );
     }
 }
 

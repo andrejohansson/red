@@ -209,7 +209,7 @@ impl AppState {
             editing_ttl: false,
             rename_editor,
             editing_key: false,
-            confirm_delete: false,
+            confirm_delete: None,
             str_format: crate::inspector::ValueFormat::Auto,
             loading_full_value: false,
             edit_after_load: false,
@@ -667,9 +667,24 @@ impl AppState {
     }
 
     pub(crate) fn kv_request_delete(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.kv_request_delete_target(session, super::KvDeleteTarget::Key, cx);
+    }
+
+    /// Park a delete behind the shared confirm modal, or run it straight away when
+    /// the user has turned delete confirmations off.
+    ///
+    /// The one entry point for both the key delete and the RedisJSON node delete,
+    /// so a second destructive action cannot quietly grow its own path around the
+    /// confirm the way the node delete did.
+    pub(crate) fn kv_request_delete_target(
+        &mut self,
+        session: SessionId,
+        target: super::KvDeleteTarget,
+        cx: &mut Context<Self>,
+    ) {
         // Opt-out: when delete confirmations are disabled, delete straight away.
         if !self.confirm_policy().confirms_delete() {
-            self.kv_confirm_delete(session, cx);
+            self.kv_apply_delete(session, target, cx);
             return;
         }
         let Some(active) = self.conn_mut(Some(session)) else {
@@ -681,7 +696,7 @@ impl AppState {
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        inspector.confirm_delete = true;
+        inspector.confirm_delete = Some(target);
         // Focus the modal so Flint's `Modal` hears Esc/Enter (see `render.rs`).
         self.focus_modal = true;
         cx.notify();
@@ -697,11 +712,35 @@ impl AppState {
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        inspector.confirm_delete = false;
+        inspector.confirm_delete = None;
         cx.notify();
     }
 
+    /// The modal's "Delete": run whatever it was raised for.
     pub(crate) fn kv_confirm_delete(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let target = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.inspector.as_mut())
+            // Cleared right away: the action is already committed. If it somehow
+            // fails the global error toast still fires; there is just no stale
+            // confirm banner left sitting on screen.
+            .and_then(|i| i.confirm_delete.take());
+        let Some(target) = target else {
+            return;
+        };
+        self.kv_apply_delete(session, target, cx);
+    }
+
+    /// Send the delete. Shared by the confirmed path and the
+    /// confirmations-disabled path so the two cannot drift.
+    fn kv_apply_delete(
+        &mut self,
+        session: SessionId,
+        target: super::KvDeleteTarget,
+        cx: &mut Context<Self>,
+    ) {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -712,12 +751,11 @@ impl AppState {
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        // Hide the confirm bar right away: the action is already committed.
-        // If it somehow fails, the global error toast still fires; there's
-        // just no stale confirm banner left sitting on screen.
-        inspector.confirm_delete = false;
-        let edit = red_core::kv::KvEdit::Delete {
-            keys: vec![inspector.key.clone()],
+        inspector.confirm_delete = None;
+        let key = inspector.key.clone();
+        let edit = match target {
+            super::KvDeleteTarget::Key => red_core::kv::KvEdit::Delete { keys: vec![key] },
+            super::KvDeleteTarget::JsonNode(path) => red_core::kv::KvEdit::JsonDelete { key, path },
         };
         self.service
             .send_to(session, Command::KvApplyEdit { epoch, edit });
@@ -1084,7 +1122,14 @@ impl AppState {
                             cx,
                         );
                     }
-                    red_core::kv::StringTtl::Set(Duration::from_secs_f64(secs))
+                    // `f64` parses `inf`, `nan` and `1e300`, and `Duration` holds
+                    // none of them: `from_secs_f64` *panics* on each, on the UI
+                    // thread. `try_from_secs_f64` is the same conversion with the
+                    // panic returned as an error the form can show.
+                    let Ok(ttl) = Duration::try_from_secs_f64(secs) else {
+                        return self.kv_set_create_error(session, "TTL is out of range".into(), cx);
+                    };
+                    red_core::kv::StringTtl::Set(ttl)
                 };
                 KvEdit::SetString { key, value, ttl }
             }

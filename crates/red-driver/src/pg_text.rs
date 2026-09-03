@@ -158,6 +158,133 @@ pub(crate) fn uuid_to_string(raw: &[u8]) -> Option<String> {
 /// `(year, month, day)` from a day count relative to the Unix epoch. Howard
 /// Hinnant's `civil_from_days`, exact across the proleptic Gregorian calendar
 /// with no lookup table.
+/// `interval`: 8-byte microseconds, 4-byte days, 4-byte months, all big-endian.
+/// Rendered in the `postgres` output style (`1 year 2 mons 3 days 04:05:06`), the
+/// one `SELECT` shows by default.
+pub(crate) fn interval_to_string(raw: &[u8]) -> Option<String> {
+    if raw.len() != 16 {
+        return None;
+    }
+    let micros = i64::from_be_bytes(raw[0..8].try_into().ok()?);
+    let days = i32::from_be_bytes(raw[8..12].try_into().ok()?);
+    let months = i32::from_be_bytes(raw[12..16].try_into().ok()?);
+    let mut parts: Vec<String> = Vec::new();
+    let (years, mons) = (months / 12, months % 12);
+    if years != 0 {
+        parts.push(format!("{years} year{}", plural(years)));
+    }
+    if mons != 0 {
+        parts.push(format!("{mons} mon{}", plural(mons)));
+    }
+    if days != 0 {
+        parts.push(format!("{days} day{}", plural(days)));
+    }
+    if micros != 0 || parts.is_empty() {
+        // Postgres prints the time part signed as a whole, not per-field.
+        let sign = if micros < 0 { "-" } else { "" };
+        let abs = micros.unsigned_abs();
+        let (h, m, s, frac) = (
+            abs / 3_600_000_000,
+            (abs / 60_000_000) % 60,
+            (abs / 1_000_000) % 60,
+            abs % 1_000_000,
+        );
+        let time = if frac == 0 {
+            format!("{sign}{h:02}:{m:02}:{s:02}")
+        } else {
+            format!("{sign}{h:02}:{m:02}:{s:02}.{:06}", frac)
+                .trim_end_matches('0')
+                .to_string()
+        };
+        parts.push(time);
+    }
+    Some(parts.join(" "))
+}
+
+fn plural(n: i32) -> &'static str {
+    if n.abs() == 1 { "" } else { "s" }
+}
+
+/// `inet` / `cidr`: address family, netmask bits, is-cidr flag, address length,
+/// then the address bytes. Rendered `addr` when the mask covers the whole address
+/// (which is how Postgres prints an `inet` host) and `addr/bits` otherwise.
+pub(crate) fn inet_to_string(raw: &[u8]) -> Option<String> {
+    // family(1) bits(1) is_cidr(1) len(1) + address
+    let (&family, rest) = raw.split_first()?;
+    let (&bits, rest) = rest.split_first()?;
+    let (_is_cidr, rest) = rest.split_first()?;
+    let (&len, addr) = rest.split_first()?;
+    if addr.len() != usize::from(len) {
+        return None;
+    }
+    // 2 = PGSQL_AF_INET, 3 = PGSQL_AF_INET6 (AF_INET + 1), not the platform's.
+    let (text, full) = match (family, addr.len()) {
+        (2, 4) => (
+            format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]),
+            32,
+        ),
+        (3, 16) => {
+            let groups: Vec<String> = addr
+                .chunks_exact(2)
+                .map(|c| format!("{:x}", u16::from_be_bytes([c[0], c[1]])))
+                .collect();
+            (groups.join(":"), 128)
+        }
+        _ => return None,
+    };
+    Some(if bits == full {
+        text
+    } else {
+        format!("{text}/{bits}")
+    })
+}
+
+/// `macaddr` (6 bytes) / `macaddr8` (8 bytes), colon-separated lower hex.
+pub(crate) fn macaddr_to_string(raw: &[u8]) -> Option<String> {
+    if raw.len() != 6 && raw.len() != 8 {
+        return None;
+    }
+    Some(
+        raw.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+/// `bit` / `varbit`: a 4-byte big-endian bit count, then the bits packed
+/// most-significant-first. Rendered as the `'1011'` string Postgres prints.
+pub(crate) fn varbit_to_string(raw: &[u8]) -> Option<String> {
+    let len = i32::from_be_bytes(raw.get(..4)?.try_into().ok()?);
+    let len = usize::try_from(len).ok()?;
+    let body = raw.get(4..)?;
+    if body.len() * 8 < len {
+        return None;
+    }
+    Some(
+        (0..len)
+            .map(|i| {
+                if body[i / 8] & (0x80 >> (i % 8)) == 0 {
+                    '0'
+                } else {
+                    '1'
+                }
+            })
+            .collect(),
+    )
+}
+
+/// `money`: a scaled `int8`. The scale is `lc_monetary`'s fractional digits, 2 in
+/// every locale RED is likely to meet, so the value is rendered with two decimals
+/// and *no* currency symbol - a symbol guessed from the wrong locale would be
+/// worse than none.
+pub(crate) fn money_to_string(raw: &[u8]) -> Option<String> {
+    let cents = i64::from_be_bytes(raw.try_into().ok()?);
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.unsigned_abs();
+    Some(format!("{sign}{}.{:02}", abs / 100, abs % 100))
+}
+
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
@@ -278,5 +405,67 @@ mod tests {
             Some("00010203-0405-0607-0809-0a0b0c0d0e0f")
         );
         assert_eq!(uuid_to_string(&[0u8; 4]), None);
+    }
+
+    /// The wire layouts these decode were previously rendered as lossy UTF-8, so
+    /// an `interval` or an `inet` cell came back as replacement characters.
+    #[test]
+    fn interval_renders_in_the_postgres_output_style() {
+        let iv = |micros: i64, days: i32, months: i32| {
+            let mut b = Vec::new();
+            b.extend(micros.to_be_bytes());
+            b.extend(days.to_be_bytes());
+            b.extend(months.to_be_bytes());
+            interval_to_string(&b)
+        };
+        assert_eq!(
+            iv(4 * 3_600_000_000 + 5 * 60_000_000 + 6_000_000, 3, 14).as_deref(),
+            Some("1 year 2 mons 3 days 04:05:06")
+        );
+        assert_eq!(iv(0, 1, 0).as_deref(), Some("1 day"));
+        assert_eq!(iv(0, 2, 0).as_deref(), Some("2 days"));
+        // Zero is a real value, not an empty string.
+        assert_eq!(iv(0, 0, 0).as_deref(), Some("00:00:00"));
+        assert_eq!(iv(-90_000_000, 0, 0).as_deref(), Some("-00:01:30"));
+        assert_eq!(interval_to_string(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn inet_renders_v4_and_v6_with_the_mask_only_when_it_narrows() {
+        let v4 = [2u8, 32, 0, 4, 192, 168, 0, 1];
+        assert_eq!(inet_to_string(&v4).as_deref(), Some("192.168.0.1"));
+        let net = [2u8, 24, 1, 4, 192, 168, 0, 0];
+        assert_eq!(inet_to_string(&net).as_deref(), Some("192.168.0.0/24"));
+        let mut v6 = vec![3u8, 128, 0, 16];
+        v6.extend([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(inet_to_string(&v6).as_deref(), Some("2001:db8:0:0:0:0:0:1"));
+        // A truncated or unknown family declines rather than guessing.
+        assert_eq!(inet_to_string(&[2u8, 32, 0, 4, 1, 2]), None);
+        assert_eq!(inet_to_string(&[9u8, 32, 0, 4, 1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn macaddr_and_varbit_and_money_render_as_postgres_prints_them() {
+        assert_eq!(
+            macaddr_to_string(&[0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]).as_deref(),
+            Some("08:00:2b:01:02:03")
+        );
+        assert_eq!(macaddr_to_string(&[1, 2, 3]), None);
+
+        // 4 bits, `1011`, packed most-significant-first into one byte.
+        let bits = [0u8, 0, 0, 4, 0b1011_0000];
+        assert_eq!(varbit_to_string(&bits).as_deref(), Some("1011"));
+        // A length longer than the bytes supplied declines.
+        assert_eq!(varbit_to_string(&[0, 0, 0, 40, 0xff]), None);
+
+        assert_eq!(
+            money_to_string(&1234i64.to_be_bytes()).as_deref(),
+            Some("12.34")
+        );
+        assert_eq!(
+            money_to_string(&(-5i64).to_be_bytes()).as_deref(),
+            Some("-0.05")
+        );
+        assert_eq!(money_to_string(&[0u8; 4]), None);
     }
 }

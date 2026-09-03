@@ -602,6 +602,17 @@ fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Report a live-engine test being skipped, and refuse to skip when the caller
+    /// declared that it must not be. A twin of `red_driver`'s `skip_or_fail`,
+    /// which is `#[cfg(test)]`-only inside that crate and so unreachable from
+    /// here; the two must agree on the `RED_TEST_REQUIRE_LIVE` contract.
+    fn skip_or_fail(var: &str, module: &str) {
+        if std::env::var_os("RED_TEST_REQUIRE_LIVE").is_some() {
+            panic!("{module}: {var} is not set, but RED_TEST_REQUIRE_LIVE demands a live engine");
+        }
+        eprintln!("SKIP {module}: {var} not set");
+    }
     use red_core::kv::{KvType, StreamEntry, tokenize_command};
 
     use super::*;
@@ -804,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn commands_export_reimports_to_the_same_keyspace() {
         let Some(driver) = live_driver().await else {
-            eprintln!("SKIP {}: RED_TEST_REDIS_URL not set", module_path!());
+            skip_or_fail("RED_TEST_REDIS_URL", module_path!());
             return;
         };
         let before = seed(&driver).await;
@@ -865,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrepresentable_value_is_skipped_and_reported() {
         let Some(driver) = live_driver().await else {
-            eprintln!("SKIP {}: RED_TEST_REDIS_URL not set", module_path!());
+            skip_or_fail("RED_TEST_REDIS_URL", module_path!());
             return;
         };
         driver.command(&["FLUSHDB".to_string()]).await.unwrap();
@@ -917,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn dump_export_restores_binary_byte_for_byte() {
         let Some(driver) = live_driver().await else {
-            eprintln!("SKIP {}: RED_TEST_REDIS_URL not set", module_path!());
+            skip_or_fail("RED_TEST_REDIS_URL", module_path!());
             return;
         };
         driver.command(&["FLUSHDB".to_string()]).await.unwrap();
@@ -973,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_export_removes_its_file() {
         let Some(driver) = live_driver().await else {
-            eprintln!("SKIP {}: RED_TEST_REDIS_URL not set", module_path!());
+            skip_or_fail("RED_TEST_REDIS_URL", module_path!());
             return;
         };
         seed(&driver).await;
@@ -997,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn json_export_is_parseable() {
         let Some(driver) = live_driver().await else {
-            eprintln!("SKIP {}: RED_TEST_REDIS_URL not set", module_path!());
+            skip_or_fail("RED_TEST_REDIS_URL", module_path!());
             return;
         };
         seed(&driver).await;

@@ -377,14 +377,16 @@ impl AppState {
         };
         let path = store.path().to_path_buf();
         if !path.exists() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             // Announce the seed so the watcher doesn't echo it back as an edit.
             if let Some(watcher) = &self.settings_watcher {
                 watcher.note_self_write(crate::assets::DEFAULT_SETTINGS);
             }
-            if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
+            // Through the shared writer, like every save that follows it: a plain
+            // `fs::write` creates at the umask, so the seeded file was the one
+            // config file in the tree that could land world-readable.
+            if let Err(e) =
+                red_config::atomic::write_private(&path, crate::assets::DEFAULT_SETTINGS.as_bytes())
+            {
                 tracing::warn!("failed to seed settings file: {e}");
             }
         }
@@ -404,14 +406,13 @@ impl AppState {
         };
         let path = store.path().to_path_buf();
         if !path.exists() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             // Announce the seed so the watcher doesn't echo it back as an edit.
             if let Some(watcher) = &self.keymap_watcher {
                 watcher.note_self_write(crate::assets::DEFAULT_KEYMAP);
             }
-            if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_KEYMAP) {
+            if let Err(e) =
+                red_config::atomic::write_private(&path, crate::assets::DEFAULT_KEYMAP.as_bytes())
+            {
                 tracing::warn!("failed to seed keymap file: {e}");
             }
         }
@@ -453,11 +454,10 @@ impl AppState {
             return;
         };
         let path = dir.join("red").join("default-settings.toml");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         // Rewritten on every open so it always matches this build of RED.
-        if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
+        if let Err(e) =
+            red_config::atomic::write_private(&path, crate::assets::DEFAULT_SETTINGS.as_bytes())
+        {
             tracing::warn!("failed to materialize default settings: {e}");
             self.notify(
                 ToastVariant::Error,

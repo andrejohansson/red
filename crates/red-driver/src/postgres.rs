@@ -258,6 +258,22 @@ impl PostgresDriver {
         Ok(Arc::new(client))
     }
 
+    /// The transaction opener for a write path.
+    ///
+    /// `READ ONLY` on a read-only connection, explicitly, rather than relying on
+    /// the `default_transaction_read_only` GUC set at connect: that is *session*
+    /// state the user can flip from the editor with one `SET`, and a posture the
+    /// connection's own badge promises should not be one statement away from being
+    /// a lie. The GUC stays as the belt; this is the braces, and it is what MySQL
+    /// has always done (`START TRANSACTION READ ONLY`).
+    fn begin_stmt(&self) -> &'static str {
+        if self.read_only {
+            "BEGIN READ ONLY"
+        } else {
+            "BEGIN"
+        }
+    }
+
     /// Run `f` on a borrowed fetch connection with `abort` armed to its cancel for
     /// the duration. Disarms *before* the connection returns to the pool, so a late
     /// `abort` never reaches a reused connection. A fetch superseded before it
@@ -567,30 +583,37 @@ impl DatabaseDriver for PostgresDriver {
             })
             .collect();
 
-        // Foreign keys.
+        // Foreign keys, read from `pg_constraint` rather than
+        // `information_schema`. See [`FK_CATALOG_SQL`] for why: the standard views
+        // have no way to pair a composite key's local and referenced columns, and
+        // `constraint_column_usage` shows only tables the current role owns.
         let fk_rows = self
             .client
             .query(
-                "SELECT kcu.column_name, ccu.table_name, ccu.column_name \
-                 FROM information_schema.table_constraints tc \
-                 JOIN information_schema.key_column_usage kcu \
-                   ON kcu.constraint_name = tc.constraint_name \
-                  AND kcu.table_schema = tc.table_schema \
-                 JOIN information_schema.constraint_column_usage ccu \
-                   ON ccu.constraint_name = tc.constraint_name \
-                  AND ccu.table_schema = tc.table_schema \
-                 WHERE tc.constraint_type = 'FOREIGN KEY' \
-                   AND tc.table_schema = $1 AND tc.table_name = $2",
+                &format!(
+                    "{FK_CATALOG_SQL} AND src_ns.nspname = $1 AND src.relname = $2 {FK_ORDER}"
+                ),
                 &[&schema, &table],
             )
             .await
             .map_err(map_pg_err)?;
         let foreign_keys = fk_rows
             .iter()
-            .map(|row| ForeignKeyMeta {
-                column: row.get(0),
-                ref_table: row.get(1),
-                ref_column: row.get(2),
+            .map(|row| {
+                let ref_schema: String = row.get(3);
+                let ref_table: String = row.get(4);
+                ForeignKeyMeta {
+                    column: row.get(2),
+                    // Qualified only when the target lives in another schema, so
+                    // the overwhelmingly common same-schema FK still reads as a
+                    // bare table name.
+                    ref_table: if ref_schema == schema {
+                        ref_table
+                    } else {
+                        format!("{ref_schema}.{ref_table}")
+                    },
+                    ref_column: row.get(5),
+                }
             })
             .collect();
 
@@ -664,19 +687,11 @@ impl DatabaseDriver for PostgresDriver {
         let rows = self
             .client
             .query(
-                "SELECT tc.table_schema, tc.table_name, kcu.column_name, \
-                        ccu.table_schema, ccu.table_name, ccu.column_name, tc.constraint_name \
-                 FROM information_schema.table_constraints tc \
-                 JOIN information_schema.key_column_usage kcu \
-                   ON kcu.constraint_name = tc.constraint_name \
-                  AND kcu.table_schema = tc.table_schema \
-                 JOIN information_schema.constraint_column_usage ccu \
-                   ON ccu.constraint_name = tc.constraint_name \
-                  AND ccu.table_schema = tc.table_schema \
-                 WHERE tc.constraint_type = 'FOREIGN KEY' \
-                   AND tc.table_schema NOT IN ('pg_catalog', 'information_schema') \
-                   AND tc.table_schema NOT LIKE 'pg\\_%' \
-                 ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position",
+                &format!(
+                    "{FK_CATALOG_SQL} \
+                     AND src_ns.nspname NOT IN ('pg_catalog', 'information_schema') \
+                     AND src_ns.nspname NOT LIKE 'pg\\_%' {FK_ORDER}"
+                ),
                 &[],
             )
             .await
@@ -900,8 +915,17 @@ impl DatabaseDriver for PostgresDriver {
         // `with_fetch_conn` arms `abort` to this connection's cancel for the
         // duration, so a write wedged on a lock is stoppable (57014 → Interrupted
         // via `map_pg_err`, rolled back below).
+        // `VACUUM`, `CREATE DATABASE`, `CREATE INDEX CONCURRENTLY` and the rest
+        // error with 25001 inside an explicit transaction block, so wrapping them
+        // meant RED simply could not run them - including the health report's own
+        // suggested SQL. They run bare; there is nothing for a rollback to undo.
+        let bare = red_core::sql::requires_autocommit(sql, red_core::sql::Dialect::Postgres);
+        let begin = self.begin_stmt();
         self.with_fetch_conn(abort, |client| async move {
-            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
+            if bare {
+                return client.execute(sql, &[]).await.map_err(map_pg_err);
+            }
+            client.batch_execute(begin).await.map_err(map_pg_err)?;
             match client.execute(sql, &[]).await {
                 Ok(affected) => {
                     client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
@@ -924,8 +948,9 @@ impl DatabaseDriver for PostgresDriver {
         if statements.is_empty() {
             return Ok(Vec::new());
         }
+        let begin = self.begin_stmt();
         self.with_fetch_conn(abort, |client| async move {
-            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
+            client.batch_execute(begin).await.map_err(map_pg_err)?;
             let mut affected = Vec::with_capacity(statements.len());
             for sql in statements {
                 // Re-checked *between* statements, not just before `BEGIN`. The
@@ -962,8 +987,9 @@ impl DatabaseDriver for PostgresDriver {
         // Borrow a pool connection so the batch's transaction never shares the
         // cursor's connection; see `execute`.
         let client = self.acquire().await?;
+        let begin = self.begin_stmt();
         let result = async {
-            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
+            client.batch_execute(begin).await.map_err(map_pg_err)?;
             let mut total = 0u64;
             for op in ops {
                 // Typed placeholders (`$n::int8`, …) like the seek path: the value's
@@ -1015,8 +1041,9 @@ impl DatabaseDriver for PostgresDriver {
         // Borrow a pool connection so the transaction never shares the cursor's
         // connection; see `execute`/`apply_edits`.
         let client = self.acquire().await?;
+        let begin = self.begin_stmt();
         let result = async {
-            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
+            client.batch_execute(begin).await.map_err(map_pg_err)?;
             let max = crate::insert_chunk_rows(columns.len(), PG_PARAM_CAP);
             let mut total = 0u64;
             for chunk in rows.chunks(max) {
@@ -1054,8 +1081,9 @@ impl DatabaseDriver for PostgresDriver {
             _ => pg_quote(&table.name),
         };
         let client = self.acquire().await?;
+        let begin = self.begin_stmt();
         let result = async {
-            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
+            client.batch_execute(begin).await.map_err(map_pg_err)?;
             match client.execute(&format!("DELETE FROM {qualify}"), &[]).await {
                 Ok(affected) => {
                     client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
@@ -2110,7 +2138,8 @@ impl DatabaseDriver for PostgresDriver {
 
         let file = File::create(path).map_err(driver_err)?;
         let out = BufWriter::new(file);
-        let mut writer = ExportWriter::begin(out, format, names, path).map_err(driver_err)?;
+        let mut writer =
+            ExportWriter::begin(out, format, names, path, DbKind::Postgres).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report
@@ -2147,7 +2176,12 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn begin_sandbox(&self) -> Result<Option<Box<dyn crate::Sandbox>>> {
         let client = self.acquire().await?;
-        client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
+        // `READ ONLY` on a read-only connection, so the engine itself refuses a
+        // write that slipped past the gate rather than trusting a session GUC.
+        client
+            .batch_execute(self.begin_stmt())
+            .await
+            .map_err(map_pg_err)?;
         // A server-side backstop for the case RED's own deadline can't cover: if
         // the app crashes mid-review, this connection would otherwise sit in
         // `idle in transaction` holding locks until somebody noticed. RED's timer
@@ -2268,6 +2302,33 @@ const PG_PARAM_CAP: usize = 60_000;
 /// but expression is of type text". When `decl_type` names such a column we add a
 /// second, *explicit* cast, `$1::text::"jsonb"`, which type-checks. Plain
 /// text-family columns (and an unknown / absent type, e.g. a key bind) keep `::text`.
+/// Every foreign-key *column* with both endpoints' schema, table and column name,
+/// as `(from_schema, from_table, from_column, to_schema, to_table, to_column,
+/// constraint)`. Callers append their own `AND …` filter and [`FK_ORDER`].
+///
+/// Read from `pg_constraint`, not `information_schema`, for two reasons the
+/// standard views cannot be worked around:
+///
+/// - **Composite keys.** `constraint_column_usage` carries no ordinal, so joining
+///   it to `key_column_usage` on the constraint name alone yields the *cartesian
+///   product* of a composite key's local and referenced columns: a two-column FK
+///   came back as four edges, three of them pairing the wrong columns.
+///   `conkey`/`confkey` are parallel arrays, and `unnest(a, b) WITH ORDINALITY`
+///   pairs them positionally, which is what "in key order" actually means.
+/// - **Visibility.** `constraint_column_usage` lists only columns of tables the
+///   current role *owns*, so a read-only reporting role saw no foreign keys at all
+///   and every FK affordance (click-through, the reference tree, the ER diagram)
+///   silently vanished. The `pg_catalog` tables are world-readable.
+///
+/// It also fixes cross-schema keys, which the old query dropped outright: it
+/// constrained `ccu.table_schema = tc.table_schema`, but `ccu`'s schema is the
+/// *referenced* side, so an FK pointing into another schema matched nothing.
+const FK_CATALOG_SQL: &str = "    SELECT src_ns.nspname, src.relname, src_att.attname,            tgt_ns.nspname, tgt.relname, tgt_att.attname, c.conname     FROM pg_constraint c     JOIN pg_class src ON src.oid = c.conrelid     JOIN pg_namespace src_ns ON src_ns.oid = src.relnamespace     JOIN pg_class tgt ON tgt.oid = c.confrelid     JOIN pg_namespace tgt_ns ON tgt_ns.oid = tgt.relnamespace     JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(src_attnum, tgt_attnum, ord)       ON TRUE     JOIN pg_attribute src_att       ON src_att.attrelid = c.conrelid AND src_att.attnum = k.src_attnum     JOIN pg_attribute tgt_att       ON tgt_att.attrelid = c.confrelid AND tgt_att.attnum = k.tgt_attnum     WHERE c.contype = 'f'";
+
+/// The ordering [`FK_CATALOG_SQL`]'s callers append, so a composite key's columns
+/// arrive together and in key order (`group_fk_edges` relies on both).
+const FK_ORDER: &str = " ORDER BY src_ns.nspname, src.relname, c.conname, k.ord";
+
 fn pg_cast(value: &Value, decl_type: Option<&str>) -> String {
     match value {
         // `pg_value` decodes a `BOOL` cell as `Value::Integer`, and Postgres has no
@@ -2358,6 +2419,17 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
         Type::TIME => decode_raw(row, i, max, |b| be_i64(b).map(pg_text::time_to_string)),
         Type::TIMETZ => decode_raw(row, i, max, pg_text::timetz_to_string),
         Type::UUID => decode_raw(row, i, max, pg_text::uuid_to_string),
+        // Types `tokio-postgres` will not decode and whose wire form is *not* text,
+        // so the lossy-UTF-8 fallback below rendered them as replacement-character
+        // soup. Each is a small fixed layout; see `pg_text`.
+        Type::OID | Type::XID | Type::CID => decode_raw(row, i, max, |b| {
+            b.try_into().ok().map(|a| u32::from_be_bytes(a).to_string())
+        }),
+        Type::INTERVAL => decode_raw(row, i, max, pg_text::interval_to_string),
+        Type::INET | Type::CIDR => decode_raw(row, i, max, pg_text::inet_to_string),
+        Type::MACADDR | Type::MACADDR8 => decode_raw(row, i, max, pg_text::macaddr_to_string),
+        Type::BIT | Type::VARBIT => decode_raw(row, i, max, pg_text::varbit_to_string),
+        Type::MONEY => decode_raw(row, i, max, pg_text::money_to_string),
         // JSON is UTF-8 text on the wire; JSONB prefixes a 1-byte version header.
         Type::JSON => decode_raw(row, i, max, |b| {
             Some(String::from_utf8_lossy(b).into_owned())
@@ -2465,7 +2537,20 @@ fn decode_raw(
 /// A fetch error or genuine SQL NULL still collapses to [`Value::Null`].
 fn raw_text_fallback(row: &Row, i: usize, max: Option<usize>) -> Value {
     decode_raw(row, i, max, |b| {
-        Some(String::from_utf8_lossy(b).into_owned())
+        // Only *when the bytes really are text*. A lossy decode of a binary wire
+        // form (an array header, a range, a composite) is a row of U+FFFD that
+        // looks like corrupt data and cannot be copied, exported or compared;
+        // hex at least says what the value is and round-trips through
+        // `decode('…','hex')`. Valid UTF-8 is by far the common case here (enum
+        // labels, `citext`, domains over text), so the check costs nothing that
+        // matters.
+        Some(match std::str::from_utf8(b) {
+            Ok(text) => text.to_string(),
+            Err(_) => format!(
+                "\\x{}",
+                b.iter().map(|c| format!("{c:02x}")).collect::<String>()
+            ),
+        })
     })
 }
 
@@ -2679,7 +2764,7 @@ mod tests {
                 None => {
                     // Visible skip (with `--nocapture`): a missing URL must read as
                     // "not run", never a silent pass. CI sets the URL so it runs.
-                    eprintln!("SKIP {}: RED_TEST_POSTGRES_URL not set", module_path!());
+                    crate::conformance::skip_or_fail("RED_TEST_POSTGRES_URL", module_path!());
                     return;
                 }
             }
@@ -3371,6 +3456,100 @@ mod tests {
         assert_eq!(text(&row[3]), "two", "plain text column unaffected");
 
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    /// A composite FK's columns have to be *paired*, and a cross-schema FK has to
+    /// exist at all. The old `information_schema` query produced the cartesian
+    /// product of the two column lists and dropped cross-schema keys outright.
+    #[tokio::test]
+    async fn reads_composite_and_cross_schema_foreign_keys() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let other = tag("fkns");
+        let parent = tag("fkparent");
+        let child = tag("fkchild");
+        let far = tag("fkfar");
+        driver
+            .execute(&format!("CREATE SCHEMA {other}"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "CREATE TABLE {parent} (a INT, b INT, PRIMARY KEY (a, b))"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("CREATE TABLE {other}.{far} (id INT PRIMARY KEY)"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "CREATE TABLE {child} (x INT, y INT, far_id INT REFERENCES {other}.{far}(id), \
+                 FOREIGN KEY (x, y) REFERENCES {parent}(a, b))"
+            ))
+            .await
+            .unwrap();
+        let schema = current_schema(&driver).await;
+
+        let edges = driver.foreign_keys().await.unwrap();
+        let mine: Vec<&FkEdge> = edges.iter().filter(|e| e.from_table == child).collect();
+        assert_eq!(
+            mine.len(),
+            2,
+            "one composite edge, one cross-schema: {mine:#?}"
+        );
+
+        let composite = mine
+            .iter()
+            .find(|e| e.to_table == parent)
+            .expect("the composite edge");
+        // Paired positionally, not crossed: exactly two pairs, x→a and y→b.
+        assert_eq!(
+            composite.columns,
+            vec![
+                ("x".to_string(), "a".to_string()),
+                ("y".to_string(), "b".to_string())
+            ],
+            "a composite key pairs in key order"
+        );
+
+        let cross = mine
+            .iter()
+            .find(|e| e.to_table == far)
+            .expect("the cross-schema edge survives");
+        assert_eq!(cross.to_schema.as_deref(), Some(other.as_str()));
+
+        // `describe_table` sees the same two, and qualifies only the far one.
+        let detail = driver.describe_table(&schema, &child).await.unwrap();
+        let mut refs: Vec<String> = detail
+            .foreign_keys
+            .iter()
+            .map(|fk| format!("{}->{}.{}", fk.column, fk.ref_table, fk.ref_column))
+            .collect();
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                format!("far_id->{other}.{far}.id"),
+                format!("x->{parent}.a"),
+                format!("y->{parent}.b"),
+            ],
+            "no cartesian product, and the cross-schema target is qualified"
+        );
+
+        driver
+            .execute(&format!("DROP TABLE {child}"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("DROP TABLE {parent}"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("DROP SCHEMA {other} CASCADE"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

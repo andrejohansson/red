@@ -76,11 +76,17 @@ pub(super) fn cap_string_value(bytes: Vec<u8>) -> Value {
     // offers its binary/hex affordance instead of a U+FFFD-riddled text preview.
     let blob = matches!(std::str::from_utf8(window), Err(e) if e.error_len().is_some());
     let mut head = String::from_utf8_lossy(window).into_owned();
-    // `from_utf8_lossy` on a byte slice cut mid-codepoint already replaces
-    // the truncated tail with U+FFFD, so `head` is always valid UTF-8 here;
-    // no separate char-boundary trim needed.
+    // `from_utf8_lossy` can *grow* the window rather than only replacing its tail:
+    // every invalid byte becomes a three-byte U+FFFD, so a binary window comes
+    // back up to three times the cap. Trim back at a char boundary -
+    // `String::truncate` panics on an index inside a codepoint, and U+FFFD is
+    // exactly the multi-byte char the cap most often lands in the middle of.
     if head.len() > STRING_PREVIEW_CAP {
-        head.truncate(STRING_PREVIEW_CAP);
+        let mut at = STRING_PREVIEW_CAP;
+        while at > 0 && !head.is_char_boundary(at) {
+            at -= 1;
+        }
+        head.truncate(at);
     }
     Value::Capped(Box::new(red_core::CappedCell { head, len, blob }))
 }
@@ -484,4 +490,74 @@ pub(super) fn value_to_i64(v: &redis::Value) -> Option<i64> {
 
 pub(super) fn value_to_string_vec(v: &redis::Value) -> Vec<String> {
     redis::from_redis_value::<Vec<String>>(v.clone()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STRING_PREVIEW_CAP, cap_string_value, lossy_utf8, pair_up};
+    use red_core::Value;
+
+    /// The cap is a byte index into a *lossy* decode, and lossy decoding grows the
+    /// text: an invalid byte becomes a three-byte U+FFFD. Truncating at the cap
+    /// therefore lands inside a codepoint, which `String::truncate` panics on -
+    /// so one oversized Redis string with binary near the cap took the backend
+    /// thread down.
+    #[test]
+    fn an_oversized_value_caps_on_a_char_boundary() {
+        // Every byte invalid: the lossy decode is three times as long as the
+        // window, and the cap falls inside one of the replacement chars.
+        let value = cap_string_value(vec![0xff; STRING_PREVIEW_CAP + 1]);
+        let Value::Capped(cell) = value else {
+            panic!("over the cap the value is capped");
+        };
+        assert!(cell.blob, "all-invalid bytes are binary content");
+        assert_eq!(cell.len, STRING_PREVIEW_CAP + 1, "the full length is kept");
+        assert!(cell.head.len() <= STRING_PREVIEW_CAP);
+        // The head is whole codepoints, which is what the panic was about.
+        assert!(cell.head.chars().all(|c| c == '\u{fffd}'));
+
+        // A multibyte character straddling the cap: valid UTF-8, still not a
+        // boundary at the cap.
+        let mut bytes = vec![b'a'; STRING_PREVIEW_CAP - 1];
+        bytes.extend("é".as_bytes());
+        bytes.extend(vec![b'b'; 64]);
+        let Value::Capped(cell) = cap_string_value(bytes) else {
+            panic!("over the cap the value is capped");
+        };
+        assert!(!cell.blob, "truncated-but-valid UTF-8 is text, not a blob");
+        assert_eq!(cell.head.len(), STRING_PREVIEW_CAP - 1);
+    }
+
+    #[test]
+    fn a_value_under_the_cap_keeps_its_exact_bytes() {
+        assert_eq!(
+            cap_string_value(b"hello".to_vec()),
+            Value::Text("hello".into())
+        );
+        // Binary under the cap stays exact, so the hex view and the decoders see
+        // the real bytes.
+        assert_eq!(
+            cap_string_value(vec![0x00, 0xff, 0x01]),
+            Value::Blob(vec![0x00, 0xff, 0x01])
+        );
+        // Exactly at the cap is still "under": the boundary is `>`.
+        let at_cap = vec![b'x'; STRING_PREVIEW_CAP];
+        assert!(matches!(cap_string_value(at_cap), Value::Text(_)));
+    }
+
+    #[test]
+    fn lossy_utf8_degrades_a_binary_name_rather_than_failing() {
+        assert_eq!(lossy_utf8(b"key".to_vec()), "key");
+        assert_eq!(lossy_utf8(vec![0xff]), "\u{fffd}");
+    }
+
+    /// A torn reply must not panic; the unpaired tail is dropped.
+    #[test]
+    fn pair_up_drops_an_unpaired_tail() {
+        assert_eq!(
+            pair_up(vec!["a".into(), "1".into(), "b".into()]),
+            vec![("a".to_string(), "1".to_string())]
+        );
+        assert!(pair_up(Vec::new()).is_empty());
+    }
 }

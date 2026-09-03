@@ -304,7 +304,12 @@ pub(crate) struct SessionState {
     /// one pooled connection and an `UPDATE` on another does nothing). Dropping it
     /// rolls back, so session teardown and idle eviction cannot leave a
     /// transaction open on the server.
-    pub(crate) tx: Option<Box<dyn red_driver::Sandbox>>,
+    ///
+    /// `Arc`, not `Box`, so a statement inside the transaction can be *spawned*
+    /// off the command pump exactly as an autocommit write is. Held on the pump,
+    /// a write blocked on a row lock stalled every other session's fetches,
+    /// connects and cancels - including the cancel for itself.
+    pub(crate) tx: Option<TxState>,
     pub(crate) results: ResultMap,
     pub(crate) inflight: HashMap<crate::Epoch, InFlight>,
     pub(crate) exports: Arc<Mutex<HashMap<OpId, Arc<AtomicBool>>>>,
@@ -551,6 +556,24 @@ pub(crate) fn apply_connect_outcome(
     }
 }
 
+/// The user's open manual transaction, and the database it is bound to.
+///
+/// The namespace is part of the transaction's identity, not a per-statement
+/// choice: the sandbox holds one connection for its whole life, and that
+/// connection sits in whichever database it was opened against. A later statement
+/// arriving from a tab pointed at a *different* database cannot be honoured on it,
+/// so it is refused rather than silently run against the wrong schema.
+pub(crate) struct TxState {
+    pub(crate) sandbox: Arc<dyn red_driver::Sandbox>,
+    /// The database the transaction was opened in, as the tab spelled it. `None`
+    /// on the engines whose namespace is fixed at connect.
+    pub(crate) namespace: Option<String>,
+    /// Statements committed to this transaction so far, for the UI's "n writes
+    /// pending" badge. On the session rather than a pump-side map so a spawned
+    /// statement can bump it, and so it cannot outlive the session it counts for.
+    pub(crate) writes: Arc<AtomicUsize>,
+}
+
 /// Drop every session that's been idle past [`IDLE_EVICT`] and isn't the
 /// foreground one: abort its in-flight work, release its driver, and tell the UI
 /// (`Disconnected`) so it demotes that workspace to a plain recent.
@@ -567,6 +590,11 @@ pub(crate) fn evict_idle(
                 // A background copy pins both ends so its source/target (and their
                 // tunnels) survive a multi-minute transfer with no commands.
                 && s.busy.load(Ordering::Relaxed) == 0
+                // An open manual transaction is *unsaved work*. Dropping the
+                // session drops the sandbox, which rolls it back - silently, ten
+                // minutes after the user switched away with a half-finished change
+                // in flight. A transaction ends when the user ends it.
+                && s.tx.is_none()
                 && now.duration_since(s.last_used) >= IDLE_EVICT
         })
         .map(|(id, _)| *id)

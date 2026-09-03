@@ -30,6 +30,10 @@ url.workspace = true
 # MongoDB driver — the DocDriver seam, see doc.rs/mongo.rs. Isolated to this
 # crate; `bson` rides in as `mongodb::bson` (no separate BSON version).
 mongodb.workspace = true
+# Only to install the process-wide crypto provider at startup (see
+# `install_crypto_provider`); every TLS connection itself is made by the driver
+# crates above, which share this same rustls.
+rustls.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }

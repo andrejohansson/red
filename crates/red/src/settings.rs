@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use gpui::{Pixels, px};
 use red_core::ConnEnv;
 use red_core::sql::RiskLevel;
@@ -1356,22 +1356,8 @@ impl FileSettingsStore {
     /// Serialize and write atomically: a sibling temp file, flushed, then renamed
     /// over the target so a crash can't leave a partial file.
     pub fn save(&self, settings: &Settings) -> Result<()> {
-        use std::io::Write;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).context("creating the config directory")?;
-        }
         let serialized = toml::to_string_pretty(settings)?;
-
-        let tmp = self
-            .path
-            .with_extension(format!("toml.tmp.{}", std::process::id()));
-        let mut file = std::fs::File::create(&tmp).context("creating the settings temp file")?;
-        file.write_all(serialized.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &self.path).context("renaming the settings temp file")?;
-        Ok(())
+        red_config::atomic::write_private(&self.path, serialized.as_bytes())
     }
 }
 

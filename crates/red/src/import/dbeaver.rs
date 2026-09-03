@@ -129,6 +129,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 ssh,
                 proxy: None,
                 sentinel_master: String::new(),
+                srv: false,
             },
             source_name: name,
             folder: conn.folder.clone(),

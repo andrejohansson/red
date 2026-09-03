@@ -483,7 +483,12 @@ impl AppState {
             Cmd::SwitchConnection => self.open_switcher = true,
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::RunScript => self.run_editor_script(cx),
-            Cmd::BeginTransaction => self.send_tx(Command::BeginTransaction, cx),
+            // The transaction is bound to the tab's database for its whole life
+            // (one pinned connection), so the tab has to say which that is.
+            Cmd::BeginTransaction => {
+                let namespace = self.send_namespace();
+                self.send_tx(Command::BeginTransaction { namespace }, cx)
+            }
             Cmd::CommitTransaction => self.send_tx(Command::CommitTransaction, cx),
             Cmd::RollbackTransaction => self.send_tx(Command::RollbackTransaction, cx),
             Cmd::NewTab => self.new_query(cx),

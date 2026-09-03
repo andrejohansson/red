@@ -25,6 +25,16 @@ use red_core::kv::{
 
 use super::*;
 
+/// Ceiling on a single `JSON.GET` of one node.
+///
+/// The lazy walk above is what keeps an ordinary browse flat; `json_get` is the
+/// one path that asks for a whole subtree at once ("show me the raw JSON", the
+/// `Json` lens, the AI's `kv_json_get`). Without a ceiling it pulled a
+/// hundred-megabyte node through the server's output buffer, the socket and RED's
+/// heap - and then displayed 8 KiB of it. Generous enough that no document a
+/// person reads in an inspector is refused.
+const JSON_NODE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Probe which Redis Stack modules the server loaded.
 ///
 /// `MODULE LIST` is the direct answer, but several managed providers restrict
@@ -347,6 +357,28 @@ pub(super) async fn json_get_text(
     key: &str,
     path: &JsonPath,
 ) -> Result<Option<String>> {
+    // Ask what it *weighs* before asking for it. `JSON.GET` has no windowing of
+    // its own, so a "show the raw JSON" on a multi-hundred-megabyte subtree pulled
+    // the whole thing into the process (and then threw all but 8 KiB of it away).
+    // `JSON.DEBUG MEMORY` is O(1)-ish and answers in bytes; a server that does not
+    // support it answers with an error, which reads as "unknown" and lets the read
+    // through, because refusing on a missing diagnostic would be worse than the
+    // problem.
+    let size: Option<u64> = redis::cmd("JSON.DEBUG")
+        .arg("MEMORY")
+        .arg(key)
+        .arg(path.expr())
+        .query_async(conn)
+        .await
+        .ok()
+        .and_then(|v: redis::Value| first_int(&v));
+    if size.is_some_and(|n| n > JSON_NODE_MAX_BYTES) {
+        return Err(RedError::Query(format!(
+            "this node is about {}; RED will not read a JSON value that large in one go. Open a \
+             child node, or read it with a `JSON.GET` in the console.",
+            crate::human_bytes(size.unwrap_or_default())
+        )));
+    }
     let raw: Option<String> = redis::cmd("JSON.GET")
         .arg(key)
         .arg(path.expr())

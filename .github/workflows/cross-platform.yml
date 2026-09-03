@@ -18,6 +18,9 @@ concurrency:
   group: cross-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -52,4 +55,4 @@ jobs:
             libasound2-dev libssl-dev libvulkan-dev libgbm-dev libdbus-1-dev
 
       - name: Build (red app)
-        run: cargo build -p red
+        run: cargo build -p red --locked

@@ -19,7 +19,7 @@ const MAX_EVENTS: usize = 2_000;
 /// The flag set used when enabling notifications from the panel: `K` (keyspace),
 /// `E` (keyevent), `A` (all event classes) — "everything", the most useful
 /// default for a live watcher (matches `redis-cli config set` guidance).
-const ENABLE_FLAGS: &str = "KEA";
+pub(crate) const ENABLE_FLAGS: &str = "KEA";
 
 pub(crate) struct KvKeyspace {
     /// A dedicated subscription epoch (distinct from the Pub/Sub monitor's), so
@@ -86,13 +86,18 @@ impl AppState {
             return;
         };
         let epoch = ks.epoch;
-        self.service.send_to(
-            session,
-            Command::KvSetNotifyConfig {
-                epoch,
-                flags: ENABLE_FLAGS.to_string(),
-            },
-        );
+        // A server-wide `CONFIG SET` affects every client of this server, not just
+        // this panel, so it goes through the same confirm the Server panel's kill
+        // does rather than firing on a click.
+        self.confirm_exec = self.pending_confirm(crate::app::PendingWrite::KvServerAction {
+            epoch,
+            action: crate::app::KvServerAction::EnableKeyspaceNotifications,
+            prose: format!(
+                "Set notify-keyspace-events to {ENABLE_FLAGS} on this server? Every client pays \
+                 a little throughput for the events, and this replaces whatever the setting is \
+                 now."
+            ),
+        });
         cx.notify();
     }
 

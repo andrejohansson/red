@@ -35,7 +35,10 @@ pub use protocol::{
     WritePreview,
 };
 pub use red_acp::DEFAULT_AGENT_COMMAND;
+// Re-exported so the binary can settle rustls' default crypto provider at startup
+// without importing `red_driver` itself (the UI never speaks to drivers directly).
 pub use red_core::{AiLimits, AiPolicy, AiTier};
+pub use red_driver::install_crypto_provider;
 
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use tokio::sync::mpsc::{UnboundedSender as CmdSender, unbounded_channel};

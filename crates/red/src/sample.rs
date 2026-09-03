@@ -58,6 +58,7 @@ pub(crate) fn first_run_connection() -> Option<StoredConnection> {
         },
         last_accessed: None,
         pinned: false,
+        legacy_password: false,
     })
 }
 
