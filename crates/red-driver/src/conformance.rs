@@ -337,6 +337,7 @@ pub(crate) async fn filters_cmp(
         column: column.to_string(),
         op,
         value,
+        decl_type: None,
     };
     // The driver's rendering of `preds` must count the same as `raw`.
     let same = async |preds: Vec<ColumnPredicate>, raw: String, what: &str| {
@@ -1503,4 +1504,21 @@ pub(crate) async fn no_sandbox_when_unsupported(driver: &dyn DatabaseDriver) {
         driver.begin_sandbox().await.unwrap().is_none(),
         "an engine without transactions must not hand back a sandbox"
     );
+}
+
+/// Report a live-engine test being skipped, and refuse to skip when the caller
+/// declared that it must not be.
+///
+/// The batteries below only run when the engine's `RED_TEST_*_URL` is set, and
+/// print `SKIP` otherwise. That is right on a laptop with no server running and
+/// wrong in CI, where a job that starts five containers and then skips three of
+/// their batteries reports green while verifying nothing - because a URL was
+/// misspelled, or a service failed to come up. `RED_TEST_REQUIRE_LIVE=1` (set by
+/// the conformance job) turns that silence into a failure.
+#[cfg(test)]
+pub(crate) fn skip_or_fail(var: &str, module: &str) {
+    if std::env::var_os("RED_TEST_REQUIRE_LIVE").is_some() {
+        panic!("{module}: {var} is not set, but RED_TEST_REQUIRE_LIVE demands a live engine");
+    }
+    eprintln!("SKIP {module}: {var} not set");
 }

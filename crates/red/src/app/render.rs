@@ -2046,6 +2046,30 @@ impl AppState {
                 query.clone(),
                 mode.verb(),
             ),
+            PendingWrite::KvServerAction { action, prose, .. } => (
+                match action {
+                    crate::app::KvServerAction::KillClient(_) => "Disconnect this client",
+                    crate::app::KvServerAction::ResetSlowlog => "Clear the slow log",
+                    crate::app::KvServerAction::EnableKeyspaceNotifications => {
+                        "Change a server-wide setting"
+                    }
+                },
+                prose.clone(),
+                // The exact command, so what is approved is what runs.
+                match action {
+                    crate::app::KvServerAction::KillClient(id) => format!("CLIENT KILL ID {id}"),
+                    crate::app::KvServerAction::ResetSlowlog => "SLOWLOG RESET".to_string(),
+                    crate::app::KvServerAction::EnableKeyspaceNotifications => format!(
+                        "CONFIG SET notify-keyspace-events {}",
+                        crate::kvkeyspace::ENABLE_FLAGS
+                    ),
+                },
+                match action {
+                    crate::app::KvServerAction::KillClient(_) => "Disconnect",
+                    crate::app::KvServerAction::ResetSlowlog => "Clear",
+                    crate::app::KvServerAction::EnableKeyspaceNotifications => "Apply",
+                },
+            ),
         };
         // A copy offers two actions, Append (keep the target's rows) and Replace all
         // (truncate first, behind the danger styling), rather than one run button.

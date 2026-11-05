@@ -1218,10 +1218,15 @@ impl DatabaseDriver for ClickhouseDriver {
             .get("x-clickhouse-summary")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body = resp.bytes().await.map_err(driver_err)?;
         if !status.is_success() {
-            return Err(ch_error(&body));
+            return Err(ch_error(&read_error_body(resp).await));
         }
+        // Drained, not collected. A write's body is a few bytes, but script mode
+        // routes *reads* through here too (a `SELECT` in a script body runs for
+        // its effect and its rows are discarded), and `resp.bytes()` pulled that
+        // whole result into memory first - the one place in the driver that
+        // materialised an unbounded result.
+        drain(resp).await?;
         Ok(summary.as_deref().and_then(parse_written_rows).unwrap_or(0))
     }
 
@@ -1896,8 +1901,14 @@ impl DatabaseDriver for ClickhouseDriver {
         let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
         let file = File::create(path).map_err(driver_err)?;
-        let mut writer =
-            ExportWriter::begin(BufWriter::new(file), format, names, path).map_err(driver_err)?;
+        let mut writer = ExportWriter::begin(
+            BufWriter::new(file),
+            format,
+            names,
+            path,
+            DbKind::Clickhouse,
+        )
+        .map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, report interruption.
@@ -2300,6 +2311,9 @@ fn parse_block(body: &[u8]) -> Result<RowBlock> {
     for l in lines {
         // `Box<RawValue>` rather than a derived `Deserialize` on `Cell`: red-driver
         // takes no direct `serde` dependency, and the map is one move per cell.
+        if let Some(e) = stream_exception(l) {
+            return Err(e);
+        }
         let line: Vec<Box<RawValue>> = serde_json::from_slice(l).map_err(driver_err)?;
         rows.push(line.into_iter().map(Cell).collect());
     }
@@ -2308,6 +2322,11 @@ fn parse_block(body: &[u8]) -> Result<RowBlock> {
 
 /// Parse one streamed JSON-array line into a display row.
 fn parse_row_line(line: &[u8], types: &[String], cap: Option<CellCap>) -> Result<Vec<Value>> {
+    // An exception the server appended mid-stream is not a malformed row; see
+    // `stream_exception`.
+    if let Some(e) = stream_exception(line) {
+        return Err(e);
+    }
     // Borrowed `&RawValue` rather than [`Cell`]'s `Box`: the line outlives the map,
     // so the hot streaming path needs no per-cell allocation at all.
     let raw: Vec<&RawValue> = serde_json::from_slice(line).map_err(driver_err)?;
@@ -2490,12 +2509,63 @@ fn parse_written_rows(summary: &str) -> Option<u64> {
 /// Map a ClickHouse error body to a [`RedError`]: a query that was killed becomes
 /// the distinct [`RedError::Interrupted`]; anything else is a [`RedError::Query`]
 /// carrying the server's (cleaned) message.
+/// Read an error body, bounded.
+///
+/// An error is text and [`clean_error`] shows the first 500 characters of it, so
+/// there is no reason to hold more than enough to find the code and the message -
+/// and a server that answers a failure with a very long body should not be able to
+/// turn that into RED's memory problem.
+async fn read_error_body(resp: reqwest::Response) -> Vec<u8> {
+    /// Comfortably more than `clean_error`'s window, so nothing a human would read
+    /// is ever cut here.
+    const MAX: usize = 64 * 1024;
+    let mut resp = resp;
+    let mut body = Vec::new();
+    while body.len() < MAX {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            // A truncated error body is still the error; report what arrived.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body
+}
+
+/// Consume a response body without keeping it, so the request completes and the
+/// connection can be reused.
+async fn drain(resp: reqwest::Response) -> Result<()> {
+    let mut resp = resp;
+    while resp.chunk().await.map_err(driver_err)?.is_some() {}
+    Ok(())
+}
+
 fn ch_error(body: &[u8]) -> RedError {
     let text = String::from_utf8_lossy(body);
     if is_cancel_error(&text) {
         return RedError::Interrupted;
     }
     RedError::Query(clean_error(body))
+}
+
+/// A ClickHouse exception the server appended to a body it had already started
+/// streaming, or `None` when `line` is ordinary data.
+///
+/// ClickHouse sends `200 OK` and its headers before it knows the query will
+/// succeed, so an error raised part-way through a large result arrives as a
+/// plain-text `Code: 241. DB::Exception: Memory limit exceeded…` line in the
+/// middle of the JSON stream. Handed to the JSON parser that is the only thing
+/// reading at that point, it became `expected value at line 1 column 1` - a
+/// message about RED's parser rather than about the server running out of memory,
+/// which is the one thing the user needed to know.
+fn stream_exception(line: &[u8]) -> Option<RedError> {
+    let text = String::from_utf8_lossy(line);
+    let trimmed = text.trim_start();
+    // A JSON row always opens with `[`; an exception never does. Checking the
+    // shape first keeps this off the hot path for every ordinary line.
+    if trimmed.starts_with('[') || trimmed.is_empty() {
+        return None;
+    }
+    (trimmed.starts_with("Code:") || trimmed.contains("DB::Exception")).then(|| ch_error(line))
 }
 
 /// Whether an error body is ClickHouse's query-cancellation (`KILL QUERY`) signal.
@@ -2539,6 +2609,39 @@ fn clean_error(body: &[u8]) -> String {
 // the shared battery unchanged.
 #[cfg(test)]
 mod tests {
+
+    /// ClickHouse commits to `200 OK` before it knows the query will finish, so an
+    /// error part-way through a big result arrives as a plain-text exception line
+    /// inside the JSON stream. Read as a row it produced `expected value at line 1
+    /// column 1` - a message about RED's parser, not about the server.
+    #[test]
+    fn a_mid_stream_exception_is_reported_as_the_servers_error() {
+        let line = b"Code: 241. DB::Exception: Memory limit (total) exceeded: would use 9.31 GiB";
+        let err = super::parse_row_line(line, &["String".into()], None)
+            .expect_err("an exception line is not a row");
+        let text = err.to_string();
+        assert!(text.contains("Memory limit"), "{text}");
+        assert!(!text.contains("expected value"), "{text}");
+
+        // A cancellation still maps to `Interrupted`, not to a query error.
+        let cancelled = b"Code: 394. DB::Exception: Query was cancelled";
+        assert!(matches!(
+            super::parse_row_line(cancelled, &["String".into()], None),
+            Err(RedError::Interrupted)
+        ));
+
+        // An ordinary row is untouched.
+        let row = super::parse_row_line(br#"["hi"]"#, &["String".into()], None).unwrap();
+        assert_eq!(row, vec![Value::Text("hi".into())]);
+        // ...including one whose *first cell* is a string that looks like an error.
+        let row = super::parse_row_line(
+            br#"["Code: 241. DB::Exception: nope"]"#,
+            &["String".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(row.len(), 1);
+    }
     use super::*;
     use crate::conformance as battery;
     use red_core::{KeyKind, ObjectKind};
@@ -2593,7 +2696,7 @@ mod tests {
             match test_url() {
                 Some(u) => u,
                 None => {
-                    eprintln!("SKIP {}: RED_TEST_CLICKHOUSE_URL not set", module_path!());
+                    crate::conformance::skip_or_fail("RED_TEST_CLICKHOUSE_URL", module_path!());
                     return;
                 }
             }

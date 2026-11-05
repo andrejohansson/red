@@ -182,8 +182,16 @@ pub fn is_lossy(target: DbKind, t: &NormType) -> bool {
         // equivalent (it becomes `STRING`); the integer and float widths collapse
         // to `INT64`/`FLOAT64`, which is widening and so not a fidelity loss.
         DbKind::Bigquery => matches!(t, NormType::Uuid),
-        // ClickHouse is never a create target; treat as lossy for completeness.
-        DbKind::Clickhouse => true,
+        // ClickHouse *is* a create target now (see `WriteCaps`/`DbKind::write_caps`),
+        // so flagging every column lossy made the create preview's warning
+        // meaningless - a banner on every row is a banner nobody reads. Only the
+        // mappings that actually give something up are flagged: a blob becomes an
+        // opaque `String`, a `time` has no native type at all, and a `DateTime` is
+        // second-resolution with a narrower range than the source's timestamp.
+        DbKind::Clickhouse => matches!(
+            t,
+            NormType::Blob | NormType::Time | NormType::Json | NormType::TimestampTz
+        ),
         // Redis is never a create target either (no column/DDL model).
         DbKind::Redis => true,
         // MongoDB is never a create target either (schemaless, no DDL model).
@@ -219,6 +227,32 @@ fn spell_bigquery(t: &NormType) -> String {
         NormType::Timestamp => "DATETIME".to_string(),
         NormType::TimestampTz => "TIMESTAMP".to_string(),
         NormType::Unknown(s) => s.clone(),
+    }
+}
+
+/// [`spell`], for a column that will be part of a **key** (a primary key, or an
+/// index the transfer creates afterwards).
+///
+/// MySQL cannot index a `TEXT`/`BLOB` column without a prefix length: a
+/// `longtext` primary key fails the whole `CREATE TABLE` with error 1170, which
+/// is what an unbounded-text PK migrated from Postgres produced. `varchar(255)` is
+/// inside InnoDB's 3072-byte key limit at utf8mb4 and is the conventional choice;
+/// widening the column instead would trade a failed create for a silently
+/// truncating one.
+///
+/// Every other engine (and every other type) spells the same as [`spell`].
+pub fn spell_keyed(kind: DbKind, t: &NormType) -> String {
+    /// Inside InnoDB's 3072-byte index limit at 4 bytes per character, with room
+    /// for a composite key.
+    const MYSQL_KEY_CHARS: u32 = 255;
+    match (kind, t) {
+        (DbKind::Mysql, NormType::Text { length })
+            if length.is_none_or(|l| l > MYSQL_KEY_CHARS) =>
+        {
+            format!("varchar({MYSQL_KEY_CHARS})")
+        }
+        (DbKind::Mysql, NormType::Blob) => format!("varbinary({MYSQL_KEY_CHARS})"),
+        _ => spell(kind, t),
     }
 }
 
@@ -288,8 +322,6 @@ fn spell_mysql(t: &NormType) -> String {
 }
 
 fn spell_clickhouse(t: &NormType) -> String {
-    // ClickHouse is read-only in v1 (never a create target); this keeps `spell`
-    // total and is a sensible mapping should that change.
     match t {
         NormType::Bool => "Bool".into(),
         NormType::Int => "Int32".into(),
@@ -468,5 +500,44 @@ mod tests {
         assert!(!is_lossy(DbKind::Postgres, &normalize("jsonb")));
         // Unknown is always lossy cross-engine.
         assert!(is_lossy(DbKind::Postgres, &normalize("tsvector")));
+        // ClickHouse is a create target now, so its flag has to mean something:
+        // the mappings that give data up, not every column.
+        assert!(is_lossy(DbKind::Clickhouse, &normalize("bytea")));
+        assert!(is_lossy(DbKind::Clickhouse, &normalize("time")));
+        assert!(is_lossy(DbKind::Clickhouse, &normalize("timestamptz")));
+        assert!(!is_lossy(DbKind::Clickhouse, &normalize("int")));
+        assert!(!is_lossy(DbKind::Clickhouse, &normalize("varchar(20)")));
+        assert!(!is_lossy(DbKind::Clickhouse, &normalize("uuid")));
+    }
+
+    /// MySQL cannot index a `TEXT`/`BLOB` column without a prefix length, so a
+    /// `longtext` primary key failed the whole `CREATE TABLE` with error 1170.
+    #[test]
+    fn a_key_column_is_spelled_so_it_can_be_indexed() {
+        // Unbounded (or very long) text as a key narrows to an indexable varchar.
+        assert_eq!(
+            spell_keyed(DbKind::Mysql, &normalize("text")),
+            "varchar(255)"
+        );
+        assert_eq!(spell(DbKind::Mysql, &normalize("text")), "longtext");
+        assert_eq!(
+            spell_keyed(DbKind::Mysql, &normalize("varchar(65535)")),
+            "varchar(255)"
+        );
+        assert_eq!(
+            spell_keyed(DbKind::Mysql, &normalize("bytea")),
+            "varbinary(255)"
+        );
+        // A short varchar is already indexable and is left alone.
+        assert_eq!(
+            spell_keyed(DbKind::Mysql, &normalize("varchar(64)")),
+            "varchar(64)"
+        );
+        assert_eq!(spell_keyed(DbKind::Mysql, &normalize("int")), "int");
+        // Every other engine indexes text without a prefix length.
+        assert_eq!(
+            spell_keyed(DbKind::Postgres, &normalize("text")),
+            spell(DbKind::Postgres, &normalize("text"))
+        );
     }
 }

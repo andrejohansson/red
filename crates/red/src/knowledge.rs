@@ -86,28 +86,10 @@ pub(crate) fn load(conn_id: &str) -> Option<String> {
 /// would then be fed to the model as authoritative, and owner-only on Unix for
 /// the same reason `queries.rs` is: the contents describe internal systems.
 pub(crate) fn save(conn_id: &str, body: &str) -> Result<PathBuf> {
-    use std::io::Write;
-
     let dir = knowledge_dir().context("no config directory for the knowledge file")?;
-    std::fs::create_dir_all(&dir).context("creating the knowledge directory")?;
     let dest = dir.join(format!("{}.md", file_stem(conn_id)));
-
-    let tmp = dest.with_extension(format!("md.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts
-        .open(&tmp)
-        .context("creating the knowledge temp file")?;
-    file.write_all(body.trim_end().as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, &dest).context("renaming the knowledge temp file")?;
+    let contents = format!("{}\n", body.trim_end());
+    red_config::atomic::write_private(&dest, contents.as_bytes())?;
     Ok(dest)
 }
 

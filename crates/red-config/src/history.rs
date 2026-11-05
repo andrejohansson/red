@@ -19,7 +19,7 @@
 //! encodes the real join paths and filter idioms that no schema can.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -247,31 +247,17 @@ fn cap_entry_sql(sql: &str) -> String {
     )
 }
 
-/// Serialize `entries` to `path` via a temp file + rename, owner-only on Unix.
-fn save(path: &PathBuf, entries: &[HistoryEntry]) -> Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating the config directory")?;
-    }
+/// Serialize `entries` to `path`, replacing it whole and owner-only.
+///
+/// [`Store::persist`] spawns a thread per change, so several of these can be in
+/// flight at once; `atomic::write_private` is what keeps them from sharing a temp
+/// file and interleaving their bytes into a `history.json` that fails to parse.
+fn save(path: &Path, entries: &[HistoryEntry]) -> Result<()> {
     let file = HistoryFile {
         entries: entries.to_vec(),
     };
     let contents = serde_json::to_string_pretty(&file).context("serializing query history")?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).context("creating the history temp file")?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path).context("renaming the history temp file")?;
-    Ok(())
+    crate::atomic::write_private(path, contents.as_bytes())
 }
 
 /// A short, human relative time ("just now", "5m ago", "3h ago", "2d ago") for a

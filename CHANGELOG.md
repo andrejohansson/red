@@ -4,6 +4,84 @@ All notable changes to RED are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- AI assistant: the `explain` and `suggest_index` tools now vet the statement they are given the same way `run_select` does. Their text reached the engine unchecked, so a chained statement or an `EXPLAIN ANALYZE` of a write could run from the read tier.
+- AI assistant: a proposed write is refused outright when it calls a server-side function that reads or writes files, runs remote SQL, or controls the server. The write preview, which runs the statement's predicate to count rows *before* the approval prompt, is held to the read tier's own standard for the same reason.
+- AI assistant: review ("sandbox") mode now relaxes the per-statement approval only for the writes the review transaction actually contains. `create_index` and `kill_session` run outside it, and had lost their prompt.
+- AI assistant: the read-only classifier now recognises the session and server controls reachable from a `SELECT` (`pg_terminate_backend`, `set_config`, `pg_sleep`, the advisory-lock and large-object families, MySQL's `GET_LOCK`/`BENCHMARK`/`SLEEP`, and the ClickHouse table functions that dial out of the server).
+- Redis: importing a key file that contains destructive commands (`FLUSHALL`, `CONFIG SET requirepass`, `REPLICAOF`, `SHUTDOWN`) now needs an explicit acknowledgement, not just a red button.
+- Redis: the console refuses commands that change the *connection* rather than the data (`SELECT`, `MULTI`, `HELLO`, `RESET`, `SUBSCRIBE`, `MONITOR`, `CLIENT REPLY`). One multiplexed connection is shared by the browser, the inspector and every panel, so those re-pointed all of them.
+- Redis: the destructive-command list now covers the commands that destroy data without saying so - `EXPIRE`/`PERSIST`, the blocking pops, `SMOVE`/`LMOVE`, the `*STORE` family, `SORT … STORE`, `SAVE`, `CLIENT PAUSE`, `SCRIPT KILL` and the cluster slot commands.
+- Redis: the Monitor panel's client kill and slow-log reset, the Keyspace panel's `CONFIG SET`, and a JSON node delete all raise a confirmation now, matching every other destructive action.
+- Redis: the console no longer writes `AUTH`, `HELLO … AUTH`, `CONFIG SET requirepass`, `MIGRATE … AUTH` or `ACL SETUSER >password` to the query history in clear.
+- MongoDB: the copy dialog's "Replace" mode drops the target collection, and now says so and asks first.
+- Postgres: a write path on a read-only connection opens `BEGIN READ ONLY`, so the posture no longer depends on a session setting that can be turned off from the editor. The editor's own read-only gate is stricter too: it refuses side-effecting `SELECT`s rather than grading them safe.
+- MySQL and MariaDB: statements now run over the binary protocol, which refuses a `;`-separated batch at the server. The text protocol ran every statement in one, so a mis-split blob executed in full under the first statement's grading.
+- The statement splitter no longer mis-reads two routine-body shapes: `IF(cond) THEN` written without a space, and a column named like a block keyword (`OLD.begin`). The first cut a trigger in half; the second swallowed every statement after it into one.
+- ClickHouse `#` and `#!` comments are read as comments. Treated as live SQL, a `;` inside one split the line and RED ran the tail the engine would have ignored.
+- Postgres: `a$x$` is an identifier, not the start of a dollar-quoted string, so a `;` after it is a real statement boundary again.
+- A typed confirmation for `TRUNCATE a, b` (or `DROP TABLE a, b`) now names every object, not just the first.
+- The self-updater refuses to install when it cannot read the installed app's Team ID, rather than proceeding on signature and notarization alone.
+- SSH: RSA keys and agent identities sign with `rsa-sha2-256`/`512` instead of SHA-1, which OpenSSH 8.8 and later refuse by default.
+- Releases now run the full test suite, lint and format check on the tag before publishing anything, build with `--locked`, grant `contents: write` per job instead of workflow-wide, and verify the AppImage packaging tool against a pinned digest.
+
+### Changed
+- `SECURITY.md` now documents the contact route, the supported versions, what RED
+  protects (credentials, destructive statements, the AI gate, transport) and the
+  update trust model, instead of being six lines with none of it.
+- The privacy note in the README now says plainly that RED checks GitHub for updates every six hours, and how to turn that off. It previously claimed no network calls of its own.
+- The driver conformance job in CI runs against ClickHouse, Redis and MongoDB as well as Postgres and MySQL, and fails when an engine is missing instead of skipping and reporting green.
+
+### Fixed
+- The database-knowledge window opens again. It was laid out one whole
+  window-height below the app, so the command palette, the assistant's buttons
+  and the agent handing back a finished draft all appeared to do nothing.
+- Watch mode grades the statement the grid will actually re-run, not the editor's
+  text. The two differ for a table browse, an FK click-through, or an editor typed
+  into since the run, and the check is repeated each tick.
+- A failed page fetch no longer leaves a permanently blank band in the middle of a
+  result, and a failed clipboard re-fetch no longer swallows every later copy.
+- Redis: a copy of a key to another server reports a name collision instead of
+  overwriting what is there, and the "New key" form refuses a name that already
+  exists rather than replacing that key's value.
+- Redis: exporting lists longer than the read window says so, and an export writes
+  to disk without blocking the backend.
+- ClickHouse: a `SELECT` in a script body no longer pulls its whole result into
+  memory to discard it.
+- AI approval prompts say how much of a payload they are not showing, and label
+  what the agent *claims* a session or client is running as a claim rather than as
+  something RED has checked.
+- TLS to Redis (`rediss://`) or MySQL (`require_ssl`) no longer panics the backend on the first connection.
+- A Redis string value over 8 KiB containing a multibyte or binary byte near the cap no longer panics the backend.
+- A TTL of `inf`, `NaN` or `1e300` in the Redis "New key" form is reported instead of panicking the interface.
+- Importing a malformed DBGate connection file, and Mongo filter completion after a non-breaking space, no longer panic.
+- Postgres: composite foreign keys are read with their columns correctly paired, cross-schema foreign keys are no longer dropped, and a role that does not own the tables can see foreign keys at all. Read from `pg_constraint` rather than the standard views, which cannot express either.
+- Postgres: `interval`, `inet`/`cidr`, `macaddr`, `bit`/`varbit`, `money`, `oid` and `xid` columns render as values instead of replacement characters; anything still unmapped renders as hex.
+- Filtering a boolean column by value produces `= TRUE` rather than the `= 1` Postgres refuses.
+- Editing a `numeric`/`decimal` cell keeps every digit. Values were coerced through a 64-bit float, so `19.99` could be stored as `19.989999999999998`.
+- `VACUUM`, `CREATE INDEX CONCURRENTLY`, `CREATE DATABASE` and SQLite's `PRAGMA journal_mode` run now; they were wrapped in a transaction that made them impossible. A row-returning statement in a script body runs instead of erroring on SQLite.
+- A confirmed script or import runs on the connection it was raised on, not on whichever one is in front when the button is pressed.
+- A statement inside a manual transaction is no longer awaited on the command pump: it can be cancelled, carries the statement timeout, and does not stall every other connection. A connection with an open transaction is exempt from idle eviction, so it is not rolled back silently after ten minutes.
+- A script, staged-edit batch, import or table copy is refused while a manual transaction is open, rather than committing beside it. A transaction is bound to its tab's database, and a statement naming a different one is refused rather than run against the wrong schema.
+- MongoDB: `mongodb+srv://` connection strings (every MongoDB Atlas string) round-trip and connect.
+- MongoDB: editing one field of a document no longer rewrites the types of the others. Small `Int64`s and whole-numbered `Double`s came back as `Int32`, and `MinKey`/`MaxKey`/`Symbol`/JavaScript values came back as strings.
+- Redis: a key, field or member name that is not valid UTF-8 is refused for writes instead of silently addressing a different key.
+- Redis: reading a whole RedisJSON node, and the recycle-bin snapshot taken before a delete, refuse an oversized value rather than pulling gigabytes into memory. A `.rdbdump` import streams the file instead of reading it whole, and no longer blocks the backend while it does.
+- Redis: a cluster browse that cannot reach a shard says so, instead of presenting a partial key list as the whole keyspace.
+- ClickHouse: an error raised part-way through a result ("Memory limit exceeded", a killed query) is reported as the server's message rather than as `expected value at line 1 column 1`.
+- Turning the AI assistant off, or lowering its access tier, now takes effect on open chats instead of at the next agent restart.
+- Migrating a table whose primary key is unbounded text into MySQL no longer fails with error 1170.
+- Exported `INSERT` statements and "Copy as SQL" are written for the engine they came from: MySQL backtick quoting, backslashes doubled only where the engine treats them as escapes, and binary columns as real hex literals rather than a `<12 bytes>` placeholder.
+- `red transfer` runs from the command line instead of opening the window.
+- The auto-limit rail is appended on its own line, so a statement ending in a comment is still limited.
+- Query history, saved queries, the connection list and every other stored file are written through one atomic writer with a per-write temporary name. Two writers in the same process shared one, which could corrupt the file.
+- A legacy plaintext password is kept in the connection file when the keychain is unavailable, instead of being dropped by the next save.
+- MySQL and MariaDB: a query run after a pause no longer fails with "Connection reset by peer". Idle connections are retired instead of being kept and handed back dead, a connection that has been sitting is checked before use, and a query that still hits a dead one is retried on a fresh connection. A connection that does drop now says "connection lost" rather than reporting a driver error.
+- AI assistant sign-in: the authorize URL is now read from both of the sign-in command's output streams, not stdout alone - it lands on stderr when stdout is a pipe rather than a terminal, which left the flow stuck on Linux.
+- AI assistant sign-in: when the sign-in command exits before printing a URL, its own error output and exit code are reported instead of a bare "sign-in ended before a URL appeared".
+
 ## [0.23.0] - 2026-08-21
 
 ### Added

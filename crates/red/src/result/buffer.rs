@@ -711,6 +711,23 @@ impl GridBuffer {
         }
     }
 
+    /// The in-flight `OFFSET` page fetch failed: clear its in-flight mark so the
+    /// window it covers can be asked for again.
+    ///
+    /// The offset twin of [`run_failed`](Self::run_failed). Without it the page
+    /// stayed in `requested` forever - `ensure_range` skips a page it has already
+    /// requested - so one failed fetch left a permanently blank band in the middle
+    /// of the result that scrolling past and back would never refill.
+    ///
+    /// Unlike the keyed path there is no `halted` flag to set: the next paint over
+    /// that range re-requests it, which is the right behaviour for a transient
+    /// failure and merely a repeated error toast for a persistent one.
+    pub(super) fn page_failed(&mut self, offset: usize) {
+        if let BufferMode::Offset(pages) = &mut self.mode {
+            pages.requested.remove(&(offset / pages.page));
+        }
+    }
+
     /// Drop a freshly-arrived `OFFSET` page in and clear its in-flight mark.
     /// A no-op in keyed mode (keyed grids never request pages).
     pub(super) fn insert_page(&mut self, offset: usize, rows: Vec<Vec<Value>>) {
@@ -919,6 +936,41 @@ mod row_tests {
             blob: false,
         }))]);
         assert_eq!(row.display[0].text.as_ref(), "line one line two…");
+    }
+}
+
+#[cfg(test)]
+mod offset_page_tests {
+    use super::*;
+
+    /// The grid marks a page `requested` before asking for it and clears the mark
+    /// when the rows land. A failed fetch used to land nothing, so the mark stayed
+    /// forever - `request` skips a page it has already requested - and the window
+    /// it covered was a permanently blank band that scrolling could not refill.
+    #[test]
+    fn a_failed_page_can_be_requested_again() {
+        let mut pages = OffsetPages::new(100);
+        pages.requested.insert(3);
+        assert!(pages.requested.contains(&3));
+
+        let mut buffer = GridBuffer::new(100);
+        buffer.mode = BufferMode::Offset(pages);
+        // Any offset inside the page frees that page, not only its first row.
+        buffer.page_failed(350);
+        let BufferMode::Offset(pages) = &buffer.mode else {
+            panic!("still in offset mode");
+        };
+        assert!(
+            !pages.requested.contains(&3),
+            "the page must be requestable again"
+        );
+
+        // A page that was never in flight is left alone rather than panicking.
+        buffer.page_failed(9_900);
+        // And a keyed grid, which never requests pages, is a no-op.
+        let mut keyed = GridBuffer::new(100);
+        keyed.mode = BufferMode::Keyed(KeyedRun::new(vec![0], 100));
+        keyed.page_failed(0);
     }
 }
 

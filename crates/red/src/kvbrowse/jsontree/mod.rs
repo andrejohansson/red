@@ -312,9 +312,13 @@ impl AppState {
             .send_to(session, Command::KvApplyEdit { epoch, edit });
     }
 
-    /// Delete the selected node (`JSON.DEL`). Rides the same confirm policy as
+    /// Delete the selected node (`JSON.DEL`), behind the same confirm policy as
     /// every other destructive Redis action; at the root it removes the key, so
     /// that case routes through the key-delete confirm instead.
+    ///
+    /// The confirm is not decoration here: unlike a key delete, a `JSON.DEL` of a
+    /// sub-document takes no recycle-bin snapshot, so there is nothing to undo it
+    /// with.
     pub(crate) fn kv_json_delete_node(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let Some(path) = self
             .json_state(session)
@@ -326,22 +330,7 @@ impl AppState {
             self.kv_request_delete(session, cx);
             return;
         };
-        let Some(active) = self.conn_mut(Some(session)) else {
-            return;
-        };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
-            return;
-        };
-        let epoch = browse.epoch;
-        let Some(inspector) = &browse.inspector else {
-            return;
-        };
-        let edit = KvEdit::JsonDelete {
-            key: inspector.key.clone(),
-            path,
-        };
-        self.service
-            .send_to(session, Command::KvApplyEdit { epoch, edit });
+        self.kv_request_delete_target(session, crate::kvbrowse::KvDeleteTarget::JsonNode(path), cx);
     }
 
     /// Ask the service for one node's level.

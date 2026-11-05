@@ -332,6 +332,80 @@ pub fn read_dump_frame(bytes: &[u8], at: usize) -> Option<(KvDumpEntry, usize)> 
     ))
 }
 
+/// Ceiling on one frame's key or payload, so a corrupt (or hostile) length
+/// prefix cannot make the reader allocate gigabytes before it discovers the file
+/// is short. Well above any single Redis value worth restoring through a GUI.
+pub const MAX_DUMP_FRAME: usize = 256 * 1024 * 1024;
+
+/// Read one frame from a stream, or `None` at a clean end of file.
+///
+/// The streaming twin of [`read_dump_frame`]. A dump is a list of independent
+/// keys, so an import has no reason to hold the whole file - and holding it means
+/// a 2 GB export costs 2 GB of RAM before the first key is written. Reading frame
+/// by frame keeps that flat, which is the same contract the rest of RED's data
+/// paths keep.
+///
+/// A torn tail reads as end of file, exactly as [`read_dump_frame`] treats it: a
+/// truncated export should restore what it does hold, and the caller reports the
+/// counts either way. A length past [`MAX_DUMP_FRAME`] is a genuine error, since
+/// continuing would mean trusting it.
+pub fn read_dump_frame_from<R: std::io::Read>(r: &mut R) -> std::io::Result<Option<KvDumpEntry>> {
+    use std::io::{Error, ErrorKind};
+
+    /// Fill `buf` completely, or report a clean EOF if *nothing* was read.
+    fn read_exact_or_eof<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
+        let mut at = 0;
+        while at < buf.len() {
+            match r.read(&mut buf[at..])? {
+                0 if at == 0 => return Ok(false),
+                // A partial frame is a torn tail, which reads as end of file.
+                0 => return Ok(false),
+                n => at += n,
+            }
+        }
+        Ok(true)
+    }
+
+    fn read_len<R: std::io::Read>(r: &mut R) -> std::io::Result<Option<usize>> {
+        let mut raw = [0u8; 4];
+        if !read_exact_or_eof(r, &mut raw)? {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(raw) as usize;
+        if len > MAX_DUMP_FRAME {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("dump frame claims {len} bytes; the file is corrupt"),
+            ));
+        }
+        Ok(Some(len))
+    }
+
+    let Some(key_len) = read_len(r)? else {
+        return Ok(None);
+    };
+    let mut key = vec![0u8; key_len];
+    if !read_exact_or_eof(r, &mut key)? {
+        return Ok(None);
+    }
+    let mut ttl = [0u8; 8];
+    if !read_exact_or_eof(r, &mut ttl)? {
+        return Ok(None);
+    }
+    let Some(payload_len) = read_len(r)? else {
+        return Ok(None);
+    };
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 && !read_exact_or_eof(r, &mut payload)? {
+        return Ok(None);
+    }
+    Ok(Some(KvDumpEntry {
+        key: String::from_utf8_lossy(&key).into_owned(),
+        ttl_ms: u64::from_le_bytes(ttl),
+        payload,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tokenize_command;
@@ -467,6 +541,45 @@ mod tests {
         file.truncate(file.len() - 2);
         let (_, at) = read_dump_frame(&file, KV_DUMP_MAGIC.len()).unwrap();
         assert_eq!(read_dump_frame(&file, at), None);
+    }
+
+    /// The streaming reader has to agree with the slice reader frame for frame,
+    /// including where it decides the file has ended - that is what lets an import
+    /// hold one key at a time instead of the whole export.
+    #[test]
+    fn the_streaming_reader_matches_the_slice_reader() {
+        let mut file = KV_DUMP_MAGIC.to_vec();
+        file.extend(dump_frame("plain", 0, &[1, 2, 3]));
+        file.extend(dump_frame("with:ttl", 1234, &[0xFF, 0x00, 0xFE]));
+        // An empty payload is legal (an empty string key).
+        file.extend(dump_frame("empty", 0, &[]));
+
+        let read_all = |bytes: &[u8]| -> Vec<KvDumpEntry> {
+            let mut r = &bytes[KV_DUMP_MAGIC.len()..];
+            let mut out = Vec::new();
+            while let Some(entry) = read_dump_frame_from(&mut r).unwrap() {
+                out.push(entry);
+            }
+            out
+        };
+        let streamed = read_all(&file);
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(streamed[0].key, "plain");
+        assert_eq!(streamed[0].payload, vec![1, 2, 3]);
+        assert_eq!(streamed[1].ttl_ms, 1234);
+        assert_eq!(streamed[1].payload, vec![0xFF, 0x00, 0xFE]);
+        assert_eq!(streamed[2].key, "empty");
+        assert!(streamed[2].payload.is_empty());
+
+        // A torn tail restores what it holds, exactly like the slice reader.
+        file.truncate(file.len() - 2);
+        assert_eq!(read_all(&file).len(), 2);
+
+        // A corrupt length is an error, not a gigabyte allocation.
+        let mut bogus = KV_DUMP_MAGIC.to_vec();
+        bogus.extend((u32::MAX).to_le_bytes());
+        let mut r = &bogus[KV_DUMP_MAGIC.len()..];
+        assert!(read_dump_frame_from(&mut r).is_err());
     }
 
     #[test]

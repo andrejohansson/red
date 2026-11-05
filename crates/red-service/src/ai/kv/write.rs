@@ -14,7 +14,7 @@
 use serde_json::Value as Json;
 
 use super::super::gate::WriteAssessment;
-use super::super::util::truncate_summary;
+use super::super::util::truncate_for_approval;
 use super::format::resp_arg;
 use super::json::kv_json_set_value;
 use super::set::{KV_SET_PROMPT_CHARS, kv_set_plan};
@@ -192,7 +192,7 @@ pub(in crate::ai) fn assess_kv_write(name: &str, input: &Json) -> WriteAssessmen
             // The prompt IS the command list: the user reads what will run, not a
             // paraphrase of it.
             Ok(plan) => WriteAssessment::NeedsApproval {
-                sql: truncate_summary(&plan.commands().join("\n"), KV_SET_PROMPT_CHARS),
+                sql: truncate_for_approval(&plan.commands().join("\n"), KV_SET_PROMPT_CHARS),
             },
             Err(why) => WriteAssessment::Reject(why),
         },
@@ -219,7 +219,7 @@ pub(in crate::ai) fn assess_kv_write(name: &str, input: &Json) -> WriteAssessmen
                 sql: format!(
                     "JSON.SET {} {path} {}{scope}",
                     resp_arg(key),
-                    truncate_summary(&value, KV_SET_PROMPT_CHARS)
+                    truncate_for_approval(&value, KV_SET_PROMPT_CHARS)
                 ),
             }
         }
@@ -259,8 +259,15 @@ pub(in crate::ai) fn assess_kv_write(name: &str, input: &Json) -> WriteAssessmen
                 if let Some(addr) = s("addr") {
                     op.push_str(&format!(" ({addr})"));
                 }
+                // The agent's claim, labelled as one: the executor kills by id and
+                // never checks `addr`/`cmd` against the client it kills, so stating
+                // them as fact would let a wrong description be the thing the user
+                // approved on.
                 match s("cmd") {
-                    Some(cmd) => op.push_str(&format!("\nLast command: {cmd}")),
+                    Some(cmd) => op.push_str(&format!(
+                        "\nThe agent says its last command was: {cmd}\n(RED has not checked \
+                         this against the server; read kv_client_list to confirm.)"
+                    )),
                     None => op.push_str(
                         "\nThe agent did not say what this client is doing; read kv_client_list \
                          before allowing.",

@@ -36,8 +36,9 @@ pub const WRITE_TOKENS: &[&str] = &[
 /// read as reads (`SELECT lo_import('/etc/passwd')`, `SELECT dblink_exec(…)`).
 ///
 /// A denylist, so it is a mitigation and not a guarantee; the complete answer is an
-/// engine-level read-only connection. The names are underscore-qualified and could
-/// not plausibly be bare column names, so blocking them does not trip real queries.
+/// engine-level read-only connection. Matched with [`has_call`](super::has_call)
+/// rather than [`has_word`]: several of these (`url`, `file`, `sleep`, `remote`, `benchmark`)
+/// are ordinary column names, and only the call form is the hole.
 pub const DANGEROUS_FNS: &[&str] = &[
     // Postgres: file read/write, large objects, remote exec, WAL, admin file ops.
     "lo_import",
@@ -57,10 +58,62 @@ pub const DANGEROUS_FNS: &[&str] = &[
     "pg_file_write",
     "pg_file_unlink",
     "pg_file_rename",
-    // MySQL: file read and UDF command execution.
+    // Postgres: session and server control reachable from a SELECT.
+    // `pg_terminate_backend`/`pg_cancel_backend` kill other people's work,
+    // `set_config` is `SET` under another name (it can flip
+    // `default_transaction_read_only` straight back off), the reload/rotate pair
+    // is server administration, and `pg_sleep`/the advisory-lock family is a
+    // denial of service a read has no reason to reach for.
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "set_config",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_xact_lock",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_all",
+    // Postgres large objects beyond the import/export pair above.
+    "lo_get",
+    "lo_put",
+    "lo_from_bytea",
+    "lo_unlink",
+    "lo_create",
+    "lo_truncate",
+    // MySQL: file read, UDF command execution, named locks, and the two
+    // wall-clock burners.
     "load_file",
     "sys_exec",
     "sys_eval",
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    "benchmark",
+    "sleep",
+    // ClickHouse table functions that dial out of the server or run a program:
+    // `SELECT * FROM url(…)` exfiltrates, `file()`/`s3()`/`hdfs()` reach storage,
+    // `remote()`/`mysql()`/`postgresql()`/`mongodb()` run SQL elsewhere, and
+    // `executable()` runs a binary.
+    "executable",
+    "url",
+    "file",
+    "s3",
+    "s3cluster",
+    "hdfs",
+    "remote",
+    "remotesecure",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "jdbc",
+    "odbc",
 ];
 
 /// How dangerous a statement, or a whole batch, is. Ordered so that a batch's level
@@ -161,6 +214,15 @@ pub struct Assessment {
     /// for a statement with no single target, and for any shape the extractor
     /// declines to guess at.
     pub table: Option<String>,
+    /// Every object the statement names, when it names a *list* of them
+    /// (`TRUNCATE a, b`, `DROP TABLE a, b`). Empty for the single-object and
+    /// unrecognised shapes, where [`Self::table`] is the answer.
+    ///
+    /// Separate from `table` because they are asked for different reasons: `table`
+    /// is what a row-count preflight queries and so must be exactly one, while this
+    /// is what a typed confirmation makes the user write out and so must be all of
+    /// them.
+    pub objects: Vec<String>,
 }
 
 impl Assessment {
@@ -185,6 +247,26 @@ impl Assessment {
             })
             .or(self.table.as_deref())
             .map(bare_name)
+    }
+
+    /// The typed confirmation's expected text, which for a *list* of objects
+    /// (`TRUNCATE a, b`) is every one of them.
+    ///
+    /// [`Self::confirm_target`] borrows, so it can only ever hand back one stored
+    /// name; asking a user to type `a` for a statement that empties `a` **and** `b`
+    /// is a confirmation that vouches for less than what happens. This owns its
+    /// result so it can join the list.
+    pub fn confirm_text(&self) -> Option<String> {
+        match self.objects.as_slice() {
+            [] => self.confirm_target().map(str::to_string),
+            names => Some(
+                names
+                    .iter()
+                    .map(|n| bare_name(n))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        }
     }
 }
 
@@ -230,14 +312,31 @@ pub fn assess(sql: &str, dialect: Dialect) -> Assessment {
     }
     // A batch has no single target, and callers that need one (a typed confirm, a
     // row-count preflight) must not be handed an arbitrary member of it.
-    let table = match statements.as_slice() {
-        [(only, _)] => target_object(only),
-        _ => None,
+    let (table, objects) = match statements.as_slice() {
+        [(only, _)] => {
+            let objects = target_objects(only);
+            // One object is a target; a list is not, but is still what a typed
+            // confirmation has to name.
+            let table = match objects.as_slice() {
+                [one] => Some(one.clone()),
+                _ => None,
+            };
+            (
+                table,
+                if objects.len() > 1 {
+                    objects
+                } else {
+                    Vec::new()
+                },
+            )
+        }
+        _ => (None, Vec::new()),
     };
     Assessment {
         level,
         risks,
         table,
+        objects,
     }
 }
 
@@ -381,6 +480,27 @@ fn explain_risk(
     }
 }
 
+/// The statement an `EXPLAIN …` wrapper is handed, or `stmt` itself when there is
+/// no wrapper.
+///
+/// Callers that grade the *thing that will run* need the inner statement, not the
+/// `EXPLAIN` in front of it: a driver's `explain` seam prepends its own verb, so a
+/// model that also wrote one leaves `EXPLAIN EXPLAIN ANALYZE DELETE …` for the
+/// engine. Returning a slice of the original (not the [`strip_noise`] copy) keeps
+/// literals and quoting intact for whatever grades it next.
+///
+/// An `EXPLAIN` whose body has no recognisable verb yields the whole input, so the
+/// caller grades the wrapper rather than silently seeing an empty statement.
+pub fn explain_body(stmt: &str, dialect: Dialect) -> &str {
+    let stripped = strip_noise(stmt, dialect);
+    if !first_keyword(&stripped).eq_ignore_ascii_case("explain") {
+        return stmt;
+    }
+    // Offsets are shared: `strip_noise` blanks bytes in place rather than removing
+    // them, so an offset into the stripped copy indexes the original.
+    inner_statement_at(&stripped).map_or(stmt, |at| &stmt[at..])
+}
+
 /// The byte offset in `stripped` of the first word that begins a statement, used
 /// to find what an `EXPLAIN` wraps. `explain` itself is absent from the list so
 /// the scan always advances past it.
@@ -442,22 +562,41 @@ fn always_true_where(lower: &str) -> bool {
 /// multi-table forms (`DELETE a FROM a JOIN b`, `UPDATE a, b SET …`) return `None`
 /// rather than picking one.
 pub(super) fn target_object(stmt: &str) -> Option<String> {
+    // One object, or none. A list (`TRUNCATE a, b`) has no single target, and every
+    // caller of this wants exactly one: a preflight builds `SELECT count(*) FROM
+    // <it>`, and `Assessment::table` is documented as the statement's target.
+    match target_objects(stmt).as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Every object a statement names, in order.
+///
+/// `TRUNCATE a, b` and `DROP TABLE a, b` destroy all of them, and a typed
+/// confirmation that named only the first asked the user to vouch for less than
+/// what was about to happen - the one thing a typed confirmation must not do.
+/// Empty when the shape is one this extractor will not guess at.
+pub(super) fn target_objects(stmt: &str) -> Vec<String> {
     let tokens = lex_refs(stmt);
     let word = |n: usize| match tokens.get(n) {
         Some(Ref::Ident(w)) => Some(w.to_ascii_lowercase()),
         _ => None,
     };
-    let mut at = match word(0)?.as_str() {
+    let Some(verb) = word(0) else {
+        return Vec::new();
+    };
+    let mut at = match verb.as_str() {
         "update" | "truncate" => 1,
         "insert" | "delete" | "merge" => {
             // The object follows a preposition. Anything else is a multi-table form.
             if !matches!(word(1).as_deref(), Some("into" | "from")) {
-                return None;
+                return Vec::new();
             }
             2
         }
         "drop" | "alter" => 2,
-        _ => return None,
+        _ => return Vec::new(),
     };
     // Modifiers that can sit between the verb and the name.
     while matches!(
@@ -466,7 +605,27 @@ pub(super) fn target_object(stmt: &str) -> Option<String> {
     ) {
         at += 1;
     }
-    read_ref(tokens.get(at..)?)
+    // The comma-separated list only exists for the forms that take one; an
+    // `UPDATE a, b SET …` is a multi-table join RED deliberately declines to name,
+    // and `DELETE`/`INSERT`/`MERGE` name exactly one.
+    let list = matches!(verb.as_str(), "truncate" | "drop");
+    let mut out = Vec::new();
+    while let Some(rest) = tokens.get(at..) {
+        let Some(name) = read_ref(rest) else { break };
+        // `read_ref` consumed one ident plus a `.ident` per qualifier segment.
+        at += name.matches('.').count() * 2 + 1;
+        out.push(name);
+        if !list || !matches!(tokens.get(at), Some(Ref::Comma)) {
+            break;
+        }
+        at += 1;
+    }
+    // `UPDATE a, b SET …` is the multi-table form this extractor refuses to guess
+    // at; the loop above stopped after `a`, so drop it entirely.
+    if !list && matches!(tokens.get(at), Some(Ref::Comma)) {
+        return Vec::new();
+    }
+    out
 }
 
 /// A token in the walk from a statement's verb to the object it names.
@@ -476,6 +635,8 @@ enum Ref<'a> {
     Ident(&'a str),
     /// The `.` joining the parts of a qualified name.
     Dot,
+    /// The `,` joining the members of an object *list* (`TRUNCATE a, b`).
+    Comma,
     /// Anything else, including a string literal: never part of an object name, and
     /// present only so the walk above can stop on it.
     Other,
@@ -538,7 +699,11 @@ fn lex_refs(stmt: &str) -> Vec<Ref<'_>> {
             out.push(Ref::Ident(&stmt[start..i]));
             continue;
         }
-        out.push(if c == b'.' { Ref::Dot } else { Ref::Other });
+        out.push(match c {
+            b'.' => Ref::Dot,
+            b',' => Ref::Comma,
+            _ => Ref::Other,
+        });
         i += 1;
     }
     out
@@ -588,6 +753,40 @@ mod tests {
         assert_eq!(
             super::assess("/*!50000 DROP TABLE users */", Dialect::Postgres).level,
             RiskLevel::Safe
+        );
+    }
+
+    #[test]
+    fn explain_body_unwraps_the_planner_verb() {
+        // No wrapper: the input is its own body.
+        assert_eq!(
+            super::explain_body("SELECT * FROM t", Dialect::Postgres),
+            "SELECT * FROM t"
+        );
+        // Wrapped, in each of the shapes a model writes.
+        assert_eq!(
+            super::explain_body("EXPLAIN SELECT * FROM t", Dialect::Postgres),
+            "SELECT * FROM t"
+        );
+        assert_eq!(
+            super::explain_body("EXPLAIN ANALYZE DELETE FROM orders", Dialect::Postgres),
+            "DELETE FROM orders"
+        );
+        assert_eq!(
+            super::explain_body("EXPLAIN (ANALYZE, BUFFERS) DROP TABLE t", Dialect::Postgres),
+            "DROP TABLE t"
+        );
+        assert_eq!(
+            super::explain_body("EXPLAIN QUERY PLAN SELECT 1", Dialect::Sqlite),
+            "SELECT 1"
+        );
+        // An `EXPLAIN` with no recognisable body yields the whole input, so the
+        // caller grades the wrapper rather than an empty statement.
+        assert_eq!(super::explain_body("EXPLAIN", Dialect::Postgres), "EXPLAIN");
+        // A statement that merely mentions the word in a literal is not a wrapper.
+        assert_eq!(
+            super::explain_body("SELECT 'explain' FROM t", Dialect::Postgres),
+            "SELECT 'explain' FROM t"
         );
     }
 
@@ -644,6 +843,26 @@ mod tests {
             Some("users")
         );
         // Nothing critical, or nothing named: the caller falls back to a plain confirm.
+        // A list destroys every member, so the confirmation names every member.
+        assert_eq!(
+            assess("TRUNCATE t1, t2").confirm_text().as_deref(),
+            Some("t1, t2")
+        );
+        assert_eq!(
+            assess("DROP TABLE IF EXISTS public.a, public.b")
+                .confirm_text()
+                .as_deref(),
+            Some("a, b")
+        );
+        // A single object is unchanged.
+        assert_eq!(
+            assess("TRUNCATE orders").confirm_text().as_deref(),
+            Some("orders")
+        );
+        // ...and the row-count preflight still refuses to guess at a list, since
+        // there is no one table to count.
+        assert_eq!(assess("TRUNCATE t1, t2").table, None);
+        assert_eq!(assess("TRUNCATE orders").table.as_deref(), Some("orders"));
         assert_eq!(assess("SELECT 1").confirm_target(), None);
         assert_eq!(assess("GRANT ALL ON t TO bob").confirm_target(), None);
     }

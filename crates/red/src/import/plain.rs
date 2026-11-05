@@ -187,6 +187,7 @@ fn pg_connection(
             proxy: None,
             sentinel_master: String::new(),
             credentials_path: String::new(),
+            srv: false,
         },
         source_name: name,
         folder: None,

@@ -107,6 +107,12 @@ gpui::actions!(red, [Quit]);
 gpui::actions!(red, [ToggleDevStats]);
 
 fn main() {
+    // Settle rustls' process-wide crypto provider before anything can dial TLS.
+    // First, because the CLI dispatch below connects to databases of its own, and
+    // because the alternative is a panic on the backend thread the moment someone
+    // opens a `rediss://` or a `require_ssl` MySQL connection.
+    red_service::install_crypto_provider();
+
     // Headless CLI: when argv names a verb (`red query|exec|test|connections`)
     // this runs the command and exits before any GPUI init. A bare `red` returns
     // `None` and falls through to the desktop app below.
@@ -125,10 +131,10 @@ fn main() {
     // binary as `<exe>.old` and relies on the next launch to reap it. Best-effort:
     // a still-locked or absent file just means there's nothing to clean up.
     #[cfg(target_os = "windows")]
-    if let Ok(exe) = std::env::current_exe() {
-        if let (Some(dir), Some(name)) = (exe.parent(), exe.file_name().and_then(|n| n.to_str())) {
-            let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let (Some(dir), Some(name)) = (exe.parent(), exe.file_name().and_then(|n| n.to_str()))
+    {
+        let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
     }
 
     application().with_assets(Assets).run(|cx: &mut App| {

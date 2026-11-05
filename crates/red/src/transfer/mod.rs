@@ -1,5 +1,5 @@
 //! The transfer wizard: one stepped modal that builds a
-//! [`TransferPlan`](red_core::transfer::TransferPlan) and runs it.
+//! [`red_core::transfer::TransferPlan`] and runs it.
 //!
 //! RED could already stream one table into another and one schema into another
 //! database, but neither flow could say "duplicate this database, these two

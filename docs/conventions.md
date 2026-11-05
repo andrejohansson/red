@@ -20,8 +20,8 @@ earns its place when it captures something the code itself cannot.
   so it has a path to resolution.
 
 Good examples already in the tree set the bar: the `f32` 2^24 layout ceiling in
-`result.rs`, the `FLING_ROWS` rationale, and the single-`gpui`-revision contract
-in `Cargo.toml`.
+`result/buffer.rs`, the `FLING_ROWS` rationale beside it, and the
+single-`gpui`-revision contract in `Cargo.toml`.
 
 ## File size & module layout
 
@@ -34,9 +34,12 @@ in `Cargo.toml`.
   (`foo/buffer.rs`, `foo/render.rs`). Re-export from `mod.rs` to keep the public
   surface stable. Unit tests move with the unit they cover.
 - **Respect crate boundaries.** `red-core` holds domain types with no UI or
-  runtime knowledge; `red-driver` is the only seam to database engines;
-  `red-service` owns the backend thread; `red` is the GPUI application. The UI
-  speaks `red-core` types and `Command`/`Event`, never driver internals.
+  runtime knowledge; `red-driver` is the only seam to database engines (all three
+  of `DatabaseDriver`, `KvDriver` and `DocDriver`); `red-service` owns the backend
+  thread, the AI gate and the MCP/ACP hosts; `red-config` owns the connection list
+  and the keychain, UI-free so the CLI shares them; `red-ai` and `red-acp` are the
+  two agent transports; `red` is the GPUI application. The UI speaks `red-core`
+  types and `Command`/`Event`, never driver internals.
 
 ## Errors & logging
 

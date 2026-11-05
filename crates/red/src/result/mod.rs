@@ -94,8 +94,8 @@ pub(in crate::result) const AUTO_FIT_MAX: f32 = 520.0;
 const CHAR_W: f32 = 7.2;
 
 /// Horizontal padding a cell adds around its text (`px_2p5` each side, plus a
-/// little slack). Headers do their own arithmetic — see [`header_width`]
-/// (ResultGrid::header_width) — because they draw more than text.
+/// little slack). Headers do their own arithmetic — see
+/// [`ResultGrid::header_width`] — because they draw more than text.
 const CELL_PADDING: f32 = 26.0;
 
 /// A monospace advance, as a fraction of the font size. Both fonts RED ships
@@ -818,6 +818,17 @@ impl ResultGrid {
             self.open_joins(),
             old_epoch,
         )
+    }
+
+    /// The SQL a re-open of this grid would run: the statement the result was
+    /// opened with, before the paging wrap, sort and filter are layered on.
+    ///
+    /// What watch mode has to grade. Not the editor's text: a table browse, an FK
+    /// click-through and a script's trailing read all open a grid whose SQL the
+    /// editor never held, and an editor the user has typed into since the run
+    /// holds SQL the grid will not run.
+    pub(crate) fn base_sql(&self) -> &str {
+        &self.base_sql
     }
 
     /// A data column's `(name, declared type)`, for the inspector header.
@@ -1830,7 +1841,12 @@ impl ResultGrid {
     /// reference is worth exactly as much as it is cheap. `None` then, and the
     /// chip resolves to nothing rather than to half the rows.
     pub(crate) fn selection_text(&self, gutter: usize) -> Option<String> {
-        match self.copy_plan(gutter, ClipboardFormat::TsvHeaders)? {
+        // TSV carries no SQL, so the engine is irrelevant here.
+        match self.copy_plan(
+            gutter,
+            ClipboardFormat::TsvHeaders,
+            red_core::DbKind::Sqlite,
+        )? {
             CopyPlan::Ready(text) if !text.trim().is_empty() => Some(text),
             _ => None,
         }
@@ -1844,7 +1860,16 @@ impl ResultGrid {
     /// re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the selection
     /// is empty or covers only the gutter. `gutter` is the data-column table offset
     /// (`1` with the row-number gutter shown, else `0`).
-    fn copy_plan(&self, gutter: usize, format: ClipboardFormat) -> Option<CopyPlan> {
+    ///
+    /// `kind` is the engine the rows came from; only the SQL form uses it, to spell
+    /// identifiers and literals the way the engine they will be pasted back into
+    /// reads them.
+    fn copy_plan(
+        &self,
+        gutter: usize,
+        format: ClipboardFormat,
+        kind: red_core::DbKind,
+    ) -> Option<CopyPlan> {
         let (r0, c0, r1, c1) = self.selection?.bounds();
         let ncol = self.columns.len();
         let dc0 = c0.max(gutter);
@@ -1884,6 +1909,7 @@ impl ResultGrid {
             format,
             self.selected_column_names(&cols),
             self.copy_table_name(),
+            kind,
         );
         // Reused across rows so a wide selection doesn't allocate a fresh Vec per
         // row; the writer only borrows it for the duration of the call.
@@ -2004,8 +2030,9 @@ pub(crate) fn rows_clipboard(
     format: ClipboardFormat,
     names: Vec<String>,
     table: Option<&str>,
+    kind: red_core::DbKind,
 ) -> String {
-    let mut writer = ClipboardWriter::begin(format, names, table);
+    let mut writer = ClipboardWriter::begin(format, names, table, kind);
     let mut cells: Vec<Value> = Vec::with_capacity(cols.len());
     for row in rows {
         cells.clear();
@@ -2189,6 +2216,34 @@ impl AppState {
             && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
             grid.read(cx).buffer.borrow_mut().run_failed(seq);
+        }
+    }
+
+    /// An offset page fetch failed: free its in-flight mark so the window can be
+    /// asked for again. The error itself arrives separately as `Event::Error`.
+    pub(crate) fn on_result_page_failed(
+        &mut self,
+        session: Option<SessionId>,
+        offset: usize,
+        epoch: red_service::Epoch,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
+        {
+            grid.read(cx).buffer.borrow_mut().page_failed(offset);
+        }
+    }
+
+    /// A `CopyRows` re-fetch failed: drop the pending copy so the next one is not
+    /// silently discarded as belonging to someone else.
+    pub(crate) fn on_copy_rows_failed(&mut self, id: OpId, cx: &mut Context<Self>) {
+        if self.pending_copy.take_if(|p| p.id == id).is_some() {
+            self.notify(
+                ToastVariant::Error,
+                "Couldn't re-read the selection to copy it",
+                cx,
+            );
         }
     }
 
@@ -3449,26 +3504,38 @@ impl AppState {
     }
 
     /// Confirmed: fire the import and stand up the progress toast (its `✕` cancels).
+    /// `session` is the connection the import **belongs to** - the one its
+    /// confirm was raised on - not whatever is foreground when it is finally sent.
+    /// A typed confirmation can sit on screen while the user switches connections
+    /// (⌘P), and loading a file into the server they happened to move to is the
+    /// one mistake the confirm exists to prevent.
     pub(crate) fn start_import(
         &mut self,
-        path: PathBuf,
-        format: ImportFormat,
-        target: TableRef,
-        mapping: Vec<ColumnMap>,
-        id: OpId,
+        session: SessionId,
+        req: ImportRequest,
         cx: &mut Context<Self>,
     ) {
-        /// Default rows per insert chunk (the driver re-clamps to its parameter cap).
-        /// A `[import]` setting is a later refinement.
-        const DEFAULT_IMPORT_CHUNK: usize = 500;
-        self.send_active(Command::Import {
+        let ImportRequest {
             path,
             format,
             target,
             mapping,
-            chunk_size: DEFAULT_IMPORT_CHUNK,
             id,
-        });
+        } = req;
+        /// Default rows per insert chunk (the driver re-clamps to its parameter cap).
+        /// A `[import]` setting is a later refinement.
+        const DEFAULT_IMPORT_CHUNK: usize = 500;
+        self.service.send_to(
+            session,
+            Command::Import {
+                path,
+                format,
+                target,
+                mapping,
+                chunk_size: DEFAULT_IMPORT_CHUNK,
+                id,
+            },
+        );
         self.push_notification(
             Notification {
                 id: 0,
@@ -3537,7 +3604,7 @@ impl AppState {
         let plan = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .and_then(|g| g.read(cx).copy_plan(gutter, format)),
+                .and_then(|g| g.read(cx).copy_plan(gutter, format, active.config.kind)),
             _ => None,
         };
         match plan {
@@ -3617,12 +3684,17 @@ impl AppState {
         let Some(pending) = self.pending_copy.take_if(|p| p.id == id) else {
             return;
         };
+        let kind = match &self.phase {
+            Phase::Connected(active) => active.config.kind,
+            _ => red_core::DbKind::Sqlite,
+        };
         let text = rows_clipboard(
             rows,
             &pending.cols,
             pending.format,
             pending.names,
             pending.table.as_deref(),
+            kind,
         );
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
@@ -4667,4 +4739,17 @@ mod frozen_column_tests {
         let max = g.content_width(gutter_w) - 300.0;
         assert_eq!(f32::from(g.h_scroll.offset().x), -max);
     }
+}
+
+/// Everything an import needs beyond the session it runs on: what file, in what
+/// shape, into which table. One struct because these five always travel together,
+/// from the confirm that parks them to the send that dispatches them, and
+/// threading them as five positional arguments is how a mapping ends up on the
+/// wrong table.
+pub(crate) struct ImportRequest {
+    pub(crate) path: PathBuf,
+    pub(crate) format: ImportFormat,
+    pub(crate) target: TableRef,
+    pub(crate) mapping: Vec<ColumnMap>,
+    pub(crate) id: OpId,
 }

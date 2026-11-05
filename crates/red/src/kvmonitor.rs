@@ -135,10 +135,31 @@ impl AppState {
         else {
             return;
         };
-        mon.clients_loading = true;
         let epoch = mon.epoch;
-        self.service
-            .send_to(session, Command::KvClientKill { epoch, id });
+        let who = mon
+            .clients
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| {
+                let name = if c.name.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \"{}\"", c.name)
+                };
+                format!("client {id}{name} at {}", c.addr)
+            })
+            .unwrap_or_else(|| format!("client {id}"));
+        // Disconnecting someone else's client is the same class of act as the
+        // Server panel's kill, which has always been confirmed. This one was a
+        // single click.
+        self.confirm_exec = self.pending_confirm(crate::app::PendingWrite::KvServerAction {
+            epoch,
+            action: crate::app::KvServerAction::KillClient(id),
+            prose: format!(
+                "Disconnect {who}? Whatever it was doing stops, and it is not RED's to \
+                 reconnect."
+            ),
+        });
         cx.notify();
     }
 
@@ -192,10 +213,18 @@ impl AppState {
         else {
             return;
         };
-        mon.slowlog_loading = true;
         let epoch = mon.epoch;
-        self.service
-            .send_to(session, Command::KvSlowlogReset { epoch });
+        let entries = mon.slowlog.len();
+        // The slow log is a diagnostic record with no copy anywhere: clearing it
+        // during an investigation throws away the evidence.
+        self.confirm_exec = self.pending_confirm(crate::app::PendingWrite::KvServerAction {
+            epoch,
+            action: crate::app::KvServerAction::ResetSlowlog,
+            prose: format!(
+                "Clear the server's slow log ({entries} entries shown)? The server keeps no \
+                 copy, so this cannot be undone."
+            ),
+        });
         cx.notify();
     }
 

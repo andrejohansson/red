@@ -263,6 +263,7 @@ impl AppState {
                 config,
                 last_accessed: None,
                 pinned: false,
+                legacy_password: false,
             });
             let index = self.connections.len() - 1;
             self.store_credential(index, &password, is_file, cx);

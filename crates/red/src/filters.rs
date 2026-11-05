@@ -18,7 +18,7 @@
 //! loads fine and merely skips those entries, instead of failing the whole read.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -196,29 +196,12 @@ impl FilterHistory {
 /// keystroke-and-Enter is a visible stall. The atomic rename still guarantees a
 /// reader never sees a torn file; only the durability wait is dropped, and the
 /// loader is fail-open, so losing the last write to a crash is harmless.
-fn save(path: &PathBuf, entries: &[RecentFilter]) -> Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating the config directory")?;
-    }
+fn save(path: &Path, entries: &[RecentFilter]) -> Result<()> {
     let file = FiltersFile {
         entries: entries.to_vec(),
     };
     let contents = serde_json::to_string_pretty(&file).context("serializing filter history")?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).context("creating the filters temp file")?;
-    f.write_all(contents.as_bytes())?;
-    drop(f);
-    std::fs::rename(&tmp, path).context("renaming the filters temp file")?;
-    Ok(())
+    red_config::atomic::write_private_fast(path, contents.as_bytes())
 }
 
 #[cfg(test)]

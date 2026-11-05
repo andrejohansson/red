@@ -112,22 +112,8 @@ impl KeymapStore {
     /// renamed over `keymap.toml` so a crash can't leave a partial file. Mirrors
     /// [`crate::settings::FileSettingsStore::save`].
     pub fn save(&self, blocks: &[KeymapBlock]) -> Result<()> {
-        use std::io::Write;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).context("creating the config directory")?;
-        }
         let serialized = Self::serialize(blocks)?;
-
-        let tmp = self
-            .path
-            .with_extension(format!("toml.tmp.{}", std::process::id()));
-        let mut file = std::fs::File::create(&tmp).context("creating the keymap temp file")?;
-        file.write_all(serialized.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &self.path).context("renaming the keymap temp file")?;
-        Ok(())
+        red_config::atomic::write_private(&self.path, serialized.as_bytes())
     }
 }
 

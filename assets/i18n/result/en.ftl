@@ -10,9 +10,9 @@
 #      *[other] { $n } rows
 #   }
 
-result-pin_limit = Six pinned rows is the maximum; unpin one to pin another
-
 result-unpin_row = Unpin row
+
+result-pin_limit = Six pinned rows is the maximum; unpin one to pin another
 
 result-empty_hint = Double-click a table or run a query to see rows
 

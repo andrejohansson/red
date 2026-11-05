@@ -19,13 +19,15 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{
-    Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
+    Column as MyColumn, DriverError, Error as MyError, Opts, OptsBuilder, Pool, PoolConstraints,
+    PoolOpts, Row, Value as MyValue,
 };
 use red_core::{
     Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, ExportOutcome,
@@ -39,6 +41,43 @@ use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
 use crate::{
     AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
 };
+
+/// How long a connection may sit idle in the pool before the reaper closes it.
+/// `mysql_async` hands out a pooled connection without checking that it is still
+/// alive, so anything the far end killed while it idled - the server's
+/// `wait_timeout`, a NAT or load balancer dropping the flow, a laptop sleeping -
+/// surfaces as an I/O error on the user's next query. Reaping bounds how long a
+/// connection can be exposed to that; [`PROBE_AFTER`] catches the rest.
+const IDLE_TTL: Duration = Duration::from_secs(60);
+
+/// How often the pool's reaper runs. Sets the granularity of [`IDLE_TTL`].
+const TTL_CHECK: Duration = Duration::from_secs(15);
+
+/// Upper bound on pooled connections. Cursors hold one each for the life of their
+/// stream, and each cancel borrows one more, so the ceiling has to clear the
+/// number of results a session can have open at once by a wide margin.
+const POOL_MAX: usize = 64;
+
+/// Idle connections the pool keeps rather than reaping. Zero: an idle connection
+/// is worth nothing here (a desktop explorer is idle most of the time) and is a
+/// liability once the far end has quietly closed it. The library's default of 10
+/// is precisely the set that goes stale overnight.
+const POOL_MIN: usize = 0;
+
+/// Wall-clock idle time after which a pooled connection is pinged before use.
+/// Interactive work (paging a grid, walking the tree, completing an identifier)
+/// arrives in bursts far tighter than this, so the round trip is paid only after
+/// a pause - which is exactly when the connection may have died under us.
+///
+/// Wall clock rather than `Instant`: the gap that matters most is the machine
+/// suspending, which a monotonic clock does not count.
+const PROBE_AFTER: Duration = Duration::from_secs(3);
+
+/// How many dead pooled connections to walk past before giving up. Connections
+/// die in sets (one sleep, one server restart kills every one of them), so a
+/// single retry is not enough; each dead one is discarded rather than returned to
+/// the pool, so the attempts converge on a freshly dialled connection.
+const REVIVE_ATTEMPTS: usize = 4;
 
 /// A live MySQL/MariaDB session. Holds a connection `Pool`: cursors take a
 /// dedicated connection for the duration of their stream, and the out-of-band
@@ -81,6 +120,11 @@ pub struct MysqlDriver {
     /// unconditionally so a connection that never switches database keeps paying
     /// nothing, which is the overwhelmingly common case.
     rebind: Arc<AtomicBool>,
+    /// Unix millis at which a connection from this pool was last handed out
+    /// healthy - the "has this pool been sitting idle?" clock the staleness probe
+    /// in [`Self::conn`] reads. Shared by every handle over the pool (they draw
+    /// from one set of idle connections), like `rebind`.
+    last_use: Arc<AtomicU64>,
 }
 
 impl MysqlDriver {
@@ -106,6 +150,16 @@ impl MysqlDriver {
             // Write paths carry their own `START TRANSACTION READ ONLY` regardless.
             builder = builder.setup(vec!["SET SESSION TRANSACTION READ ONLY"]);
         }
+        // Reap idle connections rather than keeping the library's default ten warm
+        // forever: a connection the far end has closed is indistinguishable from a
+        // live one until a query fails on it. See `IDLE_TTL`.
+        let constraints = PoolConstraints::new(POOL_MIN, POOL_MAX).unwrap_or_default();
+        builder = builder.pool_opts(
+            PoolOpts::default()
+                .with_constraints(constraints)
+                .with_inactive_connection_ttl(IDLE_TTL)
+                .with_ttl_check_interval(TTL_CHECK),
+        );
         let pool = Pool::new(builder);
 
         let mut conn = pool.get_conn().await.map_err(map_connect_err)?;
@@ -123,6 +177,7 @@ impl MysqlDriver {
             namespace: None,
             default_db,
             rebind: Arc::new(AtomicBool::new(false)),
+            last_use: Arc::new(AtomicU64::new(now_millis())),
         })
     }
 
@@ -139,13 +194,62 @@ impl MysqlDriver {
     /// the `START TRANSACTION READ ONLY` that [`Self::begin_stmt`] opens for a
     /// write batch, never inside it.
     async fn conn(&self) -> Result<mysql_async::Conn> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        // The database to bind: this handle's own namespace, or — once any handle
-        // has moved a connection off it (see `rebind`) — `default_db` again, since
-        // the connection we were handed may still be in another handle's database.
-        // A connection that dialled no database at all can't be put back to "none"
-        // (`USE` takes a name), so there the leak stands; a query that names no
-        // database was never well-defined on such a connection anyway.
+        // Whether the pool has been idle long enough for what it holds to have
+        // died unnoticed. Read once, before the first borrow: it describes the
+        // pool's state on entry, and the loop below is walking through that same
+        // set of connections.
+        let mut probe = self.idle_for() > PROBE_AFTER;
+        let mut lost: Option<MyError> = None;
+        for _ in 0..REVIVE_ATTEMPTS {
+            // Once one connection has turned out to be dead the pool is known
+            // stale, so every later candidate is checked whatever the clock said.
+            probe |= lost.is_some();
+            let mut conn = self.pool.get_conn().await.map_err(map_lost_err)?;
+            // A dead connection is discarded rather than returned to the pool, so
+            // each attempt strictly shrinks the stale set: eventually the pool has
+            // to dial a live one.
+            if probe && let Err(e) = conn.ping().await {
+                lost = Some(e);
+                continue;
+            }
+            match self.bind_namespace(&mut conn).await {
+                Ok(()) => {
+                    self.last_use.store(now_millis(), Ordering::Relaxed);
+                    return Ok(conn);
+                }
+                // The bind is the first statement on this connection, so a
+                // connection that died between the probe and here fails on it -
+                // the same stale-pool case, not a bad `USE`.
+                Err(e) if connection_lost(&e) => lost = Some(e),
+                Err(e) => return Err(map_my_err(e)),
+            }
+        }
+        self.force_probe();
+        Err(lost.map_or_else(
+            || RedError::ConnectionLost("no live connection in the pool".into()),
+            map_lost_err,
+        ))
+    }
+
+    /// Make the next [`Self::conn`] check what the pool hands it, whatever the idle
+    /// clock says. Called where a connection has just been found dead: the pool's
+    /// whole idle set is suspect from that point, and connections die in sets.
+    fn force_probe(&self) {
+        self.last_use.store(0, Ordering::Relaxed);
+    }
+
+    /// Put `conn` in this handle's database, the first statement it runs.
+    ///
+    /// The database to bind is this handle's own namespace, or - once any handle
+    /// has moved a connection off it (see `rebind`) - `default_db` again, since the
+    /// connection we were handed may still be in another handle's database. A
+    /// connection that dialled no database at all can't be put back to "none"
+    /// (`USE` takes a name), so there the leak stands; a query that names no
+    /// database was never well-defined on such a connection anyway.
+    ///
+    /// Returns the driver's own error so [`Self::conn`] can tell a dead connection
+    /// apart from a genuinely failing `USE`.
+    async fn bind_namespace(&self, conn: &mut mysql_async::Conn) -> mysql_async::Result<()> {
         let bind = match &self.namespace {
             Some(ns) => Some(ns),
             None => self
@@ -153,12 +257,17 @@ impl MysqlDriver {
                 .as_ref()
                 .filter(|_| self.rebind.load(Ordering::SeqCst)),
         };
-        if let Some(ns) = bind {
-            conn.query_drop(format!("USE `{}`", escape_ident(ns)))
-                .await
-                .map_err(map_my_err)?;
+        match bind {
+            Some(ns) => conn.query_drop(format!("USE `{}`", escape_ident(ns))).await,
+            None => Ok(()),
         }
-        Ok(conn)
+    }
+
+    /// How long since a connection from this pool was last known healthy. Zero if
+    /// the clock has moved backwards since (an NTP step), which only costs a probe
+    /// that was not needed.
+    fn idle_for(&self) -> Duration {
+        Duration::from_millis(now_millis().saturating_sub(self.last_use.load(Ordering::Relaxed)))
     }
 
     /// The statement that opens a write transaction. On a read-only connection it
@@ -257,7 +366,7 @@ impl MysqlDriver {
 impl DatabaseDriver for MysqlDriver {
     async fn ping(&self) -> Result<()> {
         let mut conn = self.conn().await?;
-        conn.query_drop("SELECT 1").await.map_err(driver_err)
+        conn.query_drop("SELECT 1").await.map_err(map_lost_err)
     }
 
     fn server_version(&self) -> String {
@@ -287,15 +396,29 @@ impl DatabaseDriver for MysqlDriver {
             namespace,
             default_db: self.default_db.clone(),
             rebind: self.rebind.clone(),
+            last_use: self.last_use.clone(),
         })
     }
 
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let mut conn = self.conn().await?;
-        let conn_id = conn.id();
         // Prepare to read columns up front without stepping rows: cheap, as the
         // contract requires; the (possibly expensive) execute happens in the task.
-        let stmt = conn.prep(sql).await.map_err(map_my_err)?;
+        let stmt = match conn.prep(sql).await {
+            Ok(stmt) => stmt,
+            // The connection died between the borrow and the prepare, so the pool's
+            // idle set is stale after all. Nothing has run yet - the statement was
+            // never sent - so one more attempt on a checked connection is free of
+            // any risk of repeating work.
+            Err(e) if connection_lost(&e) => {
+                drop(conn);
+                self.force_probe();
+                conn = self.conn().await?;
+                conn.prep(sql).await.map_err(map_my_err)?
+            }
+            Err(e) => return Err(map_my_err(e)),
+        };
+        let conn_id = conn.id();
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
 
         // Out-of-band cancel: `KILL QUERY` on a *separate* pooled connection aborts
@@ -362,7 +485,7 @@ impl DatabaseDriver for MysqlDriver {
                 (scope.clone(),),
             )
             .await
-            .map_err(driver_err)?
+            .map_err(map_lost_err)?
         } else {
             conn.query(
                 "SELECT schema_name FROM information_schema.schemata \
@@ -371,7 +494,7 @@ impl DatabaseDriver for MysqlDriver {
                  ORDER BY schema_name",
             )
             .await
-            .map_err(driver_err)?
+            .map_err(map_lost_err)?
         };
 
         let mut schemas = Vec::with_capacity(schema_names.len());
@@ -383,7 +506,7 @@ impl DatabaseDriver for MysqlDriver {
                     (schema.clone(),),
                 )
                 .await
-                .map_err(driver_err)?;
+                .map_err(map_lost_err)?;
             let objects = object_rows
                 .into_iter()
                 .map(|(name, table_type)| ObjectMeta {
@@ -419,7 +542,7 @@ impl DatabaseDriver for MysqlDriver {
                    FROM information_schema.triggers GROUP BY 1",
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
 
         let mut out: Vec<(String, ObjectKind, usize)> = rows
             .into_iter()
@@ -470,7 +593,7 @@ impl DatabaseDriver for MysqlDriver {
                     (namespace, routine_type),
                 )
                 .await
-                .map_err(driver_err)?
+                .map_err(map_lost_err)?
             }
             ObjectKind::Trigger => conn
                 .exec(
@@ -480,7 +603,7 @@ impl DatabaseDriver for MysqlDriver {
                     (namespace,),
                 )
                 .await
-                .map_err(driver_err)?,
+                .map_err(map_lost_err)?,
             // Sequences are MariaDB-only. On MySQL `information_schema.sequences`
             // does not exist, and the resulting 1109 is "this engine has none",
             // not a failure worth surfacing in the tree: the group renders empty.
@@ -512,7 +635,7 @@ impl DatabaseDriver for MysqlDriver {
                 (schema, table),
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
         let columns = column_rows
             .into_iter()
             .map(
@@ -538,7 +661,7 @@ impl DatabaseDriver for MysqlDriver {
                 (schema, table),
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
         let foreign_keys = fk_rows
             .into_iter()
             .map(|(column, ref_table, ref_column)| ForeignKeyMeta {
@@ -556,7 +679,7 @@ impl DatabaseDriver for MysqlDriver {
             escape_ident(schema),
             escape_ident(table)
         );
-        let idx_rows: Vec<Row> = conn.query(idx_sql).await.map_err(driver_err)?;
+        let idx_rows: Vec<Row> = conn.query(idx_sql).await.map_err(map_lost_err)?;
         let indexes = group_indexes(&idx_rows);
 
         Ok(TableDetail {
@@ -581,7 +704,7 @@ impl DatabaseDriver for MysqlDriver {
                 (schema, &table.name),
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
         Ok(rows
             .into_iter()
             .map(|(col, ty)| (col, crate::parse_mysql_enum(&ty)))
@@ -617,14 +740,14 @@ impl DatabaseDriver for MysqlDriver {
                 (scope.clone(),),
             )
             .await
-            .map_err(driver_err)?
+            .map_err(map_lost_err)?
         } else {
             conn.query(format!(
                 "{SELECT} AND table_schema NOT IN \
                    ('information_schema', 'performance_schema', 'mysql', 'sys'){ORDER}"
             ))
             .await
-            .map_err(driver_err)?
+            .map_err(map_lost_err)?
         };
         let edges = crate::group_fk_edges(rows.into_iter().map(
             |(from_schema, from_table, from_column, to_schema, to_table, to_column, constraint)| {
@@ -825,7 +948,7 @@ impl DatabaseDriver for MysqlDriver {
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
-        match conn.query_drop(sql).await {
+        match exec_one(&mut conn, sql).await {
             Ok(()) => {
                 let affected = conn.affected_rows();
                 conn.query_drop("COMMIT").await.map_err(map_my_err)?;
@@ -833,7 +956,7 @@ impl DatabaseDriver for MysqlDriver {
             }
             Err(e) => {
                 crate::warn_rollback(conn.query_drop("ROLLBACK").await, "execute");
-                Err(map_my_err(e))
+                Err(e)
             }
         }
     }
@@ -887,11 +1010,11 @@ impl DatabaseDriver for MysqlDriver {
                 crate::warn_rollback(conn.query_drop("ROLLBACK").await, "execute_batch");
                 return Err(RedError::Interrupted);
             }
-            match conn.query_drop(sql).await {
+            match exec_one(&mut conn, sql).await {
                 Ok(()) => affected.push(conn.affected_rows()),
                 Err(e) => {
                     crate::warn_rollback(conn.query_drop("ROLLBACK").await, "execute_batch");
-                    return Err(map_my_err(e));
+                    return Err(e);
                 }
             }
         }
@@ -1110,7 +1233,7 @@ impl DatabaseDriver for MysqlDriver {
                 (scope.clone(), scope.clone()),
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
 
         let mut totals = SizeTotals::default();
         for (schema, name, data, index, table_rows, engine) in &rows {
@@ -1282,13 +1405,13 @@ impl DatabaseDriver for MysqlDriver {
         let status: HashMap<String, String> = conn
             .query::<(String, String), _>("SHOW GLOBAL STATUS")
             .await
-            .map_err(driver_err)?
+            .map_err(map_lost_err)?
             .into_iter()
             .collect();
         let vars: HashMap<String, String> = conn
             .query::<(String, String), _>("SHOW GLOBAL VARIABLES")
             .await
-            .map_err(driver_err)?
+            .map_err(map_lost_err)?
             .into_iter()
             .collect();
 
@@ -1354,13 +1477,13 @@ impl DatabaseDriver for MysqlDriver {
                  WHERE command <> 'Daemon' ORDER BY time DESC LIMIT 500",
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
 
         // Which thread is ours, so the panel can refuse to kill it.
         let me: Option<u64> = conn
             .query_first("SELECT CONNECTION_ID()")
             .await
-            .map_err(driver_err)?;
+            .map_err(map_lost_err)?;
 
         // The lock graph, when performance_schema is available. Absent (or
         // disabled) means no wait tree rather than a failed panel, which is why
@@ -1424,7 +1547,7 @@ impl DatabaseDriver for MysqlDriver {
             red_core::KillMode::Terminate => format!("KILL {id}"),
         };
         let mut conn = self.conn().await?;
-        conn.query_drop(statement).await.map_err(driver_err)
+        conn.query_drop(statement).await.map_err(map_lost_err)
     }
 
     /// Every replaceable kind drops by qualified name here — MySQL needs no table
@@ -1471,7 +1594,7 @@ impl DatabaseDriver for MysqlDriver {
                 )));
             }
         };
-        let rows: Vec<mysql_async::Row> = conn.query(statement).await.map_err(driver_err)?;
+        let rows: Vec<mysql_async::Row> = conn.query(statement).await.map_err(map_lost_err)?;
         let row = rows
             .into_iter()
             .next()
@@ -1486,12 +1609,17 @@ impl DatabaseDriver for MysqlDriver {
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
         let base = strip_trailing(sql);
         let mut conn = self.conn().await?;
+        // `exec`, not `query`: the text protocol would run every statement in a
+        // `;`-separated batch, and this seam is handed model- and user-authored SQL
+        // (the AI `explain`/`suggest_index` tools, the editor's plan pane). The
+        // binary protocol's `COM_STMT_PREPARE` refuses a batch at the server. See
+        // [`exec_one`].
         if analyze {
             // `EXPLAIN ANALYZE` (MySQL 8.0.18+) yields the tree format and runs
             // the statement. MariaDB's syntax differs; that surfaces as a normal
             // error the UI shows in the plan pane.
             let rows: Vec<String> = conn
-                .query(format!("EXPLAIN ANALYZE {base}"))
+                .exec(format!("EXPLAIN ANALYZE {base}"), ())
                 .await
                 .map_err(map_my_err)?;
             return Ok(crate::plan::from_text_tree(&rows.join("\n"), true));
@@ -1500,14 +1628,14 @@ impl DatabaseDriver for MysqlDriver {
         // lack it (older MySQL, MariaDB) fall back to the tabular `EXPLAIN`, which
         // every version supports, rendered as a flat node list.
         let tree: std::result::Result<Vec<String>, MyError> =
-            conn.query(format!("EXPLAIN FORMAT=TREE {base}")).await;
+            conn.exec(format!("EXPLAIN FORMAT=TREE {base}"), ()).await;
         match tree {
             Ok(rows) if !rows.is_empty() => {
                 Ok(crate::plan::from_text_tree(&rows.join("\n"), false))
             }
             _ => {
                 let rows: Vec<Row> = conn
-                    .query(format!("EXPLAIN {base}"))
+                    .exec(format!("EXPLAIN {base}"), ())
                     .await
                     .map_err(map_my_err)?;
                 Ok(plan_from_table(&rows))
@@ -1535,7 +1663,8 @@ impl DatabaseDriver for MysqlDriver {
 
         let file = File::create(path).map_err(driver_err)?;
         let out = BufWriter::new(file);
-        let mut writer = ExportWriter::begin(out, format, names, path).map_err(driver_err)?;
+        let mut writer =
+            ExportWriter::begin(out, format, names, path, DbKind::Mysql).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report
@@ -1863,6 +1992,85 @@ fn object_ident(label: &str) -> &str {
 /// user must fix) or a transient [`RedError::Connect`]. 1045 = access denied,
 /// 1044 = access denied to database, 1049 = unknown database; none retry away.
 /// Anything else (refused/unreachable host) stays a retryable `Connect`.
+/// Unix millis now, or 0 if the system clock predates the epoch. The value only
+/// feeds an idle-time comparison, so a nonsense clock costs at most one probe.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Whether this error means the connection itself is gone, rather than the server
+/// having rejected the statement. An I/O failure on an established connection is
+/// always that (the socket is one-per-connection, so there is nothing else it
+/// could be), and the library raises `ConnectionClosed` when the far end hung up
+/// between packets.
+fn connection_lost(e: &MyError) -> bool {
+    matches!(
+        e,
+        MyError::Io(_) | MyError::Driver(DriverError::ConnectionClosed)
+    )
+}
+
+/// Map an error raised while getting or reviving a pooled connection. Always
+/// [`RedError::ConnectionLost`] for a dead link, so callers can retry on a fresh
+/// connection instead of reporting a query failure.
+fn map_lost_err(e: MyError) -> RedError {
+    if connection_lost(&e) {
+        return RedError::ConnectionLost(e.to_string());
+    }
+    driver_err(e)
+}
+
+/// Run one statement that returns no rows, through the **binary** protocol.
+///
+/// The point is the protocol, not the parameters. `mysql_async`'s `Conn` always
+/// negotiates `CLIENT_MULTI_STATEMENTS`, so `query_drop` happily runs every
+/// statement in a `;`-separated batch: text that RED's own scanner read as one
+/// statement, and graded as one, executes as several. `COM_STMT_PREPARE` refuses
+/// a batch at the server, which makes "one statement" a property the engine
+/// enforces rather than one the scanner has to get right.
+///
+/// MySQL cannot prepare every statement - `CREATE PROCEDURE`/`TRIGGER`/`EVENT`
+/// and `USE` among them, which is exactly the routine DDL RED goes out of its way
+/// to support - and answers `ER_UNSUPPORTED_PS` (1295) when asked to. Only there
+/// does this fall back to the text protocol, and only after the scanner confirms
+/// the text really is one statement.
+async fn exec_one(conn: &mut mysql_async::Conn, sql: &str) -> Result<()> {
+    match conn.exec_drop(sql, ()).await {
+        Ok(()) => Ok(()),
+        Err(e) if unsupported_prepare(&e) => {
+            if !is_single_statement(sql) {
+                return Err(RedError::Query(
+                    "this statement cannot be prepared and holds more than one statement; run \
+                     them one at a time"
+                        .into(),
+                ));
+            }
+            conn.query_drop(sql).await.map_err(map_my_err)
+        }
+        Err(e) => Err(map_my_err(e)),
+    }
+}
+
+/// Whether the server refused to *prepare* the statement because its kind is not
+/// preparable (`ER_UNSUPPORTED_PS`), as opposed to failing on its content.
+fn unsupported_prepare(e: &MyError) -> bool {
+    matches!(e, MyError::Server(se) if se.code == 1295)
+}
+
+/// Whether `sql` holds exactly one runnable statement, by RED's own MySQL-dialect
+/// scanner. The fallback guard for [`exec_one`]; never the primary one, because a
+/// scanner that mis-reads a routine body is precisely how a batch reaches the
+/// text protocol in the first place.
+fn is_single_statement(sql: &str) -> bool {
+    red_core::sql::split_statements(sql, red_core::sql::Dialect::MySql)
+        .into_iter()
+        .filter(|s| !red_core::sql::first_keyword(s).is_empty())
+        .count()
+        == 1
+}
+
 fn map_connect_err(e: MyError) -> RedError {
     if let MyError::Server(ref se) = e
         && matches!(se.code, 1045 | 1044 | 1049)
@@ -1874,7 +2082,8 @@ fn map_connect_err(e: MyError) -> RedError {
 
 /// Map a killed query (`KILL QUERY` → error 1317, SQLSTATE `70100`) to the
 /// distinct `Interrupted`, and "no database selected" (1046, `ER_NO_DB_ERROR`) to
-/// the actionable `NamespaceRequired`; everything else is a driver error.
+/// the actionable `NamespaceRequired`; everything else falls through to
+/// [`map_lost_err`], which separates a dead connection from a real driver error.
 ///
 /// 1046 is what an unqualified query hits when the connection dialled no database
 /// — legal for MySQL, whose database segment is optional so the tree can browse
@@ -1892,7 +2101,7 @@ fn map_my_err(e: MyError) -> RedError {
             };
         }
     }
-    driver_err(e)
+    map_lost_err(e)
 }
 
 // Tests run against a live MariaDB/MySQL provided via `RED_TEST_MYSQL_URL`, so CI
@@ -1978,7 +2187,7 @@ impl crate::Sandbox for MySandbox {
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
         }
-        conn.query_drop(sql).await.map_err(map_my_err)?;
+        exec_one(conn, sql).await?;
         Ok(conn.affected_rows())
     }
 
@@ -2173,6 +2382,30 @@ mod tests {
         std::env::var("RED_TEST_MYSQL_URL").ok()
     }
 
+    /// The fallback guard for statements MySQL cannot prepare (routine DDL). It
+    /// only has to be right about *counting*, since the binary protocol covers
+    /// everything else.
+    #[test]
+    fn the_text_protocol_fallback_only_accepts_one_statement() {
+        assert!(is_single_statement("SELECT 1"));
+        assert!(is_single_statement("SELECT 1;"));
+        assert!(is_single_statement("  -- note\n SELECT 1 ; "));
+        // A routine body is one statement, `;`s and all - the whole reason the
+        // fallback exists.
+        assert!(is_single_statement(
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW \
+             BEGIN SET NEW.a = OLD.begin; END"
+        ));
+        assert!(!is_single_statement("SELECT 1; DROP TABLE users"));
+        assert!(!is_single_statement(
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW \
+             BEGIN SET NEW.a = 1; END; DROP TABLE users"
+        ));
+        // Nothing runnable is not one statement either.
+        assert!(!is_single_statement("-- just a comment"));
+        assert!(!is_single_statement(""));
+    }
+
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -2209,6 +2442,43 @@ mod tests {
             .unwrap_or_else(|| panic!("metric {key} is missing"))
             .value
             .clone()
+    }
+
+    /// The whole reconnect path keys off this one classification: a reset socket
+    /// has to read as "the connection died" (retryable on a fresh one), while a
+    /// server that answered with an error is the statement's own failure.
+    #[test]
+    fn a_reset_socket_reads_as_a_lost_connection_and_a_server_error_does_not() {
+        use mysql_async::{IoError, ServerError};
+
+        let reset = MyError::Io(IoError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )));
+        assert!(connection_lost(&reset));
+        assert!(matches!(map_my_err(reset), RedError::ConnectionLost(_)));
+
+        let hung_up = MyError::Driver(DriverError::ConnectionClosed);
+        assert!(connection_lost(&hung_up));
+        assert!(matches!(map_lost_err(hung_up), RedError::ConnectionLost(_)));
+
+        // A killed query keeps its own meaning rather than being swept into the
+        // retry path: retrying what the user just cancelled would be a defect.
+        let killed = MyError::Server(ServerError {
+            code: 1317,
+            message: "Query execution was interrupted".into(),
+            state: "70100".into(),
+        });
+        assert!(!connection_lost(&killed));
+        assert!(matches!(map_my_err(killed), RedError::Interrupted));
+
+        let syntax = MyError::Server(ServerError {
+            code: 1064,
+            message: "You have an error in your SQL syntax".into(),
+            state: "42000".into(),
+        });
+        assert!(!connection_lost(&syntax));
+        assert!(matches!(map_my_err(syntax), RedError::Driver(_)));
     }
 
     #[test]
@@ -2323,7 +2593,7 @@ mod tests {
                 None => {
                     // Visible skip (with `--nocapture`): a missing URL must read as
                     // "not run", never a silent pass. CI sets the URL so it runs.
-                    eprintln!("SKIP {}: RED_TEST_MYSQL_URL not set", module_path!());
+                    crate::conformance::skip_or_fail("RED_TEST_MYSQL_URL", module_path!());
                     return;
                 }
             }
@@ -2336,6 +2606,37 @@ mod tests {
         let driver = MysqlDriver::connect(&url, true).await.unwrap();
         assert!(!driver.server_version().is_empty());
         driver.ping().await.unwrap();
+    }
+
+    /// The regression this path exists for. A connection the far end closes while
+    /// it idles in the pool is indistinguishable from a live one until a statement
+    /// fails on it, and `mysql_async` hands it straight back. `KILL` stands in for
+    /// what does this in the wild: the server's `wait_timeout`, a NAT dropping the
+    /// flow, a laptop suspending.
+    #[tokio::test]
+    async fn a_connection_killed_while_it_idled_is_replaced_not_handed_back() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, true).await.unwrap();
+
+        // Warm the pool, note what it holds, and let it back in.
+        let dead_id = {
+            let conn = driver.conn().await.unwrap();
+            conn.id()
+        };
+
+        // From a second pool, so the kill can't take the connection under itself.
+        let killer = MysqlDriver::connect(&url, false).await.unwrap();
+        let mut k = killer.conn().await.unwrap();
+        k.query_drop(format!("KILL {dead_id}")).await.unwrap();
+        drop(k);
+
+        // Past the probe window (and long enough for the recycler to have taken the
+        // first connection back), so the next borrow checks what it is handed.
+        tokio::time::sleep(PROBE_AFTER + Duration::from_millis(500)).await;
+
+        let mut conn = driver.conn().await.unwrap();
+        assert_ne!(conn.id(), dead_id, "the dead connection was handed back");
+        conn.query_drop("SELECT 1").await.unwrap();
     }
 
     #[tokio::test]

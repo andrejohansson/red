@@ -9,8 +9,10 @@ bindings below. Press `⌘/` in-app for the shortcut reference as an overlay.
 `Esc`/`Enter`, isn't in the palette: those are cursor movement and dialog
 responses, not commands.)
 
-Bindings are registered centrally in `crates/red/src/keymap.rs`. The `⌘/` overlay
-is generated from `keymap::shortcuts()`; keep this doc in sync with it.
+Bindings are registered centrally in `crates/red/src/keymap.rs`, and the `⌘/`
+overlay is generated from `keymap::shortcuts()` — that overlay is the complete,
+always-current list. What follows is the curated subset worth reading away from
+the app; when the two disagree, the overlay is right.
 
 > Bindings use `⌘` on macOS. The app is macOS-first today; per-platform `ctrl-*`
 > splitting is a follow-up.
@@ -28,9 +30,14 @@ is generated from `keymap::shortcuts()`; keep this doc in sync with it.
 
 | Key | Action |
 | --- | --- |
-| `⌥⌘1` / `⌥⌘2` / `⌥⌘3` | Focus schema / editor / grid |
+| hold `⌥` | Show a jump key on every panel, then press it |
 | `F6` / `⇧F6` | Cycle focus forward / back |
 | `⌘B` | Toggle the schema sidebar |
+| `⌘\` / `⌘⇧\` | Split the pane right / down |
+| `⌥⌘\` | Focus the next pane |
+| `⌥⌘W` | Close the pane |
+| `⌘⇧↩` | Maximize / restore the pane |
+| `⌥⌘0` | Equalize pane sizes |
 
 ## Query tabs
 
@@ -47,7 +54,8 @@ driven once open: `↑`/`↓` move, `↵` loads the entry, `Esc` closes.
 
 ## Result grid
 
-Focus the grid (`⌥⌘3`, or click a cell), then drive the cell cursor:
+Focus the grid (hold `⌥` and press its jump key, or click a cell), then drive
+the cell cursor:
 
 | Key | Action |
 | --- | --- |
@@ -65,7 +73,7 @@ same paging machinery the scrollbar uses, so it follows without stutter.
 
 ## Schema tree
 
-Focus the sidebar (`⌥⌘1`), then:
+Focus the sidebar (hold `⌥` and press its jump key), then:
 
 | Key | Action |
 | --- | --- |
@@ -77,6 +85,29 @@ Focus the sidebar (`⌥⌘1`), then:
 
 `⌘F` works from anywhere (it reveals a collapsed sidebar first); type to filter the
 tree live, then `↓` into the results.
+
+## Editing data
+
+| Key | Action |
+| --- | --- |
+| `↵` / `F2` | Edit the focused cell |
+| `⌘↵` | Submit staged changes |
+| `⌥⌘Z` | Revert staged changes |
+| `⌘⌫` | Mark row(s) for deletion |
+| `⌥⌘N` | Add a new row |
+| `⌥⌘0` | Set the cell to `NULL` |
+
+Edits stage in the grid rather than applying as you type: the draft markers show
+what has changed, and `⌘↵` submits the batch behind one confirmation.
+
+## MongoDB browser
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the selection (collection tree, document grid) |
+| `←` / `→` | Collapse / expand a database |
+| `↵` / `F2` | Open the highlighted collection / document |
+| `⌘F` | Search collections (tree) / filter documents (grid) |
 
 ## Dialogs
 

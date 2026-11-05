@@ -670,26 +670,47 @@ impl AppState {
     }
 
     /// `Event::KvKeysCopied`: a cross-server copy finished. Toast the outcome.
-    pub(crate) fn on_kv_keys_copied(&mut self, copied: u64, failed: u64, cx: &mut Context<Self>) {
-        let (variant, msg) = if failed == 0 {
-            (
+    ///
+    /// `skipped` is named separately from `failed` because it is not a fault: the
+    /// target already had a key of that name and the copy left it alone. Folding
+    /// the two together would read as "something went wrong" for the one case
+    /// where the safe thing happened on purpose.
+    pub(crate) fn on_kv_keys_copied(
+        &mut self,
+        copied: u64,
+        failed: u64,
+        skipped: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let (variant, msg) = match (failed, skipped) {
+            (0, 0) => (
                 ToastVariant::Success,
                 if copied == 1 {
                     crate::i18n::tr!("kv.copied_one_key", "Copied 1 key")
                 } else {
                     crate::i18n::tr!("kv.copied_keys_ok", "Copied {copied} keys", copied = copied)
                 },
-            )
-        } else {
-            (
+            ),
+            (0, skipped) => (
+                ToastVariant::Warning,
+                crate::i18n::tr!(
+                    "kv.copied_keys_skipped",
+                    "Copied {copied} key(s). {skipped} already existed on the target and were \
+                     left as they are; delete them there first to replace them.",
+                    copied = copied,
+                    skipped = skipped,
+                ),
+            ),
+            (failed, _) => (
                 ToastVariant::Warning,
                 crate::i18n::tr!(
                     "kv.copied_keys",
-                    "Copied {copied} key(s), {failed} failed",
+                    "Copied {copied} key(s), {failed} failed, {skipped} already existed",
                     copied = copied,
                     failed = failed,
+                    skipped = skipped,
                 ),
-            )
+            ),
         };
         self.notify(variant, msg, cx);
     }

@@ -38,6 +38,20 @@ pub struct StoredConnection {
     /// the low ⌘-digit slots no matter what they touched last. Defaults to false;
     /// omitted from the file when unset so pre-pin configs round-trip unchanged.
     pub pinned: bool,
+    /// This connection's password is still the legacy plaintext one from the
+    /// config file, because `migrate_secrets` could not reach the keychain.
+    ///
+    /// It is the *only* thing that lets [`save`] write a password, and it is set
+    /// exactly where the alternative is losing one: without it, a failed migration
+    /// left the password in memory while every later save (a pin toggle, a connect
+    /// stamping `last_accessed`) rewrote the file through the password-free
+    /// `WriteConnection` shape and silently dropped it. Cleared the moment the
+    /// keychain takes the secret, after which the keychain is the only copy.
+    ///
+    /// Deliberately *not* "the password field is non-empty": that is also true
+    /// while a keychain-backed password is transiently materialized for a connect
+    /// or an edit, and writing *those* back to disk would undo the whole model.
+    pub legacy_password: bool,
 }
 
 /// The on-disk shape used for *loading*, tolerant of both the current structured
@@ -101,6 +115,10 @@ struct RawConnection {
     /// Credentials. A path, not a secret, so unlike `password` it belongs on disk.
     #[serde(default)]
     credentials_path: String,
+    /// MongoDB DNS-seedlist (`mongodb+srv`) connection. Absent in pre-SRV configs,
+    /// where it defaults to the ordinary host-list form.
+    #[serde(default)]
+    srv: bool,
     /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
     #[serde(default)]
     ssh: Option<RawSsh>,
@@ -206,6 +224,7 @@ impl RawConnection {
             ai_tier: self.ai_tier,
             sentinel_master: self.sentinel_master,
             credentials_path: self.credentials_path,
+            srv: self.srv,
             ssh: self.ssh.and_then(RawSsh::into_config),
             proxy: self.proxy.and_then(RawProxy::into_config),
         };
@@ -232,6 +251,10 @@ impl RawConnection {
         }
         StoredConnection {
             id: self.id,
+            // A password in the file is legacy by definition: nothing RED writes
+            // puts one there unless the keychain migration already failed. Cleared
+            // by `migrate_secrets` the moment the keychain accepts it.
+            legacy_password: !config.password.is_empty(),
             config,
             last_accessed: self.last_accessed,
             pinned: self.pinned,
@@ -286,6 +309,18 @@ struct WriteConnection {
     /// round-trip byte-for-byte. A scalar key, so it stays ahead of `ssh`.
     #[serde(skip_serializing_if = "String::is_empty")]
     credentials_path: String,
+    /// MongoDB DNS-seedlist connection; omitted when off so non-Mongo (and
+    /// host-list Mongo) files round-trip byte-for-byte.
+    #[serde(skip_serializing_if = "is_false")]
+    srv: bool,
+    /// The legacy plaintext password, written back **only** when the keychain
+    /// migration for this connection failed (`StoredConnection::legacy_password`).
+    /// Empty - and so absent from the file - in every other case, which is the
+    /// normal one: passwords live in the keychain and this shape has nothing to
+    /// write. See [`StoredConnection::legacy_password`] for why the flag and not
+    /// the emptiness of the field is what decides.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    password: String,
     /// Optional `[connection.ssh]` sub-table. Table-valued, so it must follow all
     /// scalar keys (TOML requirement); it and `proxy` are the trailing tables.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,6 +406,12 @@ impl From<&StoredConnection> for WriteConnection {
             pinned: s.pinned,
             sentinel_master: c.sentinel_master.clone(),
             credentials_path: c.credentials_path.clone(),
+            srv: c.srv,
+            password: if s.legacy_password {
+                c.password.clone()
+            } else {
+                String::new()
+            },
             ssh: c.ssh.as_ref().map(WriteSsh::from_config),
             proxy: c.proxy.as_ref().map(WriteProxy::from_config),
         }
@@ -449,7 +490,7 @@ pub fn load() -> Vec<StoredConnection> {
             // a plain `std::fs::write` here created a world-readable copy of them at
             // the default umask — one typo away, in the one code path that runs
             // *because* the file was malformed.
-            if let Err(be) = write_private(&backup, &text) {
+            if let Err(be) = crate::atomic::write_private(&backup, text.as_bytes()) {
                 tracing::warn!("failed to back up malformed config: {be}");
             }
             tracing::warn!(
@@ -511,11 +552,20 @@ fn migrate_secrets(connections: &mut [StoredConnection]) -> bool {
             tracing::warn!(
                 "keychain unavailable; leaving credentials in the config file for now: {e}"
             );
+            // Mark them, so the *next* save keeps writing them rather than
+            // rewriting the file through the password-free shape and dropping the
+            // only copy. Every entry that still holds a password is marked, not
+            // just the one that failed: the migration is all-or-nothing, so none
+            // of them reached the keychain.
+            for &j in &with_password {
+                connections[j].legacy_password = true;
+            }
             return false;
         }
     }
     for &i in &with_password {
         connections[i].config.password.clear();
+        connections[i].legacy_password = false;
     }
     true
 }
@@ -526,48 +576,9 @@ fn migrate_secrets(connections: &mut [StoredConnection]) -> bool {
 /// Unix and atomically (temp + rename), never leaving a world-readable credential
 /// or a half-written file. Creates the config dir if needed.
 pub fn save(connections: &[StoredConnection]) -> Result<()> {
-    use std::io::Write;
-
     let path = config_path().context("no platform config directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let contents = serialize(connections)?;
-    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&tmp)
-        .context("creating the connections temp file")?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, &path).context("renaming the connections temp file")?;
-    Ok(())
-}
-
-/// Write `contents` to `path`, owner-only on Unix.
-///
-/// The permission bits are the point: everything this crate writes can hold a
-/// credential, so `std::fs::write` (which creates at the umask, typically 0644) is
-/// never the right call here.
-fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(contents.as_bytes())
+    crate::atomic::write_private(&path, contents.as_bytes())
 }
 
 /// Render the connection list to the exact TOML bytes [`save`] writes, so a
@@ -583,6 +594,53 @@ pub fn serialize(connections: &[StoredConnection]) -> Result<String> {
 mod tests {
     use super::*;
     use red_core::DbKind;
+
+    /// The bug: a failed keychain migration left the password in memory only,
+    /// and the very next save - a pin toggle, a connect stamping `last_accessed` -
+    /// rewrote the file through the password-free shape and dropped the only copy.
+    #[test]
+    fn a_failed_migration_keeps_the_password_in_the_file() {
+        let legacy = |flag: bool| {
+            [StoredConnection {
+                id: "conn-legacy".into(),
+                config: ConnectionConfig {
+                    name: "old".into(),
+                    kind: DbKind::Postgres,
+                    host: "db".into(),
+                    user: "app".into(),
+                    password: "hunter2".into(),
+                    ..Default::default()
+                },
+                last_accessed: None,
+                pinned: false,
+                legacy_password: flag,
+            }]
+        };
+        // Unmigrated: the password survives the rewrite, so it is not lost.
+        let text = serialize(&legacy(true)).unwrap();
+        assert!(text.contains("hunter2"), "{text}");
+        // And it reloads as still-unmigrated, so the next save keeps it too.
+        let back = reload(&text);
+        assert!(back[0].legacy_password);
+        assert_eq!(back[0].config.password, "hunter2");
+
+        // Migrated (the normal case): the same in-memory password - materialized
+        // from the keychain for a connect - is never written back.
+        let text = serialize(&legacy(false)).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!reload(&text)[0].legacy_password);
+    }
+
+    /// Round-trip a serialized config back through the load-side shape, the way
+    /// `load` does minus the file IO and the keychain migration.
+    fn reload(text: &str) -> Vec<StoredConnection> {
+        toml::from_str::<RawConfigFile>(text)
+            .expect("deserialize")
+            .connections
+            .into_iter()
+            .map(RawConnection::into_stored)
+            .collect()
+    }
 
     #[test]
     fn config_file_round_trips() {
@@ -600,6 +658,7 @@ mod tests {
                 // A pinned connection must round-trip (conn-b stays unpinned, so
                 // its flag is omitted from the file and defaults back to false).
                 pinned: true,
+                legacy_password: false,
             },
             StoredConnection {
                 id: "conn-b".into(),
@@ -633,10 +692,12 @@ mod tests {
                     // confirm it's omitted from the file and reads back blank.
                     sentinel_master: "mymaster".into(),
                     credentials_path: String::new(),
+                    srv: false,
                     env: ConnEnv::Prod,
                 },
                 last_accessed: None,
                 pinned: false,
+                legacy_password: false,
             },
         ];
 
@@ -727,6 +788,7 @@ mod tests {
             },
             last_accessed: None,
             pinned: false,
+            legacy_password: false,
         }];
 
         let cfg = ConfigFile {

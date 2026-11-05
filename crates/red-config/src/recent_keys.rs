@@ -8,7 +8,7 @@
 //! (fail-open, like the other loaders).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -104,29 +104,10 @@ impl RecentKeysStore {
 /// the only thing dropped is the durability wait, and recent-keys is a
 /// throwaway convenience list (the loader is fail-open) where losing the last
 /// write to a crash is harmless.
-fn save(path: &PathBuf, keys: &HashMap<String, Vec<RecentKeyRec>>) -> Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating the config directory")?;
-    }
+fn save(path: &Path, keys: &HashMap<String, Vec<RecentKeyRec>>) -> Result<()> {
     let file = RecentKeysFile { keys: keys.clone() };
     let contents = serde_json::to_string_pretty(&file).context("serializing redis recent keys")?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&tmp)
-        .context("creating the recent-keys temp file")?;
-    f.write_all(contents.as_bytes())?;
-    drop(f);
-    std::fs::rename(&tmp, path).context("renaming the recent-keys temp file")?;
-    Ok(())
+    crate::atomic::write_private_fast(path, contents.as_bytes())
 }
 
 #[cfg(test)]

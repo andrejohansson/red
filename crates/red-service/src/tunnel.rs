@@ -181,7 +181,19 @@ async fn authenticate(handle: &mut russh::client::Handle<Handler>, ssh: &SshConf
             let passphrase = (!ssh.passphrase.is_empty()).then_some(ssh.passphrase.as_str());
             let key = russh::keys::load_secret_key(path, passphrase)
                 .map_err(|e| RedError::Auth(format!("could not load SSH key {path}: {e}")))?;
-            let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            // The signature hash matters only for RSA keys, and there it is the
+            // difference between working and not: `None` means `ssh-rsa`, which is
+            // SHA-1, which OpenSSH 8.8+ refuses by default. Ask the server which
+            // `rsa-sha2-*` it accepts (the `server-sig-algs` extension) and sign
+            // with that. A server that does not advertise the extension answers
+            // `None`, and SHA-256 is the better guess there than SHA-1: an old
+            // enough server to lack the extension still accepts SHA-1, but the
+            // *modern* servers that omit it under some configurations do not.
+            let hash = match handle.best_supported_rsa_hash().await {
+                Ok(Some(alg)) => alg,
+                Ok(None) | Err(_) => Some(russh::keys::HashAlg::Sha256),
+            };
+            let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash);
             handle
                 .authenticate_publickey(ssh.user.clone(), key)
                 .await
@@ -221,10 +233,18 @@ async fn authenticate_agent(
     if identities.is_empty() {
         return Err(RedError::Auth("SSH agent has no identities loaded".into()));
     }
+    // Same reasoning as the key-file path: `None` here means `ssh-rsa`/SHA-1,
+    // which OpenSSH 8.8+ refuses by default, so an RSA identity in the agent
+    // silently never authenticated. Asked once, outside the loop: the answer is a
+    // property of the server, not of the identity.
+    let hash = match handle.best_supported_rsa_hash().await {
+        Ok(Some(alg)) => alg,
+        Ok(None) | Err(_) => Some(russh::keys::HashAlg::Sha256),
+    };
     for id in identities {
         let pubkey = id.public_key().into_owned();
         if let Ok(result) = handle
-            .authenticate_publickey_with(user.to_string(), pubkey, None, &mut agent)
+            .authenticate_publickey_with(user.to_string(), pubkey, hash, &mut agent)
             .await
             && result.success()
         {

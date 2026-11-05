@@ -130,7 +130,7 @@ shortcuts-mongodb_browser-collapse_expand_a_database = Collapse / expand a datab
 
 shortcuts-mongodb_browser-open_the_highlighted_collection_document = Open the highlighted collection / document
 
-shortcuts-mongodb_browser-focus_collection_tree_document_grid = Focus collection tree / document grid
+shortcuts-mongodb_browser-focus_collection_tree_document_grid = Show a jump key on every panel, then press it
 
 shortcuts-mongodb_browser-search_collections_tree_filter_documents_grid = Search collections (tree) / filter documents (grid)
 

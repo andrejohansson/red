@@ -294,6 +294,33 @@ impl AcpManager {
         self.prune_pending();
     }
 
+    /// Tear down **every** conversation, in flight or not, so the next prompt
+    /// rebuilds its agent and its grounding server from scratch.
+    ///
+    /// For a change to the AI policy. Each conversation's MCP server captured the
+    /// tier and the resource guards when it started, and enforces *those* on every
+    /// `tools/list` and `tools/call` for the agent's whole life - so turning the
+    /// assistant off, or dropping it from Write to Read, changed nothing for a chat
+    /// that was already open: it went on serving rows under the old policy until
+    /// something else happened to restart it. Unlike [`Self::drop_idle`] this does
+    /// not spare an active turn, because an active turn is exactly the one still
+    /// running under the policy the user just revoked.
+    pub(crate) fn drop_for_policy_change(&mut self) {
+        if self.conversations.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            "tearing down {} ACP conversation(s) after an AI policy change",
+            self.conversations.len()
+        );
+        self.conversations.clear();
+        self.restarts.clear();
+        // A prompt on screen was raised under the old policy; dropping its sink
+        // denies it, which is the safe answer to a question whose premise just
+        // changed.
+        self.pending.clear();
+    }
+
     /// Drop every conversation not mid-turn so its next prompt re-spawns the agent
     /// and re-runs the ACP handshake; used after a Settings re-auth so live
     /// chats pick up the newly signed-in account. A conversation with a turn in

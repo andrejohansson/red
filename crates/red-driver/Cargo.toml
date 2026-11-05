@@ -35,6 +35,10 @@ mongodb.workspace = true
 # already in the tree, and neither is touched on the ADC path.
 rsa.workspace = true
 base64.workspace = true
+# Only to install the process-wide crypto provider at startup (see
+# `install_crypto_provider`); every TLS connection itself is made by the driver
+# crates above, which share this same rustls.
+rustls.workspace = true
 
 [dev-dependencies]
 # `net` is for the BigQuery driver's mock-server tests: they stand up a loopback

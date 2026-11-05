@@ -704,9 +704,14 @@ const SUGGESTION_MAX: usize = 8;
 fn field_prefix(text: &str) -> Option<String> {
     // A field name runs back to whatever introduced it: whitespace, or the JSON
     // punctuation a key sits behind.
+    // Walked as chars, not `rfind(..) + 1`: `rfind` yields a byte offset and the
+    // separator need not be one byte (`is_whitespace` matches U+00A0 and friends),
+    // so `+ 1` lands inside a codepoint and the slice below panics.
     let start = text
-        .rfind(|c: char| c.is_whitespace() || matches!(c, '{' | ',' | '"' | ':' | '(' | '['))
-        .map_or(0, |i| i + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace() || matches!(c, '{' | ',' | '"' | ':' | '(' | '['))
+        .map_or(0, |(i, c)| i + c.len_utf8());
     let tail = &text[start..];
     if tail.is_empty() {
         return None;
@@ -961,9 +966,8 @@ impl MongoView {
         }
     }
 
-    /// The relations diagram *state* shown by the tab at `idx` (the canvas plus
-    /// the evidence), where [`relations`](Self::relations) hands back only the
-    /// canvas the shared ER renderer needs.
+    /// The relations diagram *state* shown by the tab at `idx`: the canvas the
+    /// shared ER renderer draws, plus the evidence panel's own state beside it.
     pub(crate) fn relations_at(&self, idx: usize) -> Option<&RelationsView> {
         match self.tabs.get(idx).map(|t| &t.state)? {
             MongoTabState::Relations(r) => Some(&**r),
@@ -2992,5 +2996,35 @@ fn write_pretty(value: &DocValue, out: &mut String, depth: usize) {
 fn indent(out: &mut String, depth: usize) {
     for _ in 0..depth {
         out.push_str("  ");
+    }
+}
+
+#[cfg(test)]
+mod field_prefix_tests {
+    use super::field_prefix;
+
+    #[test]
+    fn a_trailing_identifier_is_the_prefix() {
+        assert_eq!(field_prefix("{ na"), Some("na".into()));
+        assert_eq!(field_prefix("{ a: 1, addr.ci"), Some("addr.ci".into()));
+        assert_eq!(field_prefix("name"), Some("name".into()));
+        // Not a field token: a value, a closing brace, trailing space.
+        assert_eq!(field_prefix("{ a: 1 }"), None);
+        assert_eq!(field_prefix("{ a: "), None);
+        assert_eq!(field_prefix(""), None);
+    }
+
+    /// The separator scan used to be `rfind(..) + 1`, a byte offset advanced by
+    /// one. `is_whitespace` matches multibyte characters (a non-breaking space is
+    /// two bytes), so the offset landed inside a codepoint and slicing panicked
+    /// the UI thread on a paste from a word processor.
+    #[test]
+    fn a_multibyte_separator_does_not_panic() {
+        assert_eq!(field_prefix("{ a: 1,\u{a0}nam"), Some("nam".into()));
+        // An ideographic space, three bytes.
+        assert_eq!(field_prefix("{\u{3000}addr.city"), Some("addr.city".into()));
+        // A multibyte letter inside the tail is part of the identifier, and the
+        // slice that returns it starts on a boundary.
+        assert_eq!(field_prefix("{ na\u{e9}"), Some("na\u{e9}".into()));
     }
 }

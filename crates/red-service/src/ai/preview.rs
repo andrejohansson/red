@@ -33,7 +33,7 @@ use red_driver::{AbortSignal, DatabaseDriver};
 use serde_json::Value as Json;
 
 use super::AiBackend;
-use super::gate::changeset_statements;
+use super::gate::{changeset_statements, is_read_only_select};
 use super::sql::format::render_cell;
 use super::util::guard_timeout;
 use crate::protocol::{StatementPreview, WritePreview};
@@ -108,6 +108,26 @@ async fn preview_statement(
 ) -> Option<StatementPreview> {
     let target = write_target(sql, dialect)?;
     let matched = format!("SELECT * FROM {} WHERE {}", target.table, target.predicate);
+    // The preview runs *before* the user approves anything, so what it runs is
+    // held to the read tier's own standard rather than to the write gate's. The
+    // predicate is the model's text: a subquery in it (`WHERE id IN (DELETE …
+    // RETURNING id)`, `WHERE pg_read_file('/etc/passwd') <> ''`) would otherwise
+    // execute on a "Deny" the user is still reading. Refusing costs the prompt its
+    // number, which is the failure mode this module is built around.
+    if !is_read_only_select(&matched, dialect) {
+        return Some(StatementPreview {
+            table: target.table,
+            matches: None,
+            total: None,
+            columns: Vec::new(),
+            sample: Vec::new(),
+            note: Some(
+                "the predicate was not counted: it is not a plain read, so running it to \
+                 preview would itself have been a change"
+                    .into(),
+            ),
+        });
+    }
 
     let (matches, note) = match count_within(driver, &matched, budget(limits)).await {
         Ok(n) => (Some(n.max(0) as u64), None),

@@ -2035,8 +2035,12 @@ impl AppState {
             Event::KvKeysRestored { epoch, count } => {
                 self.on_kv_keys_restored(session, epoch, count, cx);
             }
-            Event::KvKeysCopied { copied, failed } => {
-                self.on_kv_keys_copied(copied, failed, cx);
+            Event::KvKeysCopied {
+                copied,
+                failed,
+                skipped,
+            } => {
+                self.on_kv_keys_copied(copied, failed, skipped, cx);
             }
             Event::KvImportDone {
                 ok,
@@ -2215,6 +2219,10 @@ impl AppState {
                 // the in-flight flag and computes the change flashes + row delta.
                 self.watch_rows_landed(session, epoch, cx);
             }
+            Event::ResultPageFailed { offset, epoch } => {
+                self.on_result_page_failed(session, offset, epoch, cx)
+            }
+            Event::CopyRowsFailed { id } => self.on_copy_rows_failed(id, cx),
             Event::ResultRunFailed { epoch, seq } => {
                 self.on_result_run_failed(session, epoch, seq, cx);
                 self.watch_run_failed(session, epoch, cx);
@@ -2274,12 +2282,12 @@ impl AppState {
             Event::TransactionFailed(message) => {
                 self.notify(ToastVariant::Error, message, cx);
             }
-            Event::ScriptStep(step) => self.on_script_step(step, cx),
+            Event::ScriptStep(step) => self.on_script_step(session, step, cx),
             Event::ScriptDone {
                 ran,
                 failed,
                 trailing_read,
-            } => self.on_script_done(ran, failed, trailing_read, cx),
+            } => self.on_script_done(session, ran, failed, trailing_read, cx),
             Event::Executed {
                 statements,
                 affected,
@@ -2650,7 +2658,9 @@ impl AppState {
             Some(PendingWrite::CostlyQuery { epoch, .. }) => {
                 self.rerun_cost_approved(Some(owner), epoch, cx)
             }
-            Some(PendingWrite::Script { statements, .. }) => self.send_script(statements, cx),
+            Some(PendingWrite::Script { statements, .. }) => {
+                self.send_script(owner, statements, cx)
+            }
             Some(PendingWrite::Batch {
                 ops,
                 sources,
@@ -2671,6 +2681,23 @@ impl AppState {
             Some(PendingWrite::KillSession { key, mode, .. }) => {
                 self.run_kill_session(owner, key, mode)
             }
+            // The one place these are sent, so the prose the user approved and the
+            // command that runs cannot describe two different things.
+            Some(PendingWrite::KvServerAction { epoch, action, .. }) => {
+                let command = match action {
+                    KvServerAction::KillClient(id) => {
+                        red_service::Command::KvClientKill { epoch, id }
+                    }
+                    KvServerAction::ResetSlowlog => red_service::Command::KvSlowlogReset { epoch },
+                    KvServerAction::EnableKeyspaceNotifications => {
+                        red_service::Command::KvSetNotifyConfig {
+                            epoch,
+                            flags: crate::kvkeyspace::ENABLE_FLAGS.to_string(),
+                        }
+                    }
+                };
+                self.service.send_to(owner, command);
+            }
             Some(PendingWrite::Import {
                 path,
                 format,
@@ -2678,7 +2705,17 @@ impl AppState {
                 mapping,
                 id,
                 ..
-            }) => self.start_import(path, format, target, mapping, id, cx),
+            }) => self.start_import(
+                owner,
+                crate::result::ImportRequest {
+                    path,
+                    format,
+                    target,
+                    mapping,
+                    id,
+                },
+                cx,
+            ),
             Some(PendingWrite::Transfer { .. }) => self.confirmed_transfer(cx),
             Some(PendingWrite::Copy {
                 id,

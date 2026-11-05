@@ -359,8 +359,8 @@ static SHORTCUTS: &[ShortcutGroup] = &[
             ),
             (
                 "focus_collection_tree_document_grid",
-                "⌥⌘1 / ⌥⌘3",
-                "Focus collection tree / document grid",
+                "hold ⌥",
+                "Show a jump key on every panel, then press it",
             ),
             (
                 "search_collections_tree_filter_documents_grid",

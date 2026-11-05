@@ -12,10 +12,7 @@ use red_core::DbKind;
 // gate classifies as one statement is exactly what the engine is handed, and both
 // read-only gates reason over the same stripped copy with the same token lists.
 pub use red_core::sql::Dialect;
-use red_core::sql::{
-    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_word, is_routine_ddl, split_statements,
-    statement_ranges, strip_noise,
-};
+use red_core::sql::{first_keyword, is_routine_ddl, split_statements, statement_ranges};
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
 pub const KEYWORDS: &[&str] = &[
@@ -540,35 +537,17 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
 /// (`SELECT lo_export(…)`) is an ordinary read as far as grading is concerned, and
 /// auto-running someone else's SQL deserves a narrower gate than running your own.
 ///
-/// This is the UI twin of `red-service`'s `is_read_only_select`, and reasons the
-/// same way: over a `strip_noise` copy so a write word inside a string can't fool it
-/// and a quoted column named like one can't trip it, against the same shared
-/// `WRITE_TOKENS` / `DANGEROUS_FNS`. It stays a separate function because it is
-/// deliberately looser about the *leading* keyword: the editor may auto-run an
-/// `EXPLAIN` or a bare `VALUES`, where the assistant's `run_select` may not. False
-/// positives are fine: a rejected read just doesn't auto-run; the user can still
-/// press Run.
+/// One call into `red_core::sql::classify`, with this surface's own policy for
+/// which leading keywords count as a read. The assistant's gate is the same call
+/// with [`AGENT_READ_LEADING`](red_core::sql::AGENT_READ_LEADING) instead: the
+/// scan, the token lists and the noise-stripping are shared, and the only thing
+/// that differs is the one thing that genuinely does — the editor may auto-run an
+/// `EXPLAIN` or a bare `VALUES`, where `run_select` may not.
+///
+/// False positives are fine: a rejected read just doesn't auto-run; the user can
+/// still press Run.
 pub fn is_read_only(sql: &str, dialect: Dialect) -> bool {
-    let stripped = strip_noise(sql, dialect);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // A `;` (outside a literal, already blanked) could chain a write past the prefix.
-    if trimmed.contains(';') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let read_prefix = ["select", "with", "explain", "values"]
-        .iter()
-        .any(|p| lower.starts_with(p));
-    if !read_prefix {
-        return false;
-    }
-    !WRITE_TOKENS
-        .iter()
-        .chain(DANGEROUS_FNS)
-        .any(|w| has_word(&lower, w))
+    red_core::sql::classify(sql, dialect).is_read(red_core::sql::EDITOR_READ_LEADING)
 }
 
 /// The single `;`-delimited statement to run for a caret at `cursor`: the
@@ -632,7 +611,10 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
     if trimmed.contains(';') {
         return None;
     }
-    Some(format!("{trimmed} LIMIT {n}"))
+    // On its own line, not appended to the last one: a statement ending in a
+    // line comment (`SELECT * FROM t -- rows`) would otherwise carry the LIMIT
+    // inside the comment, and the rail would silently do nothing.
+    Some(format!("{trimmed}\nLIMIT {n}"))
 }
 
 /// The single physical table a hand-typed `SELECT * FROM <table>` reads, as an
@@ -1574,12 +1556,22 @@ mod tests {
     fn auto_limit_appends_to_bare_select() {
         assert_eq!(
             auto_limit("SELECT * FROM users", 1000).as_deref(),
-            Some("SELECT * FROM users LIMIT 1000")
+            Some("SELECT * FROM users\nLIMIT 1000")
         );
         // A trailing terminator is stripped before the LIMIT is appended.
         assert_eq!(
             auto_limit("select id from t ;", 50).as_deref(),
-            Some("select id from t LIMIT 50")
+            Some("select id from t\nLIMIT 50")
+        );
+        // On its own line, so a trailing line comment cannot swallow it: appended
+        // to the same line this read `-- rows LIMIT 50` and limited nothing.
+        assert_eq!(
+            auto_limit("SELECT * FROM t -- rows", 50).as_deref(),
+            Some("SELECT * FROM t -- rows\nLIMIT 50")
+        );
+        assert_eq!(
+            auto_limit("SELECT * FROM t # rows", 50).as_deref(),
+            Some("SELECT * FROM t # rows\nLIMIT 50")
         );
     }
 

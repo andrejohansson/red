@@ -530,12 +530,18 @@ pub(crate) async fn run_turn(
                             });
                             continue;
                         }
-                        WriteAssessment::NeedsApproval { sql } if sandbox_mode => {
+                        WriteAssessment::NeedsApproval { sql }
+                            if sandbox_mode && crate::ai::gate::rides_sandbox(name) =>
+                        {
                             // Sandbox mode relaxes the *approval*, never the gate: the
                             // shape checks above (DDL, chained statements, a WHERE-less
                             // UPDATE) already ran and already rejected. What changes is
                             // that nothing is committed, so asking per statement is
                             // friction without a decision behind it.
+                            //
+                            // Only for the tools the transaction actually contains: a
+                            // `create_index` or `kill_session` runs on the driver, outside
+                            // it, so it keeps the prompt (see `gate::rides_sandbox`).
                             if sandbox.is_none() {
                                 match open_sandbox(&backend, &state, session, conversation_id).await
                                 {
@@ -1409,7 +1415,8 @@ mod tests {
     /// without a network or a real model.
     struct ScriptedWrite {
         calls: std::sync::atomic::AtomicUsize,
-        sql: String,
+        tool: String,
+        input: Json,
     }
 
     #[async_trait::async_trait]
@@ -1425,8 +1432,8 @@ mod tests {
                 (
                     vec![ContentBlock::ToolUse {
                         id: "w1".into(),
-                        name: "propose_write".into(),
-                        input: json!({ "sql": self.sql }),
+                        name: self.tool.clone(),
+                        input: self.input.clone(),
                     }],
                     StopReason::ToolUse,
                 )
@@ -1493,9 +1500,15 @@ mod tests {
     }
 
     fn scripted(sql: &str) -> Arc<dyn red_ai::AiProvider> {
+        scripted_tool("propose_write", json!({ "sql": sql }))
+    }
+
+    /// A provider that calls one named tool once, then finishes.
+    fn scripted_tool(tool: &str, input: Json) -> Arc<dyn red_ai::AiProvider> {
         Arc::new(ScriptedWrite {
             calls: std::sync::atomic::AtomicUsize::new(0),
-            sql: sql.into(),
+            tool: tool.into(),
+            input,
         })
     }
 
@@ -1505,11 +1518,21 @@ mod tests {
         driver: Arc<dyn DatabaseDriver>,
         sql: &str,
     ) -> (Arc<Mutex<AiState>>, SessionId, Vec<Event>) {
+        sandbox_tool_turn(driver, scripted(sql), CancelToken::new()).await
+    }
+
+    /// The general form: one sandbox-mode turn driving whichever tool `provider`
+    /// calls, under `cancel`.
+    async fn sandbox_tool_turn(
+        driver: Arc<dyn DatabaseDriver>,
+        provider: Arc<dyn red_ai::AiProvider>,
+        cancel: CancelToken,
+    ) -> (Arc<Mutex<AiState>>, SessionId, Vec<Event>) {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let state = Arc::new(Mutex::new(AiState::default()));
         let session = SessionId::new(1);
         run_turn(
-            scripted(sql),
+            provider,
             AiBackend::Sql {
                 driver,
                 dialect: Dialect::Sqlite,
@@ -1525,7 +1548,7 @@ mod tests {
             Vec::new(),
             AiContext::default(),
             true,
-            CancelToken::new(),
+            cancel,
         )
         .await;
         let mut events = Vec::new();
@@ -1533,6 +1556,40 @@ mod tests {
             events.push(e);
         }
         (state, session, events)
+    }
+
+    /// Review mode trades the per-call prompt for a transaction the user reviews.
+    /// `create_index` never enters that transaction - it is DDL, run straight on
+    /// the driver - so relaxing its prompt would drop its only gate and leave it
+    /// off the review card too. It keeps the prompt.
+    #[tokio::test]
+    async fn sandbox_mode_still_prompts_for_a_write_the_transaction_cannot_hold() {
+        let (db, driver) = write_fixture("sbx-ddl");
+        // Nobody is going to answer the prompt, so cancel once it is up:
+        // `await_write_approval` polls the token and denies, and the turn winds
+        // down. The assertion is that it asked at all.
+        let cancel = CancelToken::new();
+        let ticker = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            ticker.cancel();
+        });
+        let (_, _, events) = sandbox_tool_turn(
+            driver,
+            scripted_tool(
+                "create_index",
+                json!({ "table": "t", "name": "ix_t_name", "columns": ["name"] }),
+            ),
+            cancel,
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::AiPermissionRequest { .. })),
+            "a write outside the review transaction must still be approved: {events:#?}"
+        );
+        let _ = std::fs::remove_file(&db);
     }
 
     /// A citable call is numbered and its result carries the label the model
@@ -1694,10 +1751,7 @@ mod tests {
         }
         // Writable connection at the Write tier.
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, false));
-        let provider: Arc<dyn red_ai::AiProvider> = Arc::new(ScriptedWrite {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            sql: "UPDATE t SET name = 'after' WHERE id = 1".into(),
-        });
+        let provider = scripted("UPDATE t SET name = 'after' WHERE id = 1");
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let state = Arc::new(Mutex::new(AiState::default()));
         let policy = AiPolicy {

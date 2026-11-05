@@ -112,6 +112,7 @@ impl AppState {
             // Unmarked until the user picks, or accepts the form's suggestion.
             env: ConnEnv::Unset,
             tls: false,
+            srv: false,
             editing: None,
             submitted: false,
             test: TestState::Idle,
@@ -198,6 +199,7 @@ impl AppState {
             read_only: config.read_only,
             env: config.env,
             tls: config.tls,
+            srv: config.srv,
             editing: Some(index),
             submitted: false,
             test: TestState::Idle,
@@ -306,6 +308,7 @@ impl AppState {
             proxy,
             // A Sentinel master group only applies to Redis; other engines never
             // carry one even if the input holds stale text from an engine switch.
+            srv: form.srv && form.kind == DbKind::Mongo,
             sentinel_master: if form.kind == DbKind::Redis {
                 read(&self.sentinel_master_input)
             } else {
@@ -416,6 +419,7 @@ impl AppState {
                     config,
                     last_accessed: None,
                     pinned: false,
+                    legacy_password: false,
                 });
                 self.connections.len() - 1
             }
@@ -646,6 +650,10 @@ impl AppState {
         if let Some(form) = &mut self.form {
             form.kind = parsed.kind;
             form.tls = parsed.tls;
+            // Carried, not derived: `mongodb+srv` cannot be rebuilt from a host
+            // and a port, and losing it turns every Atlas string into a
+            // `mongodb://cluster.example.net:27017` that resolves to nothing.
+            form.srv = parsed.srv;
             form.test = TestState::Idle;
         }
         cx.notify();

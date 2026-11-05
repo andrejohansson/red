@@ -1119,12 +1119,30 @@ fn bson_to_doc(b: Bson) -> DocValue {
         Bson::Document(d) => {
             DocValue::Document(d.into_iter().map(|(k, v)| (k, bson_to_doc(v))).collect())
         }
-        // Legacy/edge types with no dedicated mirror arm.
-        Bson::Symbol(s) | Bson::JavaScriptCode(s) => DocValue::Str(s),
-        Bson::JavaScriptCodeWithScope(c) => DocValue::Str(c.code),
-        Bson::MinKey => DocValue::Str("MinKey".into()),
-        Bson::MaxKey => DocValue::Str("MaxKey".into()),
-        Bson::DbPointer(_) => DocValue::Null,
+        // Legacy and sentinel types, carried opaquely as the extended JSON that
+        // spells them. Folding them to strings (which is what happened before) was
+        // not only a display compromise: RED writes documents back with a whole
+        // `replace`, so opening a document holding a `MinKey` and editing an
+        // unrelated field rewrote that `MinKey` as the string `"MinKey"`. Round
+        // -tripping the extjson keeps the value the value it was.
+        other => {
+            let tag = match &other {
+                Bson::Symbol(_) => "symbol",
+                Bson::JavaScriptCode(_) => "code",
+                Bson::JavaScriptCodeWithScope(_) => "codeWithScope",
+                Bson::MinKey => "minKey",
+                Bson::MaxKey => "maxKey",
+                Bson::DbPointer(_) => "dbPointer",
+                // Every representable arm is matched above, so this is only ever
+                // reached by a *new* BSON type from a future driver release; the
+                // canonical extjson still spells it, whatever it is.
+                _ => "unknown",
+            };
+            DocValue::Other {
+                tag: tag.to_string(),
+                json: other.into_canonical_extjson().to_string(),
+            }
+        }
     }
 }
 
@@ -1166,6 +1184,15 @@ fn doc_to_bson(v: &DocValue) -> Bson {
                 .map(|(k, val)| (k.clone(), doc_to_bson(val)))
                 .collect(),
         ),
+        // Parsed back through the same extended-JSON reader the raw editor uses,
+        // so the value that came off the wire is the value that goes back on it. A
+        // text that no longer parses (only reachable if it was hand-edited into
+        // nonsense) degrades to a string rather than failing the whole write, which
+        // is the same posture the `Decimal128` arm takes.
+        DocValue::Other { json, .. } => serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|v| Bson::try_from(v).ok())
+            .unwrap_or_else(|| Bson::String(json.clone())),
     }
 }
 
@@ -1468,6 +1495,38 @@ fn replica_set_metrics(rs: &BsonDocument, snap: &mut red_core::server::ServerSna
 
 #[cfg(test)]
 mod tests {
+
+    /// RED writes a document back with a whole `replace`, so every value it cannot
+    /// represent is a value it *destroys* on the next save of any field. The
+    /// legacy and sentinel types used to fold to strings; they now round-trip.
+    #[test]
+    fn legacy_bson_types_survive_a_read_write_round_trip() {
+        use mongodb::bson::{Bson, JavaScriptCodeWithScope, doc};
+
+        let cases: Vec<Bson> = vec![
+            Bson::MinKey,
+            Bson::MaxKey,
+            Bson::Symbol("legacy".into()),
+            Bson::JavaScriptCode("function () { return 1 }".into()),
+            Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+                code: "function () { return x }".into(),
+                scope: doc! { "x": 1 },
+            }),
+        ];
+        for original in cases {
+            let mirrored = super::bson_to_doc(original.clone());
+            assert!(
+                matches!(mirrored, DocValue::Other { .. }),
+                "{original:?} must be carried opaquely, not folded"
+            );
+            let back = super::doc_to_bson(&mirrored);
+            assert_eq!(
+                back.into_canonical_extjson(),
+                original.into_canonical_extjson(),
+                "the value that came off the wire must be the value that goes back"
+            );
+        }
+    }
     use super::*;
     use mongodb::bson::{Binary, spec::BinarySubtype};
 
@@ -1711,7 +1770,7 @@ mod tests {
             match test_url() {
                 Some(u) => u,
                 None => {
-                    eprintln!("SKIP {}: RED_TEST_MONGO_URL not set", module_path!());
+                    crate::conformance::skip_or_fail("RED_TEST_MONGO_URL", module_path!());
                     return;
                 }
             }

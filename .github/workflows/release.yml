@@ -4,11 +4,45 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write   # create the GitHub Release + upload assets
+# Least privilege at the top: a job that only compiles needs nothing at all, and
+# the three that publish grant themselves `contents: write` individually. Granted
+# workflow-wide it also covered every third-party action these jobs run.
+permissions: {}
 
 jobs:
+  # The gate. A release is a build users cannot easily undo, so it does not ship
+  # until the same checks `ci.yml` runs on a pull request have passed on the tag
+  # itself - a tag can point at a commit CI never saw.
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang cmake protobuf-compiler \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-shm0-dev \
+            libasound2-dev libssl-dev libvulkan-dev libgbm-dev libdbus-1-dev
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
   macos:
+    needs: verify
+    permissions:
+      contents: write   # create the GitHub Release + upload assets
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +139,9 @@ jobs:
           fail_on_unmatched_files: true
 
   linux:
+    needs: verify
+    permissions:
+      contents: write
     # Built on the oldest supported runner so the AppImage links against an older
     # glibc and runs on a wider range of desktops. No self-update yet (manual
     # download) — see docs/plans/future/cross-platform.md.
@@ -129,6 +166,10 @@ jobs:
             librsvg2-bin libfuse2
 
       - name: Build AppImage
+        env:
+          # `continuous` is a moving tag, so the packaging tool is pinned by digest
+          # rather than by URL; see `scripts/bundle-linux.sh`. Bump deliberately.
+          APPIMAGETOOL_SHA256: ${{ vars.APPIMAGETOOL_SHA256 }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ./scripts/bundle-linux.sh "$VERSION"
@@ -143,6 +184,9 @@ jobs:
           fail_on_unmatched_files: true
 
   windows:
+    needs: verify
+    permissions:
+      contents: write
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

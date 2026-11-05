@@ -10,9 +10,9 @@
 #      *[other] { $n } rows
 #   }
 
-result-pin_limit = [Síx píññéd röws ís thé máxímúm; úñpíñ öñé tö píñ áñöthér]
-
 result-unpin_row = [Úñpíñ röw]
+
+result-pin_limit = [Síx píññéd röws ís thé máxímúm; úñpíñ öñé tö píñ áñöthér]
 
 result-empty_hint = [Döúblé-çlíçk á táblé ör rúñ á qúéry tö séé röws]
 

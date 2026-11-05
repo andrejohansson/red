@@ -65,6 +65,23 @@ pub(in crate::ai) fn truncate_summary(s: &str, max: usize) -> String {
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{cut}…")
 }
+/// [`truncate_summary`] for text in an **approval prompt**, where the whole
+/// payload runs whatever the dialog can show.
+///
+/// A trailing `…` is the right marker for a log line and the wrong one here: the
+/// user is being asked to vouch for the payload, and a single ellipsis at the end
+/// of a wall of JSON does not read as "and 40 kilobytes you cannot see". This
+/// says how much is hidden, in a sentence, so the decision is made knowing it is
+/// partial.
+pub(in crate::ai) fn truncate_for_approval(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let hidden = total - max;
+    format!("{cut}\n… and {hidden} more character(s) not shown here, which will also run.")
+}
 /// Coarse human byte count for the agent's text output, shared by every seam's
 /// formatter.
 pub(in crate::ai) fn fmt_bytes(n: u64) -> String {
@@ -192,6 +209,28 @@ const KNOWLEDGE_HEADING: &str = "\n\nWhat the user has told us about this databa
 
 #[cfg(test)]
 mod tests {
+
+    /// An approval prompt asks the user to vouch for the *whole* payload. A
+    /// trailing ellipsis on a wall of JSON does not read as "and 40 kilobytes you
+    /// cannot see", so the marker says how much is hidden.
+    #[test]
+    fn an_approval_prompt_says_how_much_it_is_not_showing() {
+        let short = "SET k v";
+        assert_eq!(truncate_for_approval(short, 80), short);
+
+        let long = "x".repeat(200);
+        let out = truncate_for_approval(&long, 80);
+        assert!(out.starts_with(&"x".repeat(80)));
+        assert!(out.contains("120 more character(s)"), "{out}");
+        assert!(out.contains("will also run"), "{out}");
+
+        // Counted in characters, not bytes, so a multibyte payload is not cut
+        // mid-codepoint and the count is the one a person would make.
+        let emoji = "🙂".repeat(10);
+        let out = truncate_for_approval(&emoji, 4);
+        assert_eq!(out.chars().take(4).collect::<String>(), "🙂🙂🙂🙂");
+        assert!(out.contains("6 more character(s)"), "{out}");
+    }
     use super::*;
 
     #[test]

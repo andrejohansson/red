@@ -19,7 +19,7 @@
 //! renders itself, owns its subscriptions, and reports what happened by emitting
 //! [`KnowledgeEditorEvent`] rather than by reaching into [`AppState`]. It is the
 //! first surface in RED extracted this way (see
-//! `docs/plans/todo/zed-architecture-inspiration.md`, Tier 1), and the pattern
+//! the view-per-surface extraction), and the pattern
 //! the rest should copy:
 //!
 //! - **State and behaviour live together.** Saving is `KnowledgeEditor::save`,
@@ -253,16 +253,10 @@ impl Render for KnowledgeEditor {
         // (which threads an event) cannot satisfy. A weak handle it is.
         let close_view = cx.entity().downgrade();
 
-        // The wrapper carries the key context so bindings can scope to this
-        // surface. It repeats the scrim's own `absolute().inset_0()` geometry so
-        // the modal it contains lays out exactly as it did when the app rendered
-        // it directly.
-        // `absolute()` is paired with an explicit `size_full()`, not with
-        // `inset_0()`: insets alone leave the box zero-height (the layout test
-        // catches exactly that), which would collapse the absolutely-positioned
-        // scrim inside it. Same pairing Zed uses for its own overlays.
         div()
             .absolute()
+            .top_0()
+            .left_0()
             .size_full()
             .key_context("KnowledgeEditor")
             // Lets the layout test assert this wrapper still covers the window.
@@ -646,6 +640,62 @@ mod tests {
              was wrapped: an absolutely-positioned child lays out against this box, \
              so any other size would collapse the modal inside it"
         );
+    }
+
+    #[gpui::test]
+    fn the_modal_draws_at_the_origin_when_mounted_beside_a_full_screen_shell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Host {
+            editor: Entity<KnowledgeEditor>,
+        }
+        impl Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .relative()
+                    .child(div().size_full().child("shell"))
+                    .child(self.editor.clone())
+            }
+        }
+
+        let id = test_conn_id("mounted");
+        cx.update(|cx| cx.set_global(crate::theme::one_dark()));
+        let window = cx.add_window(|_window, cx| {
+            let modal_focus = cx.focus_handle();
+            let editor = cx.new(|cx| {
+                KnowledgeEditor::new(
+                    id,
+                    SharedString::from("Acme"),
+                    "# Acme".to_string(),
+                    false,
+                    modal_focus,
+                    cx,
+                )
+            });
+            Host { editor }
+        });
+        let viewport = window
+            .update(cx, |_this, window, _cx| window.viewport_size())
+            .expect("the window is live");
+
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let root = cx
+            .debug_bounds("knowledge-editor-root")
+            .expect("the modal drew beside the shell");
+        assert_eq!(
+            root.origin,
+            gpui::Point::default(),
+            "an absolutely-positioned box with `auto` insets takes its static \
+             position, which put the modal a whole viewport below the window"
+        );
+        assert_eq!(root.size, viewport);
     }
 
     #[gpui::test]

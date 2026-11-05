@@ -1,0 +1,58 @@
+name: Cross-platform build
+
+# Compile-only guard that the Linux and Windows GPUI backends keep building
+# (a macOS-only API, a missing cfg arm). Deliberately NOT on push/PR: a cold
+# cache means a full GPUI build per runner, which cost 20-35 min per branch and
+# dominated CI wall-clock. Behaviour is verified by the macOS job in ci.yml.
+#
+# Weekly is enough because the only consumer of a green Linux/Windows build is
+# `release.yml`, which builds both at tag time. This catches platform rot days
+# before a tag instead of halfway through a release, when the macOS DMG has
+# already been notarized and published.
+on:
+  schedule:
+    - cron: "0 4 * * 1"   # Mondays 04:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: cross-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  cross:
+    name: cross-platform build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GPUI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang cmake protobuf-compiler \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-shm0-dev \
+            libasound2-dev libssl-dev libvulkan-dev libgbm-dev libdbus-1-dev
+
+      - name: Build (red app)
+        run: cargo build -p red --locked

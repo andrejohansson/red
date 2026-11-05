@@ -60,6 +60,10 @@ pub(super) async fn discover_cluster(
         masters.push(node_conn);
     }
     Ok(ClusterState {
+        addrs: masters_addr
+            .iter()
+            .map(|(h, p)| format!("{h}:{p}"))
+            .collect(),
         masters,
         slot_owner,
     })

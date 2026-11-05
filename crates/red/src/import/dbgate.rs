@@ -126,6 +126,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 proxy: None,
                 sentinel_master: String::new(),
                 credentials_path: String::new(),
+                srv: false,
             },
             source_name: name,
             folder: None,
@@ -183,10 +184,15 @@ fn simple_decrypt(key: &str, token: &str) -> Result<String> {
     let crypto_key = Sha256::digest(key.as_bytes());
     let token = token.trim();
     // Default (hmac on): [hmac 64 hex][iv 32 hex][ciphertext base64].
-    if token.len() < 64 + 32 {
+    //
+    // Split with `split_at_checked`, not a byte-length check plus `split_at`: the
+    // length says the bytes are there, not that byte 64 is a character boundary,
+    // and a malformed token with a multibyte character across it panics `split_at`
+    // on the UI thread. A token that is not hex here fails the decode below
+    // anyway; the point is to fail it as an error rather than a crash.
+    let Some((hmac_hex, rest)) = token.split_at_checked(64) else {
         bail!("token too short for hmac + iv");
-    }
-    let (hmac_hex, rest) = token.split_at(64);
+    };
     let expected = hex::decode(hmac_hex).context("decode hmac hex")?;
     #[allow(
         clippy::expect_used,
@@ -198,7 +204,9 @@ fn simple_decrypt(key: &str, token: &str) -> Result<String> {
     mac.verify_slice(&expected)
         .map_err(|_| anyhow!("HMAC verification failed (wrong key?)"))?;
 
-    let (iv_hex, ct_b64) = rest.split_at(32);
+    let Some((iv_hex, ct_b64)) = rest.split_at_checked(32) else {
+        bail!("token too short for hmac + iv");
+    };
     let iv = hex::decode(iv_hex).context("decode iv hex")?;
     let ct = BASE64.decode(ct_b64).context("decode ciphertext base64")?;
     let plain = Aes256CbcDec::new_from_slices(crypto_key.as_slice(), &iv)

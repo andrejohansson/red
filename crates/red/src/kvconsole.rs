@@ -5,7 +5,10 @@
 //! a reply to the wrong entry.
 
 use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px};
-use red_core::kv::{OpClass, RespValue, classify_command, tokenize_command};
+use red_core::kv::{
+    OpClass, RespValue, classify_command, connection_state_refusal, redact_secrets,
+    tokenize_command,
+};
 use red_service::{Command, SessionId};
 
 use flint::prelude::*;
@@ -284,6 +287,19 @@ fn parse_batch(text: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// How a command is written to the persisted query history.
+///
+/// The history file is read back by the History dock *and* handed to the
+/// assistant as grounding, so a line carrying a password would otherwise be
+/// stored in clear and then quoted into a model's context. The command stays
+/// legible; only the secret is replaced. See `red_core::kv::redact_secrets`.
+fn history_line(argv: &[String]) -> String {
+    match redact_secrets(argv) {
+        Some(safe) => crate::kvbrowse::join_redis_argv(&safe),
+        None => crate::kvbrowse::join_redis_argv(argv),
+    }
+}
+
 impl AppState {
     /// A line was submitted: tokenize it, and either send it straight away
     /// (read/write) or park it behind a confirm (destructive).
@@ -295,6 +311,13 @@ impl AppState {
     ) {
         let argv = tokenize_command(&line);
         if argv.is_empty() {
+            return;
+        }
+        // Refused, not confirmed: these change the shared connection itself, and a
+        // user cannot meaningfully approve damage to a connection they can't see.
+        // Answered in the scrollback, where the command was typed.
+        if let Some(why) = connection_state_refusal(&argv) {
+            self.kv_console_refuse(session, argv, why, cx);
             return;
         }
         let Some(console) = self
@@ -338,6 +361,38 @@ impl AppState {
         cx.notify();
     }
 
+    /// Answer a refused command in the scrollback, so the console reads as a
+    /// console: the line the user typed, then why it did not run. Never sent, and
+    /// never recorded in history.
+    fn kv_console_refuse(
+        &mut self,
+        session: SessionId,
+        argv: Vec<String>,
+        why: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
+            return;
+        };
+        console.recall = None;
+        let req = console.next_req;
+        console.next_req += 1;
+        console.history.push(KvConsoleEntry {
+            argv,
+            req,
+            result: Some(Err(why)),
+        });
+        if console.history.len() > MAX_CONSOLE_HISTORY {
+            let drop = console.history.len() - MAX_CONSOLE_HISTORY;
+            console.history.drain(0..drop);
+        }
+        cx.notify();
+    }
+
     fn kv_console_send(&mut self, session: SessionId, argv: Vec<String>, cx: &mut Context<Self>) {
         // Log the executed command in the shared query-history store (the same
         // store SQL uses — it's just text keyed by `conn_id`). The History dock's
@@ -347,9 +402,8 @@ impl AppState {
             .map(|a| a.conn_id.clone())
             .unwrap_or_default();
         if !conn_id.is_empty() {
-            self.query_history.update(cx, |store, _| {
-                store.record(&conn_id, &crate::kvbrowse::join_redis_argv(&argv))
-            });
+            self.query_history
+                .update(cx, |store, _| store.record(&conn_id, &history_line(&argv)));
         }
         let Some(console) = self
             .conn_mut(Some(session))
@@ -465,7 +519,7 @@ impl AppState {
         if !conn_id.is_empty() {
             self.query_history.update(cx, |store, _| {
                 for argv in &commands {
-                    store.record(&conn_id, &crate::kvbrowse::join_redis_argv(argv));
+                    store.record(&conn_id, &history_line(argv));
                 }
             });
         }

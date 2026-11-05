@@ -394,6 +394,9 @@ fn installed_app_root() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let app = exe.parent()?.parent()?.parent()?; // …/RED.app
     let is_bundle = app.extension().and_then(|e| e.to_str()) == Some("app");
+    // `starts_with` on a `Path` compares whole components, so this is
+    // `/Applications/…` and not the `/ApplicationsX` a string prefix would also
+    // match. Kept explicit because the two read identically.
     let writable = app.starts_with("/Applications")
         && app
             .parent()
@@ -552,20 +555,26 @@ fn verify_authentic(mounted_app: &Path, running_app: &Path) -> Result<(), String
 
     let theirs = team_identifier(mounted_app)
         .ok_or("downloaded bundle has no Team ID; refusing to install")?;
-    // The running app passed Gatekeeper at launch; if we can read its Team ID,
-    // require a match. If we can't (an unsigned dev build, or a codesign-output
-    // change), the signature + spctl checks above still stand on their own, but
-    // log it, since it's the anti-substitution control silently dropping out.
-    match team_identifier(running_app) {
-        Some(ours) if theirs != ours => {
-            return Err(format!(
-                "downloaded bundle Team ID ({theirs}) does not match the installed app ({ours})"
-            ));
-        }
-        Some(_) => {}
-        None => tracing::warn!(
-            "could not read the running app's Team ID; installing on signature + notarization alone"
-        ),
+    // The running app passed Gatekeeper at launch, so it has a Team ID; requiring
+    // the download's to match it is the anti-substitution control - what stops a
+    // *validly signed and notarized bundle belonging to somebody else* from being
+    // installed over RED.
+    //
+    // Failing open when the running app's Team ID is unreadable would make the
+    // whole control conditional on a `codesign` invocation succeeding, which is
+    // the wrong way round: an unreadable Team ID is the state an attacker who can
+    // interfere with the process wants. So it refuses, and says how to proceed
+    // deliberately. The one legitimate case is a build that was never signed (a
+    // `cargo run` dev build), and that build has no `/Applications` bundle to
+    // replace either - `installed_app_root` already declines it.
+    let ours = team_identifier(running_app).ok_or(
+        "could not read the installed app's Team ID, so the downloaded bundle cannot be checked \
+         against it; download the update manually instead",
+    )?;
+    if theirs != ours {
+        return Err(format!(
+            "downloaded bundle Team ID ({theirs}) does not match the installed app ({ours})"
+        ));
     }
     Ok(())
 }

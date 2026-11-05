@@ -1237,8 +1237,14 @@ impl DatabaseDriver for BigqueryDriver {
         let head = self.results(&job, None, None, 0).await?;
         let names: Vec<String> = head.columns.iter().map(|c| c.name.clone()).collect();
         let file = std::fs::File::create(path).map_err(driver_err)?;
-        let mut writer = ExportWriter::begin(std::io::BufWriter::new(file), format, names, path)
-            .map_err(driver_err)?;
+        let mut writer = ExportWriter::begin(
+            std::io::BufWriter::new(file),
+            format,
+            names,
+            path,
+            DbKind::Bigquery,
+        )
+        .map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         let mut token: Option<String> = None;

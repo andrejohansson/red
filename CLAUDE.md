@@ -9,9 +9,11 @@
 - **GPUI main thread** renders all UI; a **Tokio backend thread** (`red-service`)
   owns database sessions + the query lifecycle. They talk over channels
   (`Command` UI→service, `Event` service→UI). The UI never blocks on the backend.
-- Crate map: `red` (app binary) · `red-core` (shared domain types, no UI/runtime)
-  · `red-driver` (`DatabaseDriver` trait + engine impls) · `red-service` (backend
-  thread + bridge).
+- Crate map: `red` (app binary + CLI) · `red-core` (shared domain types, no
+  UI/runtime) · `red-driver` (the `DatabaseDriver`/`KvDriver`/`DocDriver` seams +
+  engine impls) · `red-service` (backend thread, bridge, AI gate, MCP/ACP hosts)
+  · `red-config` (connections, keychain, history — UI-free so the CLI shares it)
+  · `red-ai` (Claude API client) · `red-acp` (ACP subprocess client).
 - UI components + theme come from **Flint** (`../flint`), the shared in-house
   GPUI library.
 - `red-core` holds types with no UI/runtime knowledge; the driver/service run on

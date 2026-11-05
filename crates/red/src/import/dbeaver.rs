@@ -130,6 +130,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 proxy: None,
                 sentinel_master: String::new(),
                 credentials_path: String::new(),
+                srv: false,
             },
             source_name: name,
             folder: conn.folder.clone(),

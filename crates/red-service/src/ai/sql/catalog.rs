@@ -184,16 +184,17 @@ pub(in crate::ai) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 default it only PLANS (nothing executes). Pass `analyze: true` to run the \
                 statement and get actual row counts and timings beside the estimates — that \
                 comparison is what makes plan reasoning real, and it is the way to prove a bad \
-                cardinality estimate. Because EXPLAIN ANALYZE executes, it is allowed for \
-                read-only statements ONLY; anything that could write is refused outright."
+                cardinality estimate. The statement must be a single read either way: one \
+                SELECT (or a CTE resolving to one), no `;`, no write. Pass the bare statement, \
+                not an EXPLAIN of it."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string", "description": "The SQL to explain." },
+                    "sql": { "type": "string", "description": "The single read to explain." },
                     "analyze": {
                         "type": "boolean",
-                        "description": "Run the statement to collect actuals (read-only statements only). Default false.",
+                        "description": "Run the statement to collect actuals. Default false.",
                     },
                 },
                 "required": ["sql"],

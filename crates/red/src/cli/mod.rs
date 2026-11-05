@@ -190,6 +190,23 @@ struct ExecArgs {
     yes: bool,
 }
 
+/// The verbs that mean "run headless and exit" rather than "open the window".
+///
+/// Kept in step with [`Verb`] by `every_subcommand_is_a_recognised_verb`: a verb
+/// missing here does not error, it silently launches the GUI, which is how
+/// `red transfer` came to be unreachable from the command line.
+const VERBS: &[&str] = &[
+    "connections",
+    "test",
+    "query",
+    "exec",
+    "copy",
+    "migrate",
+    "reset",
+    "transfer",
+    "mcp",
+];
+
 /// Entry point from `main`. Returns `Some(code)` when a CLI verb ran (the caller
 /// exits with it), or `None` to fall through and open the desktop app.
 pub fn run() -> Option<u8> {
@@ -197,16 +214,6 @@ pub fn run() -> Option<u8> {
     // leading global flag like `--quiet` doesn't hide it), or a help/version flag
     // is present. A bare launch (or a stray token like macOS's `-psn_…`) falls
     // through to the GUI untouched.
-    const VERBS: &[&str] = &[
-        "connections",
-        "test",
-        "query",
-        "exec",
-        "copy",
-        "migrate",
-        "reset",
-        "mcp",
-    ];
     let args: Vec<String> = std::env::args().skip(1).collect();
     let first_positional = args.iter().find(|a| !a.starts_with('-'));
     let is_verb = first_positional.is_some_and(|a| VERBS.contains(&a.as_str()) || a == "help");
@@ -361,7 +368,7 @@ fn cmd_query(args: QueryArgs) -> u8 {
     let assessment = red_core::sql::assess(&sql, dialect);
     if assessment.level >= red_core::sql::RiskLevel::Risky {
         let what = assessment
-            .confirm_target()
+            .confirm_text()
             .map(|t| format!(" (targets `{t}`)"))
             .unwrap_or_default();
         if let Some(code) = confirm_destructive(
@@ -800,4 +807,25 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| format!("cannot read stdin: {e}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, VERBS};
+    use clap::CommandFactory;
+
+    /// `VERBS` is what decides whether argv is a headless run or a GUI launch, and
+    /// it is a hand-written copy of [`Verb`]'s variants. A verb missing from it
+    /// does not produce an error - the window opens instead, which is what
+    /// `red transfer` did.
+    #[test]
+    fn every_subcommand_is_a_recognised_verb() {
+        for sub in Cli::command().get_subcommands() {
+            assert!(
+                VERBS.contains(&sub.get_name()),
+                "`red {}` is a subcommand but not in VERBS, so it opens the GUI",
+                sub.get_name()
+            );
+        }
+    }
 }

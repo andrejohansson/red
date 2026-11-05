@@ -48,13 +48,19 @@ kv-commands_ready = [{ $count } { $unit }(s) réády tö rúñ]
 
 kv-import_destructive = [{ $count } déstrúçtívé çömmáñd(s) íñ thís fílé:]
 
+kv-import_ack = [Rúñ thésé çömmáñds ágáíñst thís sérvér]
+
 kv-import_keys = [Ímpört kéys]
 
 kv-export_keys = [Éxpört kéys]
 
 kv-this_cant_be_undone = [Thís çáñ't bé úñdöñé.]
 
+kv-json_delete_cant_be_undone = [Délétíñg íñsídé á JSÖÑ döçúméñt tákés ñö réçyçlé-bíñ sñápshöt, sö thís çáñ't bé úñdöñé.]
+
 kv-delete_key = [Délété kéy]
+
+kv-delete_json_node = [Délété JSÖÑ ñödé]
 
 kv-rename_key = [Réñámé kéy]
 
@@ -86,7 +92,9 @@ kv-copied_one_key = [Çöpíéd 1 kéy]
 
 kv-copied_keys_ok = [Çöpíéd { $copied } kéys]
 
-kv-copied_keys = [Çöpíéd { $copied } kéy(s), { $failed } fáíléd]
+kv-copied_keys_skipped = [Çöpíéd { $copied } kéy(s). { $skipped } álréády éxístéd öñ thé tárgét áñd wéré léft ás théy áré; délété thém théré fírst tö répláçé thém.]
+
+kv-copied_keys = [Çöpíéd { $copied } kéy(s), { $failed } fáíléd, { $skipped } álréády éxístéd]
 
 kv-note = [ñöté…]
 

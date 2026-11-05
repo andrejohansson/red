@@ -50,13 +50,35 @@ EOF
 chmod +x "$APPDIR/AppRun" "$APPDIR/usr/bin/RED"
 
 # appimagetool: prefer one on PATH, else fetch the official AppImage into build/.
+#
+# The download is pinned by digest, not just by URL. `continuous` is a *moving*
+# tag - the same URL serves different bytes on different days - so an unpinned
+# fetch means the tool that assembles a signed-adjacent release artifact is
+# whatever that repository published most recently. Bump `APPIMAGETOOL_SHA256`
+# deliberately when bumping the tool, the same way a lockfile is bumped.
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+APPIMAGETOOL_SHA256="${APPIMAGETOOL_SHA256:-}"
 TOOL="$(command -v appimagetool || true)"
 if [[ -z "$TOOL" ]]; then
   TOOL="$BUILD/appimagetool-x86_64.AppImage"
   if [[ ! -x "$TOOL" ]]; then
     echo "▸ downloading appimagetool"
-    curl -fsSL -o "$TOOL" \
-      "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+    curl -fsSL --proto '=https' --proto-redir '=https' -o "$TOOL" "$APPIMAGETOOL_URL"
+    if [[ -n "$APPIMAGETOOL_SHA256" ]]; then
+      echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum --check --status || {
+        echo "appimagetool digest mismatch; refusing to package with it" >&2
+        echo "  expected $APPIMAGETOOL_SHA256" >&2
+        echo "  got      $(sha256sum "$TOOL" | cut -d" " -f1)" >&2
+        rm -f "$TOOL"
+        exit 1
+      }
+    else
+      # Not fatal for a local build, where the operator can see what they fetched;
+      # the release workflow sets the variable, so a release never packages with
+      # an unverified tool.
+      echo "⚠ APPIMAGETOOL_SHA256 is unset; packaging with an unverified appimagetool" >&2
+      echo "  digest of what was downloaded: $(sha256sum "$TOOL" | cut -d" " -f1)" >&2
+    fi
     chmod +x "$TOOL"
   fi
 fi

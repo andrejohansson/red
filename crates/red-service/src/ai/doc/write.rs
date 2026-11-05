@@ -16,7 +16,7 @@ use red_driver::DocDriver;
 use serde_json::Value as Json;
 
 use super::super::gate::WriteAssessment;
-use super::super::util::truncate_summary;
+use super::super::util::truncate_for_approval;
 use red_core::RedError;
 
 // ============================================================================
@@ -75,7 +75,10 @@ pub(in crate::ai) fn assess_doc_write(name: &str, input: &Json) -> WriteAssessme
     // privilege escalation they never saw. What executes must be derived into what
     // is shown — the same rule the `kv_delete` prompt now follows.
     let payload = |key: &str| match input.get(key) {
-        Some(v) => format!("\n{}", truncate_summary(&v.to_string(), DOC_PAYLOAD_CHARS)),
+        Some(v) => format!(
+            "\n{}",
+            truncate_for_approval(&v.to_string(), DOC_PAYLOAD_CHARS)
+        ),
         None => String::new(),
     };
     match name {
@@ -151,10 +154,15 @@ pub(in crate::ai) fn assess_doc_write(name: &str, input: &Json) -> WriteAssessme
                     "\n\u{26a0} An interrupted multi-document write is NOT rolled back: what it \
                      already changed stays changed.",
                 );
+                // Labelled as the agent's claim, not stated as fact: the
+                // executor matches the operation by id alone and never checks this
+                // text against it, so a wrong (or invented) description here would
+                // read as verified and be the thing the user approved on.
                 match s("command") {
                     Some(cmd) => op.push_str(&format!(
-                        "\nRunning: {}",
-                        truncate_summary(cmd, DOC_PAYLOAD_CHARS)
+                        "\nThe agent says it is running: {}\n(RED has not checked this against \
+                         the server; read doc_current_op to confirm.)",
+                        truncate_for_approval(cmd, DOC_PAYLOAD_CHARS)
                     )),
                     None => op.push_str(
                         "\nThe agent did not say what this operation is; read doc_current_op \

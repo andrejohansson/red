@@ -230,14 +230,27 @@ impl AppState {
         if tab.is_view() {
             return Err("this tab has no query to re-run");
         }
-        if tab.result.is_none() {
+        let Some(grid) = tab.result.as_ref() else {
             return Err("run the query once before watching it");
-        }
-        let sql = tab.editor.read(cx).content();
+        };
+        // Graded on the *grid's* SQL, which is what a tick re-opens. The editor's
+        // text is a different string in every case that matters: a table browse,
+        // an FK click-through and a script's trailing read all open a grid the
+        // editor never held, and an editor typed into since the run holds SQL the
+        // grid will not run. Grading the one and running the other is how an
+        // unattended re-run could reach a statement nobody vetted.
+        Self::watch_allowed_sql(grid.read(cx).base_sql(), active.config.kind)
+    }
+
+    /// Whether `sql` is something a watch may re-run unattended: one statement,
+    /// and a read.
+    ///
+    /// Split out so the arm-time check and the per-tick check below cannot drift;
+    /// the tick re-checks because a grid can be re-opened (a sort, a filter, an
+    /// FK follow) while its tab is being watched.
+    fn watch_allowed_sql(sql: &str, kind: red_core::DbKind) -> Result<(), &'static str> {
         let sql = sql.trim();
-        // A table browse's editor holds the generated SELECT, so both paths land
-        // on the same check.
-        let dialect = crate::sql::Dialect::of(active.config.kind);
+        let dialect = crate::sql::Dialect::of(kind);
         if !sql.is_empty() && !crate::sql::is_read_only(sql, dialect) {
             return Err("watch only re-runs read-only queries");
         }
@@ -340,6 +353,35 @@ impl AppState {
         let Some((tab_ix, session)) = self.watch_tab_for(epoch, cx) else {
             return;
         };
+        // Re-graded every tick, not only when the watch was armed: a grid can be
+        // re-opened while its tab is watched (a sort, a filter, an FK follow), and
+        // what a tick re-runs is whatever the grid holds *now*. A watch that has
+        // drifted onto something it may not run unattended stops rather than
+        // pausing, because there is nothing for it to wait for. Read before the
+        // mutable borrow below so the toast can be raised from `&mut self`.
+        let drifted = match &self.phase {
+            Phase::Connected(active) => active
+                .tabs
+                .get(tab_ix)
+                .and_then(|t| t.result.as_ref())
+                .and_then(|g| {
+                    Self::watch_allowed_sql(g.read(cx).base_sql(), active.config.kind).err()
+                }),
+            _ => None,
+        };
+        if let Some(why) = drifted {
+            if let Phase::Connected(active) = &mut self.phase
+                && let Some(tab) = active.tabs.get_mut(tab_ix)
+            {
+                tab.watch = None;
+            }
+            self.notify(
+                flint::ToastVariant::Warning,
+                format!("Watch stopped: {why}"),
+                cx,
+            );
+            return;
+        }
         let Phase::Connected(active) = &mut self.phase else {
             return;
         };
@@ -735,5 +777,32 @@ impl AppState {
         };
         let next = (!on).then(|| self.settings.sql.watch_default_secs.max(5));
         self.set_watch(next, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppState;
+    use red_core::DbKind;
+
+    /// A watch re-runs its statement unattended, so what it grades has to be what
+    /// it runs. The arm-time check used to read the *editor*, while the tick
+    /// re-opened the *grid* — two different strings for a table browse, an FK
+    /// follow, or an editor typed into since the run.
+    #[test]
+    fn watch_only_accepts_a_single_read() {
+        let ok = |sql: &str| AppState::watch_allowed_sql(sql, DbKind::Postgres).is_ok();
+        assert!(ok("SELECT * FROM orders"));
+        assert!(ok("  select 1 ;  "));
+        // A grid with no SQL behind it (never run) is not refused here; the caller
+        // has already required a result.
+        assert!(ok(""));
+
+        assert!(!ok("UPDATE t SET a = 1 WHERE id = 1"));
+        assert!(!ok("SELECT 1; SELECT 2"));
+        // A side-effecting SELECT is a write for this purpose, which is the whole
+        // reason the gate is `is_read_only` and not the risk grading.
+        assert!(!ok("SELECT pg_terminate_backend(1)"));
+        assert!(!ok("WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x"));
     }
 }

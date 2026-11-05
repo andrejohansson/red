@@ -281,7 +281,15 @@ pub trait KvDriver: Send + Sync {
 
     /// `SET key value` with an explicit [`StringTtl`] expiry policy. Refused on
     /// a read-only connection.
-    async fn set_string(&self, key: &str, value: String, ttl: StringTtl) -> Result<()>;
+    /// `SET key value [PX ms]`, or `SET … NX` when `create_only`, which fails with
+    /// [`RedError::Query`](red_core::RedError::Query) rather than replacing a key that already exists.
+    async fn set_string(
+        &self,
+        key: &str,
+        value: String,
+        ttl: StringTtl,
+        create_only: bool,
+    ) -> Result<()>;
 
     /// `HSET key field value`. Refused on a read-only connection.
     async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()>;

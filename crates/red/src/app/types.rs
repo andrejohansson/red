@@ -1007,6 +1007,11 @@ pub(crate) struct FormState {
     /// Encrypt the connection with TLS. Off by default; only offered for network
     /// engines.
     pub tls: bool,
+    /// MongoDB DNS-seedlist (`mongodb+srv`) connection. Not offered as a control:
+    /// it is set by pasting an Atlas connection string into the DSN mirror and
+    /// carried from there, because it is a property of *that string* rather than a
+    /// choice about a host the user typed.
+    pub srv: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
     /// Set once the user tries to Save/Connect (or Test) with missing fields.
@@ -1178,6 +1183,19 @@ impl ConfirmInput {
     }
 }
 
+/// Which destructive Redis server action a [`PendingWrite::KvServerAction`] holds.
+#[derive(Clone, Copy)]
+pub(crate) enum KvServerAction {
+    /// `CLIENT KILL ID <id>`: disconnects someone else's client.
+    KillClient(i64),
+    /// `SLOWLOG RESET`: discards the server's slow-command log, which is not
+    /// recoverable and may be the thing an operator is reading.
+    ResetSlowlog,
+    /// `CONFIG SET notify-keyspace-events <flags>`: a server-wide setting change
+    /// that costs every client a little throughput.
+    EnableKeyspaceNotifications,
+}
+
 /// A [`PendingWrite`] together with the connection it belongs to.
 ///
 /// The session is stamped when the confirm is *raised*, and the write is sent to
@@ -1276,6 +1294,23 @@ pub(crate) enum PendingWrite {
         who: String,
         /// The statement being stopped, for the preview pane.
         query: String,
+    },
+    /// A destructive Redis *server* action raised from one of the panels: the
+    /// Monitor's client kill and slow-log reset, and the Keyspace panel's
+    /// `CONFIG SET notify-keyspace-events`.
+    ///
+    /// These reach past the keyspace into the server's own state - disconnecting
+    /// somebody else's client, discarding the diagnostic log an operator may be
+    /// mid-investigation on, changing a server-wide setting - which is the same
+    /// class the Server panel's kill is already gated as. They are held here as
+    /// *parameters* rather than a built `Command` because `Command` is not
+    /// `Clone`; the arm in `confirm_destructive` rebuilds it, and is the only place
+    /// that sends them.
+    KvServerAction {
+        epoch: red_service::Epoch,
+        action: KvServerAction,
+        /// What is about to happen, in the user's terms.
+        prose: String,
     },
     /// A confirmed table copy (result → another table). Carries everything to fire
     /// `Command::CopyToTable` on confirm plus the precomputed `prose`/`preview` (the
@@ -2140,7 +2175,7 @@ impl ActiveConn {
     /// The one place that leases the grid entity: call sites were reshaped into
     /// this closure form *before* `result` became an `Entity<ResultGrid>`, so the
     /// flip changed this body alone. See
-    /// `docs/plans/todo/zed-architecture-inspiration.md` (Stage A.5).
+    /// the view-per-surface extraction.
     pub(crate) fn with_active_result<R>(
         &mut self,
         cx: &mut App,

@@ -355,7 +355,9 @@ pub(super) async fn kv_apply_set(driver: &Arc<dyn KvDriver>, plan: &KvSetPlan) -
         |n: usize, e: RedError| (format!("error: after {n} write(s) to `{key}`: {e}"), false);
     match &plan.body {
         KvSetBody::Str { value, ttl } => {
-            if let Err(e) = driver.set_string(key, value.clone(), *ttl).await {
+            // The agent's `kv_set` is an assignment, not a create: it has already
+            // been through the approval prompt naming the key.
+            if let Err(e) = driver.set_string(key, value.clone(), *ttl, false).await {
                 return failed(0, e);
             }
             done = 1;

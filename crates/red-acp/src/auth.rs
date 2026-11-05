@@ -11,8 +11,8 @@
 //! - `auth login --claudeai` → a **paste-code** OAuth flow: it opens the browser
 //!   to an authorize URL, then waits on **stdin** for the code the browser shows.
 //!   There is no localhost auto-callback variant, so RED drives it: read the URL
-//!   off stdout ([`run_login`] emits [`LoginEvent::Url`]), let the user authorize,
-//!   then feed the code back over stdin (the `code` receiver).
+//!   off its output ([`run_login`] emits [`LoginEvent::Url`]), let the user
+//!   authorize, then feed the code back over stdin (the `code` receiver).
 //! - `auth logout` → clears the stored credential.
 //!
 //! RED never sees the OAuth tokens: the bundled CLI owns them.
@@ -47,6 +47,13 @@ const LOGIN_FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cap on captured stderr used to explain a failed sign-in, so a chatty agent
 /// can't grow the buffer without bound.
 const STDERR_CAP: usize = 4096;
+
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
+struct OutLine {
+    stderr: bool,
+    text: String,
+}
 
 /// The agent's `auth status --json` payload: who (if anyone) is signed in. Unknown
 /// fields are ignored; every field defaults so a `{"loggedIn": false}` still parses.
@@ -182,28 +189,26 @@ async fn run_login_inner(
     #[allow(clippy::expect_used, reason = "stdio was configured piped() above")]
     let stderr = child.stderr.take().expect("piped stderr");
 
-    // Drain stderr into a capped buffer so a failed exchange can be explained.
     let errbuf = Arc::new(Mutex::new(String::new()));
-    {
+    let (line_tx, mut lines) = mpsc::unbounded_channel::<OutLine>();
+    spawn_line_reader(stdout, false, line_tx.clone());
+    spawn_line_reader(stderr, true, line_tx);
+
+    let url = match read_until_url(&mut lines, &errbuf, LOGIN_URL_TIMEOUT).await {
+        Ok(url) => url,
+        Err(reason) => return Err(explain_early_exit(&mut child, &errbuf, reason).await),
+    };
+    let _ = events.send(LoginEvent::Url(url));
+    let drain = {
         let errbuf = errbuf.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let mut buf = errbuf.lock().unwrap_or_else(|p| p.into_inner());
-                if buf.len() < STDERR_CAP {
-                    buf.push_str(&line);
-                    buf.push('\n');
+            while let Some(line) = lines.recv().await {
+                if line.stderr {
+                    push_capped(&errbuf, &line.text);
                 }
             }
-        });
-    }
-
-    let mut lines = BufReader::new(stdout).lines();
-    // Phase 1: read the authorize URL off stdout (the CLI also opens the browser).
-    let url = read_until_url(&mut lines, LOGIN_URL_TIMEOUT).await?;
-    let _ = events.send(LoginEvent::Url(url));
-    // Keep draining stdout so the pipe never stalls while the user authorizes.
-    let drain = tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        })
+    };
 
     // Phase 2: the sign-in completes one of two ways, whichever happens first:
     //  - the **common** path: the user authorizes in the browser and the CLI's own
@@ -282,28 +287,70 @@ async fn run_login_inner(
     }
 }
 
-/// Read stdout lines until one carries an `https://` URL, or the stream ends / the
-/// deadline passes. Returns the bare URL.
-async fn read_until_url<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut tokio::io::Lines<R>,
+fn spawn_line_reader<R>(reader: R, stderr: bool, tx: mpsc::UnboundedSender<OutLine>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(text)) = lines.next_line().await {
+            if tx.send(OutLine { stderr, text }).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn push_capped(errbuf: &Arc<Mutex<String>>, line: &str) {
+    let mut buf = errbuf.lock().unwrap_or_else(|p| p.into_inner());
+    if buf.len() < STDERR_CAP {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+}
+
+async fn read_until_url(
+    lines: &mut mpsc::UnboundedReceiver<OutLine>,
+    errbuf: &Arc<Mutex<String>>,
     within: Duration,
 ) -> Result<String, String> {
     let scan = async {
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if let Some(url) = extract_url(&line) {
-                        return Ok(url);
-                    }
-                }
-                Ok(None) => return Err("sign-in ended before a URL appeared".to_string()),
-                Err(e) => return Err(format!("could not read sign-in output: {e}")),
+        while let Some(line) = lines.recv().await {
+            if line.stderr {
+                push_capped(errbuf, &line.text);
+            }
+            if let Some(url) = extract_url(&line.text) {
+                return Ok(url);
             }
         }
+        Err("sign-in ended before a URL appeared".to_string())
     };
     match timeout(within, scan).await {
         Ok(result) => result,
         Err(_) => Err("timed out waiting for the sign-in URL".to_string()),
+    }
+}
+
+async fn explain_early_exit(
+    child: &mut tokio::process::Child,
+    errbuf: &Arc<Mutex<String>>,
+    reason: String,
+) -> String {
+    let code = match timeout(EXIT_GRACE, child.wait()).await {
+        Ok(Ok(status)) => status.code(),
+        _ => {
+            let _ = child.start_kill();
+            None
+        }
+    };
+    let stderr = errbuf
+        .lock()
+        .map(|b| b.trim().to_string())
+        .unwrap_or_default();
+    match (code, stderr.is_empty()) {
+        (_, false) => format!("{reason}: {stderr}"),
+        (Some(code), true) => format!("{reason} (the sign-in command exited with status {code})"),
+        (None, true) => reason,
     }
 }
 
@@ -357,6 +404,36 @@ mod tests {
             Some("https://claude.com/cai/oauth/authorize?code=true&x=1")
         );
         assert_eq!(extract_url("no url here"), None);
+    }
+
+    #[tokio::test]
+    async fn finds_the_url_on_stderr_too() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let errbuf = Arc::new(Mutex::new(String::new()));
+        for text in ["npm warn exec", "Visit: https://claude.com/auth?x=1"] {
+            tx.send(OutLine {
+                stderr: true,
+                text: text.to_string(),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        let url = read_until_url(&mut rx, &errbuf, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(url, "https://claude.com/auth?x=1");
+        assert!(errbuf.lock().unwrap().contains("npm warn exec"));
+    }
+
+    #[tokio::test]
+    async fn reports_output_ending_before_a_url() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<OutLine>();
+        drop(tx);
+        let errbuf = Arc::new(Mutex::new(String::new()));
+        let err = read_until_url(&mut rx, &errbuf, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "sign-in ended before a URL appeared");
     }
 
     #[test]

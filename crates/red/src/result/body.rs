@@ -7,7 +7,7 @@
 //! and the theme, and every interaction it wires reaches the app through a weak
 //! handle rather than a `cx.listener`, so the conversion is a change of receiver
 //! rather than a rewrite. Keeping it in its own file means that change stays
-//! local. See `docs/plans/todo/zed-architecture-inspiration.md` (Stage C).
+//! local, as the view-per-surface extraction requires.
 
 use flint::TextInput;
 use flint::prelude::*;

@@ -9,7 +9,7 @@
 //! # This is a view
 //!
 //! [`HistoryPanel`] is an `Entity<HistoryPanel>` (the second surface extracted
-//! under Tier 1 of `docs/plans/todo/zed-architecture-inspiration.md`, after
+//! as part of the view-per-surface extraction, after
 //! `KnowledgeEditor`). It owns everything about the dock that is genuinely its
 //! own — the search box, the keyboard selection, which buckets are collapsed,
 //! its focus handle — and holds `Entity<QueryHistory>` so it can re-derive its

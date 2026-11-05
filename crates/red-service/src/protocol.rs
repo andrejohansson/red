@@ -938,12 +938,22 @@ pub enum Command {
     /// editor commits together on every engine whose transactions cover DDL. Replied
     /// with `Executed`.
     /// Open a manual transaction on this session, pinning a connection for its
-    /// lifetime. Every later `Execute` / `RunScript` / result open runs inside it
-    /// until `CommitTransaction` or `RollbackTransaction`.
+    /// lifetime. Every later `Execute` runs inside it until `CommitTransaction` or
+    /// `RollbackTransaction`.
     ///
     /// Refused on an engine without transactions (ClickHouse) and on a read-only
-    /// connection, where holding one could only ever end in a rollback.
-    BeginTransaction,
+    /// connection, where holding one could only ever end in a rollback. Refused
+    /// too for the write paths that cannot be routed into it - `RunScript`,
+    /// `ApplyBatch`, `Import`, `CopyToTable` - which would otherwise autocommit
+    /// *beside* the transaction while the UI showed one open.
+    ///
+    /// `namespace` binds the transaction's connection to the tab's database for
+    /// its whole life; a later `Execute` naming a different one is refused rather
+    /// than run against the wrong schema. `None` on the engines whose namespace is
+    /// fixed at connect.
+    BeginTransaction {
+        namespace: Option<String>,
+    },
     /// Commit the open transaction and return to autocommit.
     CommitTransaction,
     /// Discard the open transaction and return to autocommit.
@@ -1726,6 +1736,13 @@ pub enum Event {
     KvKeysCopied {
         copied: u64,
         failed: u64,
+        /// Keys the target already had, which were left as they were.
+        ///
+        /// The copy restores *without* `REPLACE`, so a name collision is reported
+        /// rather than resolved: overwriting a key on another server is not
+        /// something a menu item should do on the user's behalf, and it is not
+        /// undoable from there.
+        skipped: u64,
     },
     /// One Pub/Sub message, pushed for as long as the `KvSubscribe { epoch,
     /// .. }` that started it stays open.
@@ -1953,6 +1970,20 @@ pub enum Event {
     ResultRunFailed {
         epoch: Epoch,
         seq: u64,
+    },
+    /// An offset `FetchPage` failed. The offset-mode twin of `ResultRunFailed`,
+    /// and for the same reason: the grid marks a page `requested` before it asks
+    /// for it, so without a terminal event that page stays `requested` forever and
+    /// the window it covers is a blank band the grid never asks for again.
+    ResultPageFailed {
+        offset: usize,
+        epoch: Epoch,
+    },
+    /// A `CopyRows` request failed. Echoes `id` so the UI can drop the pending
+    /// copy; without it the slot stays occupied and every later copy of a
+    /// display-clipped selection is silently dropped as "not mine".
+    CopyRowsFailed {
+        id: OpId,
     },
     /// A column's aggregate summary, in response to `ColumnStats`. Echoes `epoch`
     /// and the `column` name so the grid routes it to the right result and column

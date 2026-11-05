@@ -10,7 +10,9 @@
 //! so the gate the user sees and the gate the write rides cannot drift apart.
 
 use red_ai::ToolDef;
-use red_core::sql::{DANGEROUS_FNS, Dialect, WRITE_TOKENS, has_word, strip_noise};
+use red_core::sql::{
+    AGENT_READ_LEADING, DANGEROUS_FNS, Dialect, classify, has_call, has_word, strip_noise,
+};
 use red_core::{AiPolicy, AiTier};
 use serde_json::Value as Json;
 
@@ -18,7 +20,7 @@ use super::doc::write::{assess_doc_write, is_doc_write_tool};
 use super::kv::write::{assess_kv_write, is_kv_write_tool};
 use super::sql::format::qualified;
 use super::sql::tools::index_args;
-use super::util::truncate_summary;
+use super::util::truncate_for_approval;
 
 /// Apply the two membership gates every seam's catalog shares: the tier decides
 /// which tools exist at all, and any write tool is additionally withheld on a
@@ -54,41 +56,59 @@ pub(super) fn narrow_to_subagent(catalog: Vec<ToolDef>) -> Vec<ToolDef> {
 /// check is not enough: Postgres executes **data-modifying CTEs**
 /// (`WITH x AS (DELETE … RETURNING …) SELECT * FROM x`), and `SELECT … INTO` /
 /// `INTO OUTFILE` and sequence-advancing functions also write while leading with
-/// SELECT. So, like [`write_shape`], we reason about a **noise-stripped** copy
-/// (literals/quoted-identifiers/comments blanked) and reject any surviving write
-/// keyword. The stripping, the whole-word test, and both token lists live in
-/// `red_core::sql`, so this gate, the UI's `is_read_only`, and [`write_shape`] cannot
-/// drift apart. False positives (a rejected legitimate read) are acceptable: the user can
+/// SELECT. So the whole judgement lives in `red_core::sql::classify`, which reasons
+/// about a **noise-stripped** copy (literals, quoted identifiers and comments
+/// blanked) and answers the three separate questions this gate composes: is it one
+/// statement, what does it lead with, and does anything in it write. This gate,
+/// the UI's `is_read_only` and [`write_shape`] are three *policies* over that one
+/// scan, which is what keeps them from drifting apart the way four hand-written
+/// scans did.
+///
+/// False positives (a rejected legitimate read) are acceptable: the user can
 /// always run such a query by hand in a query tab. (Defense in depth: opening the
 /// AI's reads on an engine-level read-only connection would make this belt-and-
 /// suspenders: a worthwhile follow-up, but it needs a per-call driver seam.)
 pub(in crate::ai) fn is_read_only_select(sql: &str, dialect: Dialect) -> bool {
-    let stripped = strip_noise(sql, dialect);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // No embedded statement terminator (a `;` could chain a write past the prefix).
-    if trimmed.contains(';') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower.starts_with("select") || lower.starts_with("with")) {
-        return false;
-    }
-    // A statement that *starts* SELECT/WITH can still write. Reject if any write
-    // keyword survives noise-stripping as a whole-word token: the data-modifying
-    // CTE verbs (Postgres runs these), `INTO` (`SELECT … INTO new_table` /
-    // `INTO OUTFILE`/`DUMPFILE`), and the sequence-advancing functions. These verbs
-    // are reserved words, so they can't be bare column names in a real read; a
-    // column legitimately named one of them would be quoted, and quoting blanks it
-    // out before this check. (`FOR UPDATE` locking reads trip `update` and are
-    // rejected too; fine, the assistant browses, it doesn't lock.)
-    !WRITE_TOKENS
-        .iter()
-        .chain(DANGEROUS_FNS)
-        .any(|w| has_word(&lower, w))
+    classify(sql, dialect).is_read(AGENT_READ_LEADING)
 }
+/// Whether a write tool's effect is actually contained by the review-mode
+/// transaction.
+///
+/// Sandbox ("review") mode trades the per-call approval prompt for a promise: the
+/// turn's writes run inside one transaction the user reviews and can roll back at
+/// the end. That promise only covers the tools that route through
+/// `Sandbox::execute` — `propose_write` and `propose_changeset`. `create_index`
+/// and `kill_session` call the driver directly (`CREATE INDEX` is DDL, and killing
+/// a backend is not transactional at all), so relaxing their prompt would drop the
+/// only gate they have and leave them out of the review card as well. Everything
+/// not named here keeps its prompt.
+pub(in crate::ai) fn rides_sandbox(name: &str) -> bool {
+    matches!(name, "propose_write" | "propose_changeset")
+}
+/// The read gate for the plan tools (`explain`, `suggest_index`).
+///
+/// Both hand the model's text to `DatabaseDriver::explain`, which prepends its own
+/// `EXPLAIN` and sends the result to the engine. That is a full statement channel:
+/// `EXPLAIN ANALYZE` executes on Postgres and MySQL 8.0.18+ (and the model can
+/// write the `ANALYZE` itself, whatever the `analyze` argument said), and MySQL's
+/// text protocol runs every statement in a `;`-separated batch. So the text is
+/// vetted exactly like `run_select`'s, after unwrapping any `EXPLAIN` the model
+/// wrote, which is what [`is_read_only_select`]'s "starts with SELECT/WITH" rule
+/// would otherwise reject out of hand.
+///
+/// Returns the **unwrapped body** so the caller passes that on rather than the
+/// original: the driver seam prepends its own verb, and `EXPLAIN EXPLAIN SELECT …`
+/// is a syntax error on every engine.
+pub(in crate::ai) fn vet_explain_target(sql: &str, dialect: Dialect) -> Option<&str> {
+    let body = red_core::sql::explain_body(sql, dialect).trim();
+    is_read_only_select(body, dialect).then_some(body)
+}
+/// The refusal handed back when [`is_read_only_explain`] says no. One message so
+/// `explain` and `suggest_index` answer the model identically.
+pub(in crate::ai) const EXPLAIN_REFUSED: &str = "error: this tool plans a single read. The statement must be one SELECT (or a CTE that \
+     resolves to one) with no `;` and no write, and `EXPLAIN ANALYZE` executes what it is \
+     given. Rewrite it as a read, or run the change yourself in a query tab.";
+
 /// The tools that never mutate data and so may run on any backend without the
 /// per-call write gate. This is an allowlist on purpose: anything *not* named here
 /// is treated as a write, so a future tool fails *closed* (gated, withheld from the
@@ -104,8 +124,8 @@ pub(in crate::ai) const READ_ONLY_TOOLS: &[&str] = &[
     // Reads the next window of a `run_select` already in flight.
     "fetch_more",
     "search_data",
-    // Plans; with `analyze` it also *runs* the statement, which is why that
-    // branch refuses anything `risk::assess` grades above Safe.
+    // Plans; with `analyze` it also *runs* the statement, and the text reaches
+    // the engine either way, which is why it rides `vet_explain_target`.
     "explain",
     "health_report",
     "server_sessions",
@@ -327,13 +347,22 @@ fn assess_kill_session(input: &Json) -> WriteAssessment {
     if mode == red_core::KillMode::Terminate {
         op.push_str("\n\u{26a0} Terminating rolls back this session's open transaction.");
     }
+    // The agent's claim, labelled as one. The executor kills by `key` and never
+    // checks `user`/`statement` against the session it stops, so presenting the
+    // statement as verified would make a wrong (or invented) one the thing the
+    // user approved on - and "stop this harmless-looking SELECT" is exactly the
+    // shape that gets waved through.
     match input
         .get("statement")
         .and_then(Json::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(sql) => op.push_str(&format!("\nRunning: {}", truncate_summary(sql, 300))),
+        Some(sql) => op.push_str(&format!(
+            "\nThe agent says it is running: {}\n(RED has not checked this against the server; \
+             read server_sessions to confirm.)",
+            truncate_for_approval(sql, 300)
+        )),
         None => op.push_str(
             "\nThe agent did not say what this session is running; read server_sessions before \
              allowing.",
@@ -427,19 +456,41 @@ enum WriteShape {
 /// fool the gate; e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
 /// blocked, and a `;` inside a string isn't read as statement chaining.
 fn write_shape(sql: &str, dialect: Dialect) -> WriteShape {
-    let stripped = strip_noise(sql, dialect);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
+    // The same one scan the read gates ride, asked its own questions. See
+    // `red_core::sql::classify`.
+    let verdict = classify(sql, dialect);
+    if verdict.leading.is_empty() {
         return WriteShape::Blocked("the statement is empty");
     }
     // No embedded terminator: a real `;` chains a second statement past the keyword
     // check (and past the user's eyes).
-    if trimmed.contains(';') {
+    if !verdict.single {
         return WriteShape::Blocked("multiple statements are not allowed; submit one at a time");
     }
-    let lower = trimmed.to_ascii_lowercase();
-    let first = lower.split_whitespace().next().unwrap_or("");
-    match first {
+    let lower = strip_noise(sql, dialect).to_ascii_lowercase();
+    // A side-effecting function reads as an ordinary part of any statement -
+    // `UPDATE t SET x = pg_read_file('/etc/passwd') WHERE …` is a well-formed
+    // qualified UPDATE - and the approval prompt shows the user a sentence about
+    // rows, not about the file the server is about to read. It is also the half of
+    // the statement the preview runs *before* the prompt (see `preview.rs`), so it
+    // is blocked rather than prompted, exactly as `is_read_only_select` blocks it
+    // on the read side.
+    if let Some(f) = DANGEROUS_FNS.iter().find(|f| has_call(&lower, f)) {
+        return WriteShape::Blocked(match *f {
+            // One message per family rather than one per name: the caller wants a
+            // sentence a user can act on, and `WriteShape` carries `&'static str`.
+            _ if f.starts_with("lo_") || f.starts_with("pg_") || f.starts_with("dblink") => {
+                "this statement calls a server-side function that reads or writes files, runs \
+                 remote SQL, or controls the server; run it yourself in a query tab if you meant \
+                 it"
+            }
+            _ => {
+                "this statement calls a server-side function that reaches outside the database; \
+                  run it yourself in a query tab if you meant it"
+            }
+        });
+    }
+    match verdict.leading.as_str() {
         "select" | "with" => WriteShape::NotWrite,
         "insert" => WriteShape::Ok,
         "update" | "delete" => {
@@ -508,6 +559,41 @@ mod tests {
         assert!(!is_read_only_select("DELETE FROM t"));
         assert!(!is_read_only_select("select 1; drop table t"));
         assert!(!is_read_only_select(""));
+    }
+
+    /// `explain`/`suggest_index` hand their text to the engine behind a prepended
+    /// `EXPLAIN`, so they ride the same read gate as `run_select` — after the
+    /// wrapper the model may have written is peeled off.
+    #[test]
+    fn explain_gate_vets_the_statement_under_the_planner_verb() {
+        let ok = |s: &str| super::vet_explain_target(s, Dialect::Generic).is_some();
+        assert!(ok("SELECT * FROM t WHERE id = 1"));
+        assert!(ok("with x as (select 1) select * from x"));
+        // The wrapper is peeled off, so what the driver is handed can be wrapped
+        // again without becoming `EXPLAIN EXPLAIN …`.
+        assert_eq!(
+            super::vet_explain_target("EXPLAIN SELECT * FROM t", Dialect::Generic),
+            Some("SELECT * FROM t")
+        );
+        // The verb the model wrote does not decide anything: the body does.
+        assert!(
+            super::vet_explain_target("EXPLAIN (ANALYZE) DELETE FROM orders", Dialect::Postgres)
+                .is_none()
+        );
+        assert!(
+            super::vet_explain_target("EXPLAIN ANALYZE UPDATE t SET a = 1", Dialect::Postgres)
+                .is_none()
+        );
+        // MySQL's text protocol runs the whole batch, so a chained statement is
+        // refused even though the first one plans cleanly.
+        assert!(super::vet_explain_target("SELECT 1; DROP TABLE users", Dialect::MySql).is_none());
+        // A side-effecting function inside a SELECT is what `risk::assess` graded
+        // Safe; the read gate does not.
+        assert!(
+            super::vet_explain_target("SELECT pg_terminate_backend(1)", Dialect::Postgres)
+                .is_none()
+        );
+        assert!(super::vet_explain_target("", Dialect::Generic).is_none());
     }
 
     #[test]
@@ -583,6 +669,20 @@ mod tests {
         // Conversely, a real WHERE with a `;` inside a string literal is a single,
         // qualified statement: allowed (the `;` isn't statement chaining).
         assert!(allowed("UPDATE t SET note = 'a;b' WHERE id = 1"));
+        // A side-effecting function is a well-formed qualified write as far as
+        // shape goes, and the approval prompt would describe it as one. It is also
+        // the half of the statement `preview.rs` runs before the prompt goes up.
+        assert!(rejected(
+            "UPDATE t SET x = pg_read_file('/etc/passwd') WHERE id = 1"
+        ));
+        assert!(rejected(
+            "DELETE FROM t WHERE id IN (SELECT lo_import('/etc/passwd'))"
+        ));
+        assert!(rejected(
+            "UPDATE t SET x = 1 WHERE pg_terminate_backend(123)"
+        ));
+        // A column that happens to share a denied function's name is not a call.
+        assert!(allowed("UPDATE t SET url = 'x' WHERE file = 'y'"));
     }
 
     #[test]

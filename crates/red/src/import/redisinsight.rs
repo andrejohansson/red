@@ -126,6 +126,7 @@ fn read_report(conn: &Connection) -> Result<ImportReport> {
                 proxy: None,
                 sentinel_master: String::new(),
                 credentials_path: String::new(),
+                srv: false,
             },
             source_name: name,
             folder: None,

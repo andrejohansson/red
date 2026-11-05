@@ -821,16 +821,42 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str, abort: &AbortSignal
     if abort.is_aborted() {
         return Err(RedError::Interrupted);
     }
+    // `PRAGMA journal_mode = WAL` is silently ignored inside a transaction, and
+    // `VACUUM` errors outright, so the wrapper is what stopped them working at all.
+    // Neither has anything for a rollback to undo.
+    if red_core::sql::requires_autocommit(sql, red_core::sql::Dialect::Sqlite) {
+        return run_one(&conn, sql);
+    }
     conn.execute_batch("BEGIN").map_err(driver_err)?;
-    match conn.execute(sql, []) {
+    match run_one(&conn, sql) {
         Ok(affected) => {
             conn.execute_batch("COMMIT").map_err(driver_err)?;
-            Ok(affected as u64)
+            Ok(affected)
         }
         Err(e) => {
             crate::warn_rollback(conn.execute_batch("ROLLBACK"), "execute");
-            Err(map_step_err(e))
+            Err(e)
         }
+    }
+}
+
+/// Run one statement for its effect, whatever shape it is.
+///
+/// `Connection::execute` refuses a statement that returns rows
+/// (`ExecuteReturnedResults`), which is not a failure here: a script's body can
+/// legitimately hold a `SELECT` run for a side effect, and reporting the engine's
+/// "Execute returned results" for it is a message about RED's plumbing rather than
+/// about the user's SQL. Those fall through to `execute_batch`, which steps the
+/// statement and discards the rows; it reports no row count, and 0 is the honest
+/// answer for a read anyway.
+fn run_one(conn: &rusqlite::Connection, sql: &str) -> Result<u64> {
+    match conn.execute(sql, []) {
+        Ok(affected) => Ok(affected as u64),
+        Err(rusqlite::Error::ExecuteReturnedResults) => {
+            conn.execute_batch(sql).map_err(map_step_err)?;
+            Ok(0)
+        }
+        Err(e) => Err(map_step_err(e)),
     }
 }
 
@@ -854,11 +880,11 @@ fn execute_batch_blocking(
     conn.execute_batch("BEGIN").map_err(driver_err)?;
     let mut affected = Vec::with_capacity(statements.len());
     for sql in statements {
-        match conn.execute(sql, []) {
-            Ok(n) => affected.push(n as u64),
+        match run_one(&conn, sql) {
+            Ok(n) => affected.push(n),
             Err(e) => {
                 crate::warn_rollback(conn.execute_batch("ROLLBACK"), "execute_batch");
-                return Err(map_step_err(e));
+                return Err(e);
             }
         }
     }
@@ -963,7 +989,8 @@ fn export_blocking(
     let file = File::create(out_path).map_err(driver_err)?;
     let out = BufWriter::new(file);
     let mut rows_iter = stmt.query([]).map_err(driver_err)?;
-    let mut writer = ExportWriter::begin(out, format, names, out_path).map_err(driver_err)?;
+    let mut writer =
+        ExportWriter::begin(out, format, names, out_path, DbKind::Sqlite).map_err(driver_err)?;
     let mut throttle = ProgressThrottle::new(progress);
 
     // Bail on cancel: drop the writer, remove the partial file, and report
@@ -1647,6 +1674,48 @@ impl crate::Sandbox for SqliteSandbox {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `BEGIN`/`COMMIT` wrapper is what made these impossible: `PRAGMA
+    /// journal_mode` is silently ignored inside a transaction, and a row-returning
+    /// statement in a script body came back as rusqlite's "Execute returned
+    /// results" rather than running.
+    #[tokio::test]
+    async fn runs_pragmas_and_row_returning_statements_through_execute() {
+        let db = temp_db_path("exec");
+        let _ = std::fs::remove_file(&db);
+        let driver = SqliteDriver::new(db.clone(), false);
+        driver
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)")
+            .await
+            .unwrap();
+        driver.execute("INSERT INTO t VALUES (1, 1)").await.unwrap();
+
+        // A pragma that only takes effect outside a transaction.
+        driver.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        let mode: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mode.to_ascii_lowercase(),
+            "wal",
+            "the pragma took effect, which it cannot inside a transaction"
+        );
+
+        // A read run for its effect: 0 rows affected, not an error.
+        assert_eq!(driver.execute("SELECT * FROM t").await.unwrap(), 0);
+        // And in a batch, beside real writes, which still commit together.
+        let affected = driver
+            .execute_batch(&[
+                "UPDATE t SET n = 2 WHERE id = 1".to_string(),
+                "SELECT * FROM t".to_string(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(affected, vec![1, 0]);
+
+        let _ = std::fs::remove_file(&db);
+    }
     use super::*;
     use crate::conformance as battery;
     use red_core::KeyKind;

@@ -21,7 +21,7 @@ use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant};
 use gpui::{AnyElement, Context, ScrollHandle, div, prelude::*, px};
 use red_core::{ScriptOutcome, ScriptStep, ScriptStop};
-use red_service::Command;
+use red_service::{Command, SessionId};
 
 use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
 
@@ -113,16 +113,27 @@ impl AppState {
             self.open_script_confirm(source, statements, assessment, cx);
             return;
         }
-        self.send_script(statements, cx);
+        // The connection the script was graded against is the one it runs on.
+        let Some(session) = self.foreground_session else {
+            return;
+        };
+        self.send_script(session, statements, cx);
     }
 
     /// Dispatch a graded script to the backend and open its log in the result
     /// pane. The single place a `RunScript` is sent, so the confirm path and the
     /// direct path cannot drift.
-    pub(crate) fn send_script(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
-        let Some(session) = self.foreground_session else {
-            return;
-        };
+    /// `session` is the connection the script **belongs to** - the one the confirm
+    /// was raised on - not whatever is foreground when it is finally sent. A typed
+    /// confirmation can sit on screen while the user switches connections (⌘P), and
+    /// running a migration against the server they happened to move to is the one
+    /// mistake a confirm dialog exists to prevent.
+    pub(crate) fn send_script(
+        &mut self,
+        session: SessionId,
+        statements: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(conn) = self.conn_for(Some(session)) else {
             return;
         };
@@ -136,9 +147,9 @@ impl AppState {
             .update(cx, |store, _| store.record(&conn_id, &joined));
 
         let total = statements.len();
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(index) = active.focused_tab_index()
-            && let Some(tab) = active.tabs.get_mut(index)
+        if let Some(conn) = self.conn_mut(Some(session))
+            && let Some(index) = conn.focused_tab_index()
+            && let Some(tab) = conn.tabs.get_mut(index)
         {
             // The log takes the result pane, so the grid and any open plan step
             // aside for it, exactly as a plan displaces the grid.
@@ -159,11 +170,17 @@ impl AppState {
         cx.notify();
     }
 
-    /// A `ScriptStep` landed: append it to the open log.
-    pub(crate) fn on_script_step(&mut self, step: ScriptStep, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(index) = active.focused_tab_index()
-            && let Some(run) = active.tabs.get_mut(index).and_then(|t| t.script.as_mut())
+    /// A `ScriptStep` landed: append it to the open log, on the connection that
+    /// ran it rather than the one on screen.
+    pub(crate) fn on_script_step(
+        &mut self,
+        session: Option<SessionId>,
+        step: ScriptStep,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conn) = self.conn_mut(session)
+            && let Some(index) = conn.focused_tab_index()
+            && let Some(run) = conn.tabs.get_mut(index).and_then(|t| t.script.as_mut())
         {
             run.steps.push(step);
             cx.notify();
@@ -174,19 +191,18 @@ impl AppState {
     /// the script left one to open.
     pub(crate) fn on_script_done(
         &mut self,
+        session: Option<SessionId>,
         ran: usize,
         failed: usize,
         trailing_read: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.foreground_session
-            && let Some(conn) = self.conn_mut(Some(session))
-        {
+        if let Some(conn) = self.conn_mut(session) {
             conn.write_in_flight = false;
         }
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(index) = active.focused_tab_index()
-            && let Some(run) = active.tabs.get_mut(index).and_then(|t| t.script.as_mut())
+        if let Some(conn) = self.conn_mut(session)
+            && let Some(index) = conn.focused_tab_index()
+            && let Some(run) = conn.tabs.get_mut(index).and_then(|t| t.script.as_mut())
         {
             run.summary = Some(ScriptSummary { ran, failed });
         }
@@ -209,16 +225,21 @@ impl AppState {
         // Opening the trailing read replaces the log with its grid: the rows are
         // what the user was reading the script for, and the log's own summary
         // has already been toasted.
+        // The trailing read opens in the grid, which only exists on screen: a
+        // script that finished on a backgrounded connection closes its log there
+        // and leaves the rows for when the user comes back to it.
         if let Some(sql) = trailing_read {
-            let table = self.resolve_browse_table(&sql, cx);
-            let sql = crate::sql::auto_limit(&sql, self.settings.sql.auto_limit).unwrap_or(sql);
-            if let Phase::Connected(active) = &mut self.phase
-                && let Some(index) = active.focused_tab_index()
-                && let Some(tab) = active.tabs.get_mut(index)
+            if let Some(conn) = self.conn_mut(session)
+                && let Some(index) = conn.focused_tab_index()
+                && let Some(tab) = conn.tabs.get_mut(index)
             {
                 tab.script = None;
             }
-            self.open_result("script", sql, table, cx);
+            if session == self.foreground_session {
+                let table = self.resolve_browse_table(&sql, cx);
+                let sql = crate::sql::auto_limit(&sql, self.settings.sql.auto_limit).unwrap_or(sql);
+                self.open_result("script", sql, table, cx);
+            }
         }
         cx.notify();
     }

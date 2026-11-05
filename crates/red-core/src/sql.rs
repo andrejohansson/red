@@ -45,6 +45,7 @@ pub mod target;
 pub use preflight::count_preflight;
 pub use risk::{
     Assessment, DANGEROUS_FNS, DropKind, MutateVerb, Risk, RiskLevel, WRITE_TOKENS, assess,
+    explain_body,
 };
 pub use shape::{JoinProbe, ShapeWarning, inspect, join_probe};
 pub use target::{WriteTarget, write_target};
@@ -84,11 +85,21 @@ impl Dialect {
         }
     }
 
-    /// MySQL and GoogleSQL speak `#`-to-end-of-line comments. Everywhere else `#`
-    /// is an operator (Postgres JSONB `#>`, `#` XOR), so reading it as a comment
-    /// would hide live SQL from every gate that scans the stripped copy.
+    /// MySQL, ClickHouse and GoogleSQL speak `#`-to-end-of-line comments
+    /// (ClickHouse also accepts `#!`, which this covers: the `!` is just the next
+    /// byte of the comment). On Postgres and SQLite `#` is an operator (JSONB
+    /// `#>`, `#` XOR), and reading *that* as a comment would hide live SQL from
+    /// every gate that scans the stripped copy.
+    ///
+    /// Getting it wrong in the other direction is not harmless either, which is
+    /// why ClickHouse belongs here: a `# note; DROP TABLE t` line read as live SQL
+    /// splits at the `;`, and RED then sends the `DROP` as its own statement -
+    /// executing something the engine would have read as a comment from end to end.
     fn hash_comments(self) -> bool {
-        matches!(self, Dialect::MySql | Dialect::BigQuery)
+        matches!(
+            self,
+            Dialect::MySql | Dialect::ClickHouse | Dialect::BigQuery
+        )
     }
 
     /// Whether `--` at `i` opens a line comment. MySQL requires whitespace (or
@@ -298,23 +309,28 @@ pub fn statement_ranges(sql: &str, dialect: Dialect) -> Vec<Range<usize>> {
 
 /// Whether `word` at `sql[..from]` opens a block that an `END` closes.
 ///
-/// `IF` and `REPEAT` are also functions, which is the one ambiguity here.
-/// Written call-style — `(` hard against the word — they are calls
-/// (`IF(a, b, c)`), matching how MySQL's own lexer reads built-ins. A *spaced*
-/// `(` after `IF` is usually a parenthesized block condition
-/// (`IF (available < NEW.quantity) THEN`), but can still be a call; only a
-/// top-level `THEN` before the statement ends settles it. `WHILE`, `CASE` and
+/// `IF` and `REPEAT` are also functions, which is the one ambiguity here. A `(`
+/// after either — hard against the word or spaced — can be a call (`IF(a, b, c)`)
+/// or a parenthesized block condition (`IF(available < NEW.quantity) THEN`); MySQL
+/// accepts both spellings for both meanings, so the spacing settles nothing and
+/// only a top-level `THEN` before the statement ends does. `WHILE`, `CASE` and
 /// `LOOP` have no function form, so their parenthesized conditions always open
 /// blocks. `IF` also introduces the `IF [NOT] EXISTS` of a header, which opens
 /// nothing.
+///
+/// A word qualified by a `.` is a member name, never a keyword: `OLD.begin` and
+/// `t.end` are ordinary column references, and reading them as block structure
+/// left a routine body permanently open — so the `;` that should have ended it
+/// stopped being a separator and every statement after it was swallowed into one
+/// blob, graded by the routine's own leading `CREATE`.
 fn opens_block(b: &[u8], word: &[u8], from: usize, dialect: Dialect) -> bool {
     if !is_block_kind(word) && !word.eq_ignore_ascii_case(b"begin") {
         return false;
     }
+    if is_qualified_member(b, from - word.len()) {
+        return false;
+    }
     if word.eq_ignore_ascii_case(b"if") || word.eq_ignore_ascii_case(b"repeat") {
-        if b.get(from) == Some(&b'(') {
-            return false;
-        }
         let mut at = from;
         while at < b.len() && b[at].is_ascii_whitespace() {
             at += 1;
@@ -336,6 +352,20 @@ fn opens_block(b: &[u8], word: &[u8], from: usize, dialect: Dialect) -> bool {
         return then_follows(b, from, dialect);
     }
     true
+}
+
+/// Whether the word starting at `at` is the member half of a qualified name
+/// (`OLD.begin`, `t`.`end``), which makes it an identifier rather than a keyword
+/// however it is spelled.
+///
+/// Looks *backwards* past whitespace for a `.`. The qualifier itself may be
+/// backtick-quoted, which is fine: only the dot matters.
+fn is_qualified_member(b: &[u8], at: usize) -> bool {
+    let mut i = at;
+    while i > 0 && b[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i > 0 && b[i - 1] == b'.'
 }
 
 /// Whether the `IF` ending at `from` is followed by the `EXISTS` / `NOT EXISTS`
@@ -654,6 +684,14 @@ fn skip_block_comment(b: &[u8], i: usize, dialect: Dialect) -> usize {
 /// treats it as an ordinary byte.
 fn dollar_quote_end(b: &[u8], i: usize) -> Option<usize> {
     let n = b.len();
+    // A `$` *inside* an identifier opens nothing. Postgres allows `$` as an
+    // identifier continuation character, so `a$x$` is one column name and the `;`
+    // after it is a real statement boundary - but read as a dollar quote it
+    // swallowed everything up to the next `$x$`, hiding a whole statement from the
+    // splitter and from every gate that reads its output.
+    if i > 0 && (b[i - 1] == b'_' || b[i - 1].is_ascii_alphanumeric()) {
+        return None;
+    }
     // Read the tag: `$` (alnum|_)* `$`.
     let mut j = i + 1;
     while j < n && (b[j] == b'_' || b[j].is_ascii_alphanumeric()) {
@@ -819,9 +857,186 @@ pub fn has_word(haystack: &str, word: &str) -> bool {
         .any(|tok| tok == word)
 }
 
+/// What one piece of SQL *is*, as every gate in RED needs to know it.
+///
+/// The four questions the read gates, the write gate and the risk grading were
+/// each answering separately, in four hand-written scans over four slightly
+/// different token lists. That drift was not theoretical: the `EXPLAIN ANALYZE`
+/// gate asked the risk grading whether a statement was safe, and the risk grading
+/// grades every `SELECT` safe - including `SELECT lo_import('/etc/passwd')` -
+/// because "how much does this destroy" is a different question from "does this
+/// only read".
+///
+/// So the questions are separated here and answered once. A caller composes the
+/// ones it cares about; the *policy* (which leading keywords it will accept) stays
+/// with the caller, because that genuinely differs — the editor may auto-run an
+/// `EXPLAIN`, the assistant's `run_select` may not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// How much this destroys, from [`assess`]. Unchanged semantics: a batch
+    /// grades as its most dangerous member.
+    pub level: RiskLevel,
+    /// Exactly one runnable statement. `false` for a chained batch *and* for
+    /// nothing runnable at all (blank, comment-only), so a caller never has to
+    /// spell both.
+    pub single: bool,
+    /// The leading keyword of the first runnable statement, lower-cased. Empty
+    /// when there is none.
+    pub leading: String,
+    /// A write verb or a side-effecting function survives noise-stripping
+    /// anywhere in the text.
+    ///
+    /// The question `level` cannot answer: `SELECT setval(…)`,
+    /// `WITH x AS (DELETE …) SELECT * FROM x` and `SELECT … INTO t2` all grade
+    /// Safe by blast radius and all write.
+    pub side_effects: bool,
+}
+
+impl Verdict {
+    /// Whether this is a single statement that only reads, and whose leading
+    /// keyword is one the caller accepts.
+    ///
+    /// The one shape both read gates are: they differ *only* in `allowed`, which
+    /// is the policy each owns. Passing it in is what keeps them from drifting
+    /// into two different scans again.
+    pub fn is_read(&self, allowed: &[&str]) -> bool {
+        self.single && !self.side_effects && allowed.contains(&self.leading.as_str())
+    }
+}
+
+/// The leading keywords the **assistant's** read tools accept: a `SELECT`, or a
+/// CTE that resolves to one.
+pub const AGENT_READ_LEADING: &[&str] = &["select", "with"];
+
+/// The leading keywords the **editor** will auto-run: the agent's two, plus the
+/// forms a person legitimately types into a query tab and expects to open in the
+/// grid. Looser on purpose - a false positive here costs an auto-run the user can
+/// still trigger by hand.
+pub const EDITOR_READ_LEADING: &[&str] = &["select", "with", "explain", "values"];
+
+/// Answer every gate's question about `sql` in one pass.
+///
+/// `dialect` must be the engine that will run it: statement boundaries, comment
+/// forms and string escapes differ per engine, and scanning against the wrong
+/// lexing is the drift this module exists to prevent.
+pub fn classify(sql: &str, dialect: Dialect) -> Verdict {
+    let statements: Vec<&str> = split_statements(sql, dialect)
+        .into_iter()
+        .filter(|s| !first_keyword(&strip_noise(s, dialect)).is_empty())
+        .collect();
+    let leading = statements
+        .first()
+        .map(|s| first_keyword(&strip_noise(s, dialect)).to_ascii_lowercase())
+        .unwrap_or_default();
+    // Read over the whole input, not per statement: a caller that has already
+    // established `single` wants one answer, and one that has not is asking
+    // "does anything in here write".
+    let lower = strip_noise(sql, dialect).to_ascii_lowercase();
+    // Verbs are matched as whole words - they are reserved and cannot be bare
+    // identifiers - while the function denylist is matched in call position,
+    // because several of its names (`url`, `file`, `sleep`) are ordinary column
+    // names. See [`has_call`].
+    let side_effects = WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
+        || DANGEROUS_FNS.iter().any(|f| has_call(&lower, f));
+    Verdict {
+        level: assess(sql, dialect).level,
+        single: statements.len() == 1,
+        leading,
+        side_effects,
+    }
+}
+
+/// Whether `sql` is a statement the engine refuses to run inside an explicit
+/// transaction block, so a caller that wraps writes in `BEGIN`/`COMMIT` must run
+/// this one bare.
+///
+/// The wrapper exists so a failed write leaves nothing behind, which is the right
+/// default and wrong for a specific, short list. `VACUUM`, `CREATE DATABASE`,
+/// `CREATE INDEX CONCURRENTLY` and friends error with 25001 ("cannot run inside a
+/// transaction block") on Postgres, and SQLite's `PRAGMA journal_mode = WAL` is
+/// silently a no-op inside one - so the health report's own `suggested_sql` was
+/// among the statements RED could not run.
+///
+/// Read on the [`strip_noise`] copy so a keyword inside a literal or comment
+/// decides nothing. Conservative in the safe direction: an unrecognised statement
+/// keeps the wrapper.
+pub fn requires_autocommit(sql: &str, dialect: Dialect) -> bool {
+    let stripped = strip_noise(sql, dialect);
+    let lower = stripped
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_lowercase();
+    let verb = first_keyword(&lower);
+    match dialect {
+        Dialect::Postgres => match verb {
+            // Unconditionally non-transactional.
+            "vacuum" | "cluster" | "discard" => true,
+            // Only the `CONCURRENTLY` forms; a plain `CREATE INDEX` is
+            // transactional and benefits from the wrapper.
+            "reindex" => has_word(&lower, "concurrently"),
+            "create" | "drop" | "alter" => {
+                has_word(&lower, "concurrently")
+                    || has_word(&lower, "tablespace")
+                    || has_word(&lower, "subscription")
+                    // `CREATE DATABASE` / `DROP DATABASE` / `ALTER SYSTEM`.
+                    || (has_word(&lower, "database") && !has_word(&lower, "alter"))
+                    || (verb == "alter" && has_word(&lower, "system"))
+            }
+            _ => false,
+        },
+        // `PRAGMA journal_mode` is the one that matters: setting WAL inside a
+        // transaction is silently ignored. Gating every `PRAGMA` is simpler and
+        // costs nothing, since none of them needs a rollback.
+        Dialect::Sqlite => matches!(verb, "pragma" | "vacuum"),
+        // MySQL implicitly commits DDL, so a wrapper around one is already a
+        // fiction rather than an error; ClickHouse has no transactions at all.
+        _ => false,
+    }
+}
+
+/// Whether `word` appears in `haystack` as a whole word in **call position** —
+/// followed, across any whitespace, by `(`.
+///
+/// The looser [`has_word`] is right for reserved verbs, which can never be bare
+/// identifiers. It is wrong for function names: `url`, `file`, `sleep`, `remote`
+/// and `benchmark` are all perfectly ordinary column names, and a denylist that
+/// rejected `SELECT url FROM links` would be one users route around rather than
+/// trust. Requiring the parenthesis says what the denylist means — *this function
+/// is being called* — and so lets the list name the functions that matter rather
+/// than only the ones with unmistakable names.
+///
+/// `haystack` is assumed already lower-cased and, for any safety decision, already
+/// passed through [`strip_noise`] — which blanks a `(` inside a string or comment
+/// along with everything else in it.
+pub fn has_call(haystack: &str, word: &str) -> bool {
+    let b = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(word) {
+        let at = from + rel;
+        let end = at + word.len();
+        from = end;
+        // Whole word: not a fragment of a longer identifier on either side.
+        if at > 0 && is_word_byte(b[at - 1]) {
+            continue;
+        }
+        if b.get(end).is_some_and(|&c| is_word_byte(c)) {
+            continue;
+        }
+        // Call position: the next non-space byte opens an argument list.
+        if b[end..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(') {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Dialect, first_keyword, has_word};
+    use super::{
+        AGENT_READ_LEADING, Dialect, EDITOR_READ_LEADING, RiskLevel, first_keyword, has_call,
+        has_word, requires_autocommit,
+    };
 
     /// Tests that don't probe a dialect difference run under [`Dialect::Generic`];
     /// the dialect-specific behaviours have their own tests below.
@@ -831,6 +1046,147 @@ mod tests {
 
     fn strip_noise(sql: &str) -> String {
         super::strip_noise(sql, Dialect::Generic)
+    }
+
+    /// ClickHouse reads `#` and `#!` to end of line as comments, so a `;` after
+    /// one is not a boundary. Splitting there sent the tail to the engine as its
+    /// own statement - running text ClickHouse would have ignored entirely.
+    #[test]
+    fn clickhouse_hash_comments_are_comments() {
+        let s = super::split_statements("SELECT 1 # tidy; DROP TABLE users", Dialect::ClickHouse);
+        assert_eq!(s.len(), 1, "got {s:#?}");
+        let s = super::split_statements(
+            "#!/usr/bin/env clickhouse; DROP TABLE users\nSELECT 1",
+            Dialect::ClickHouse,
+        );
+        assert_eq!(s.len(), 1, "got {s:#?}");
+        assert_eq!(
+            super::strip_noise("SELECT 1 # DROP TABLE users", Dialect::ClickHouse).trim_end(),
+            "SELECT 1"
+        );
+        // Postgres and SQLite still read `#` as an operator, where treating it as a
+        // comment would hide live SQL.
+        assert_eq!(
+            super::split_statements("SELECT 1 # tidy; DROP TABLE users", Dialect::Postgres).len(),
+            2
+        );
+    }
+
+    /// Postgres allows `$` inside an identifier, so `a$x$` is one column name.
+    /// Read as a dollar quote it swallowed the statement after it.
+    #[test]
+    fn a_dollar_inside_an_identifier_opens_no_quote() {
+        let s =
+            super::split_statements("SELECT a$x$; DELETE FROM t; SELECT b$x$", Dialect::Postgres);
+        assert_eq!(s.len(), 3, "got {s:#?}");
+        assert_eq!(s[1].trim(), "DELETE FROM t");
+        // A genuine dollar-quoted body still spans its `;`s.
+        let s = super::split_statements(
+            "CREATE FUNCTION f() RETURNS int AS $x$ SELECT 1; SELECT 2; $x$ LANGUAGE sql; SELECT 3",
+            Dialect::Postgres,
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert_eq!(s[1].trim(), "SELECT 3");
+    }
+
+    /// One classifier, four questions. The bug this replaces: the
+    /// `EXPLAIN ANALYZE` gate asked the *risk grading* whether a statement was
+    /// safe, and the grading answers "how much does this destroy" - which is
+    /// `Safe` for every `SELECT`, including one that writes a file.
+    #[test]
+    fn classify_separates_blast_radius_from_side_effects() {
+        let v = super::classify("SELECT * FROM t", Dialect::Postgres);
+        assert!(v.single);
+        assert_eq!(v.leading, "select");
+        assert!(!v.side_effects);
+        assert_eq!(v.level, RiskLevel::Safe);
+        assert!(v.is_read(EDITOR_READ_LEADING));
+        assert!(v.is_read(AGENT_READ_LEADING));
+
+        // Graded Safe by blast radius, and it writes a file.
+        let v = super::classify("SELECT lo_export(1, '/tmp/x')", Dialect::Postgres);
+        assert_eq!(v.level, RiskLevel::Safe, "the grading is unchanged");
+        assert!(v.side_effects, "and the read gate sees what it misses");
+        assert!(!v.is_read(EDITOR_READ_LEADING));
+
+        // A data-modifying CTE leads with `with` and writes.
+        let v = super::classify(
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            Dialect::Postgres,
+        );
+        assert_eq!(v.leading, "with");
+        assert!(v.side_effects);
+        assert!(!v.is_read(AGENT_READ_LEADING));
+
+        // A chained batch is not a single statement, whatever it leads with.
+        let v = super::classify("SELECT 1; DROP TABLE users", Dialect::Postgres);
+        assert!(!v.single);
+        assert_eq!(v.leading, "select");
+        assert_eq!(v.level, RiskLevel::Critical, "graded by its worst member");
+        assert!(!v.is_read(EDITOR_READ_LEADING));
+
+        // Nothing runnable is not a single statement either, so no caller has to
+        // spell the empty case.
+        let v = super::classify("  -- just a comment\n", Dialect::Postgres);
+        assert!(!v.single);
+        assert_eq!(v.leading, "");
+        assert!(!v.is_read(EDITOR_READ_LEADING));
+
+        // The two policies differ only in what they lead with, which is the whole
+        // reason `allowed` is a parameter.
+        let v = super::classify("EXPLAIN SELECT * FROM t", Dialect::Postgres);
+        assert!(v.is_read(EDITOR_READ_LEADING), "the editor may auto-run it");
+        assert!(!v.is_read(AGENT_READ_LEADING), "run_select may not");
+    }
+
+    /// The `BEGIN`/`COMMIT` wrapper every write path uses is exactly what makes
+    /// these statements fail, so they have to be recognised before it goes on.
+    #[test]
+    fn non_transactional_statements_are_recognised_per_dialect() {
+        let pg = |s: &str| requires_autocommit(s, Dialect::Postgres);
+        assert!(pg("VACUUM ANALYZE orders"));
+        assert!(pg("CREATE INDEX CONCURRENTLY ix ON t (a)"));
+        assert!(pg("DROP INDEX CONCURRENTLY ix"));
+        assert!(pg("REINDEX INDEX CONCURRENTLY ix"));
+        assert!(pg("CREATE DATABASE staging"));
+        assert!(pg("ALTER SYSTEM SET work_mem = '64MB'"));
+        assert!(pg("CREATE TABLESPACE fast LOCATION '/mnt/fast'"));
+        // The transactional forms keep the wrapper.
+        assert!(!pg("CREATE INDEX ix ON t (a)"));
+        assert!(!pg("REINDEX INDEX ix"));
+        assert!(!pg("ALTER TABLE t ADD COLUMN a int"));
+        assert!(!pg("UPDATE t SET a = 1 WHERE id = 1"));
+        assert!(!pg("ALTER DATABASE app SET work_mem = '64MB'"));
+        // A keyword inside a literal decides nothing.
+        assert!(!pg("INSERT INTO t (note) VALUES ('vacuum concurrently')"));
+
+        assert!(requires_autocommit(
+            "PRAGMA journal_mode = WAL",
+            Dialect::Sqlite
+        ));
+        assert!(requires_autocommit("VACUUM", Dialect::Sqlite));
+        assert!(!requires_autocommit("DELETE FROM t", Dialect::Sqlite));
+        // MySQL implicitly commits DDL and ClickHouse has no transactions, so
+        // neither has a statement the wrapper *breaks*.
+        assert!(!requires_autocommit("VACUUM", Dialect::MySql));
+    }
+
+    /// The function denylist is only a hole in call position, and several of its
+    /// names are ordinary column names, so the match has to tell the two apart.
+    #[test]
+    fn has_call_matches_only_the_call_form() {
+        assert!(has_call("select pg_sleep(10)", "pg_sleep"));
+        assert!(has_call("select * from url ('http://x')", "url"));
+        assert!(has_call("select\n  file\n  (1)", "file"));
+        // A column, a table, or an alias of the same name is not a call.
+        assert!(!has_call("select url from links", "url"));
+        assert!(!has_call("select a from file", "file"));
+        assert!(!has_call("select f(url) from t", "url"));
+        // Not a fragment of a longer identifier on either side.
+        assert!(!has_call("select my_url(1)", "url"));
+        assert!(!has_call("select url_of(1)", "url"));
+        // The looser whole-word match is what the verbs still use.
+        assert!(has_word("select url from links", "url"));
     }
 
     /// MySQL's `#` comment hides everything to end of line — including a `;` and
@@ -997,6 +1353,58 @@ SELECT 1";
         assert_eq!(s.len(), 2, "got {s:#?}");
         assert!(s[0].starts_with("CREATE TRIGGER") && s[0].ends_with("END"));
         assert_eq!(s[1], "SELECT 1");
+    }
+
+    /// A body word that only *looks* like block structure must not be read as
+    /// any: an unmatched opener leaves the routine permanently open, so the `;`
+    /// that should end it stops separating and everything after it is swallowed
+    /// into one blob — which MySQL's text protocol then runs in full, graded by the
+    /// routine's own leading `CREATE`.
+    #[test]
+    fn a_body_word_that_is_only_a_column_name_opens_nothing() {
+        // `OLD.begin` is a column reference; the `.` is what says so.
+        let s = split_statements(
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW \
+             BEGIN SET NEW.a = OLD.begin; END; DROP TABLE users",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert!(s[0].starts_with("CREATE TRIGGER") && s[0].ends_with("END"));
+        assert_eq!(s[1], "DROP TABLE users");
+        // Backtick-quoted and spaced-out qualifiers read the same way.
+        let s = split_statements(
+            "CREATE PROCEDURE p() BEGIN SELECT t.`end`, o . loop FROM t; END; DROP TABLE users",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert_eq!(s[1], "DROP TABLE users");
+    }
+
+    /// `IF(cond) THEN` with no space is as valid as `IF (cond) THEN`, so the
+    /// spacing settles nothing and only the `THEN` does. Reading the hard-paren
+    /// form as the `IF(a,b,c)` *function* left its `END IF` closing the enclosing
+    /// `BEGIN`, cutting the routine in half.
+    #[test]
+    fn a_hard_paren_if_still_opens_a_block() {
+        let s = split_statements(
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW \
+             BEGIN IF(NEW.a > 0) THEN SET NEW.a = 1; END IF; END; DROP TABLE users",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert!(s[0].ends_with("END"));
+        assert_eq!(s[1], "DROP TABLE users");
+        // `CREATE EVENT … DO BEGIN IF … THEN` is the same shape behind another verb.
+        let s = split_statements(
+            "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO \
+             BEGIN IF(1) THEN SELECT 1; END IF; END; DROP TABLE users",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert_eq!(s[1], "DROP TABLE users");
+        // And the function form is still a function: its statement ends without a
+        // top-level THEN, so nothing is opened and the `;` still separates.
+        let s = split_statements(
+            "CREATE PROCEDURE p() BEGIN SET x = IF(a, b, c); SET y = 2; END; DROP TABLE users",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert_eq!(s[1], "DROP TABLE users");
     }
 
     /// Every block form a body can nest, and the `END <kind>` that closes each: one

@@ -7056,6 +7056,7 @@ dependencies = [
  "reqwest",
  "rsa 0.9.10",
  "rusqlite",
+ "rustls",
  "serde_json",
  "tokio",
  "tokio-postgres",

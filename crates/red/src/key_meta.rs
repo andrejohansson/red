@@ -9,7 +9,7 @@
 //! "no annotations"; one bad file never blocks startup (fail-open).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -191,27 +191,10 @@ impl KeyMetaStore {
 /// Serialize `keys` to `path` via a temp file + rename, owner-only on Unix. Like
 /// `recent_keys.rs`, not `fsync`ed: this runs on the UI thread on every edit and
 /// the store is a throwaway convenience (the loader is fail-open).
-fn save(path: &PathBuf, keys: &HashMap<String, HashMap<String, KeyAnnotation>>) -> Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating the config directory")?;
-    }
+fn save(path: &Path, keys: &HashMap<String, HashMap<String, KeyAnnotation>>) -> Result<()> {
     let file = KeyMetaFile { keys: keys.clone() };
     let contents = serde_json::to_string_pretty(&file).context("serializing redis key meta")?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).context("creating the key-meta temp file")?;
-    f.write_all(contents.as_bytes())?;
-    drop(f);
-    std::fs::rename(&tmp, path).context("renaming the key-meta temp file")?;
-    Ok(())
+    red_config::atomic::write_private_fast(path, contents.as_bytes())
 }
 
 #[cfg(test)]

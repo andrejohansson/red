@@ -70,7 +70,7 @@ pub(crate) enum SchemaEvent {
 /// tables/views → columns.
 ///
 /// A view (`Entity<SchemaState>`), the fourth extracted under Tier 1 of
-/// `docs/plans/todo/zed-architecture-inspiration.md`. It holds both the schema
+/// the view-per-surface extraction (see the module docs). It holds both the schema
 /// *model* (namespaces, objects, per-object detail) and the tree's own UI state
 /// (expansion, selection, filter, menu), deliberately: several other modules
 /// (the ER canvas, the palette, editor completion, assistant grounding) read the

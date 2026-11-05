@@ -158,7 +158,8 @@ impl<W: Write> Sink<W> {
                     ExportFormat::Xlsx
                 };
                 let writer =
-                    ExportWriter::begin(out, wire, columns.clone(), dest).map_err(io_err)?;
+                    ExportWriter::begin(out, wire, columns.clone(), dest, red_core::DbKind::Mongo)
+                        .map_err(io_err)?;
                 Ok(Sink::Tabular {
                     writer,
                     columns,

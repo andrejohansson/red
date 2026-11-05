@@ -866,6 +866,18 @@ impl ImportPayload {
     }
 }
 
+/// What an open Redis delete confirm is about.
+#[derive(Clone)]
+pub(crate) enum KvDeleteTarget {
+    /// The whole key (`DEL`). Snapshotted into the recycle bin first, so it can be
+    /// undone.
+    Key,
+    /// One node inside a RedisJSON document (`JSON.DEL <path>`). There is no
+    /// recycle-bin snapshot for a sub-document, so this one really is final - which
+    /// is why the modal says a different thing for it.
+    JsonNode(red_core::kv::JsonPath),
+}
+
 pub(crate) struct ImportState {
     /// The chosen file's display path, or `None` before one is picked.
     pub(crate) path: Option<String>,
@@ -877,6 +889,15 @@ pub(crate) struct ImportState {
     /// `CONFIG SET dir …` takeover pair) must be visible *before* the click
     /// that runs the whole file.
     pub(crate) destructive: Vec<String>,
+    /// The user has read the destructive pre-scan and asked for it anyway.
+    ///
+    /// The gate for a file that holds any of those commands, and the reason the
+    /// warning above is worth rendering at all: the whole file runs on one click,
+    /// and a `FLUSHALL`, a `CONFIG SET requirepass`, a `REPLICAOF` or a `SHUTDOWN`
+    /// on line 400 is not something a red button asks about. Always `false` when
+    /// [`destructive`](Self::destructive) is empty, where there is nothing to
+    /// acknowledge.
+    pub(crate) destructive_ack: bool,
     /// A read/parse problem to surface inline (e.g. unreadable file, no commands).
     pub(crate) error: Option<String>,
     /// True once the import is in flight (buttons disabled until `KvImportDone`).
@@ -1010,7 +1031,12 @@ pub(crate) struct KvInspector {
     pub(crate) editing_ttl: bool,
     pub(crate) rename_editor: Entity<TextInput>,
     pub(crate) editing_key: bool,
-    pub(crate) confirm_delete: bool,
+    /// The delete awaiting confirmation, or `None` when no modal is up.
+    ///
+    /// Carries *what* is being deleted rather than a bare flag: the key delete and
+    /// the RedisJSON node delete share this one modal, and they are not the same
+    /// question - one is undoable from the recycle bin and the other is not.
+    pub(crate) confirm_delete: Option<KvDeleteTarget>,
     /// The lens the string value is rendered through (Auto/Raw/JSON/Hex + binary
     /// decoders), reusing the SQL inspector's `ValueFormat`. Only meaningful for a
     /// `KvValue::Str`.
@@ -2310,6 +2336,7 @@ impl AppState {
                 path: None,
                 payload: None,
                 destructive: Vec::new(),
+                destructive_ack: false,
                 error: None,
                 running: false,
             });
@@ -2370,20 +2397,30 @@ impl AppState {
             let parsed = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                     let label = path.display().to_string();
+                    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
                     // A DUMP export names itself, so the right reader is chosen
                     // from the file rather than from a radio the user must get
-                    // right.
-                    if bytes.starts_with(red_core::kv::KV_DUMP_MAGIC) {
-                        let mut at = red_core::kv::KV_DUMP_MAGIC.len();
+                    // right. Read the magic on its own first: the dump branch then
+                    // counts keys by *streaming* the rest, where slurping a
+                    // multi-gigabyte export into memory to produce one number is
+                    // the kind of peak this modal has no business causing.
+                    let mut magic = vec![0u8; red_core::kv::KV_DUMP_MAGIC.len()];
+                    let is_dump = std::io::Read::read_exact(&mut file, &mut magic).is_ok()
+                        && magic == red_core::kv::KV_DUMP_MAGIC;
+                    if is_dump {
+                        let mut r = std::io::BufReader::new(file);
                         let mut keys = 0;
-                        while let Some((_, next)) = red_core::kv::read_dump_frame(&bytes, at) {
+                        while red_core::kv::read_dump_frame_from(&mut r)
+                            .map_err(|e| e.to_string())?
+                            .is_some()
+                        {
                             keys += 1;
-                            at = next;
                         }
                         return Ok((label, ImportPayload::Dump { path, keys }));
                     }
+                    drop(file);
+                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                     let text = String::from_utf8_lossy(&bytes);
                     let commands: Vec<Vec<String>> = text
                         .lines()
@@ -2419,10 +2456,21 @@ impl AppState {
                                     })
                                     .map(|argv| argv.join(" "))
                                     .collect(),
-                                // A dump restores values; it runs no commands the
-                                // classifier could grade, and it never deletes.
-                                ImportPayload::Dump { .. } => Vec::new(),
+                                // A dump restores values, so there are no commands
+                                // for the classifier to grade - but it restores
+                                // them with `REPLACE`, which overwrites whatever
+                                // key of that name is already there. That is the
+                                // same "you will lose data" the list above is for,
+                                // so it is said in the same place.
+                                ImportPayload::Dump { .. } => {
+                                    vec![
+                                        "RESTORE … REPLACE (overwrites any key of the same name)"
+                                            .to_string(),
+                                    ]
+                                }
                             };
+                            // A new file is a new decision.
+                            imp.destructive_ack = false;
                             imp.payload = Some(payload);
                         }
                         Err(e) => {
@@ -2430,6 +2478,7 @@ impl AppState {
                             imp.path = None;
                             imp.payload = None;
                             imp.destructive.clear();
+                            imp.destructive_ack = false;
                         }
                     }
                 }
@@ -2438,6 +2487,18 @@ impl AppState {
             .ok();
         })
         .detach();
+    }
+
+    /// Toggle the "I understand" acknowledgement on the import modal.
+    pub(crate) fn kv_toggle_import_ack(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(imp) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.import.as_mut())
+        {
+            imp.destructive_ack = !imp.destructive_ack;
+        }
+        cx.notify();
     }
 
     /// Run the chosen import: send the parsed commands to the backend as one
@@ -2460,6 +2521,11 @@ impl AppState {
             return;
         };
         if imp.running {
+            return;
+        }
+        // The backstop for the modal's own disabled button: a file holding
+        // destructive commands runs only once the user has said so explicitly.
+        if !imp.destructive.is_empty() && !imp.destructive_ack {
             return;
         }
         let command = match payload {
@@ -2923,6 +2989,11 @@ impl AppState {
             self.on_analysis_page(session, epoch, page, cx);
             return;
         }
+        // A cluster scan that could not reach a shard has returned an *incomplete*
+        // keyspace, which the list below will render as though it were the whole
+        // one. Said out loud, once per page that skips something, because "these
+        // are all your keys" is exactly the wrong thing for it to imply.
+        let skipped = page.skipped_nodes.clone();
         let max_resident = self.settings.kv.max_resident_keys;
         let Some(browse) = self
             .conn_mut(session)
@@ -2950,6 +3021,22 @@ impl AppState {
         browse.exhausted = page.exhausted;
         browse.loading = false;
         cx.notify();
+        if !skipped.is_empty() {
+            self.notify(
+                ToastVariant::Warning,
+                format!(
+                    "Couldn't reach {} on this cluster, so keys it holds are missing from this \
+                     list: {}",
+                    if skipped.len() == 1 {
+                        "one shard".to_string()
+                    } else {
+                        format!("{} shards", skipped.len())
+                    },
+                    skipped.join(", ")
+                ),
+                cx,
+            );
+        }
         // Outside the `browse` borrow: if a filter left this page under-matched,
         // this page landing is what chains the next one (see
         // `kv_maybe_grow_pool`'s doc comment for the full loop shape).

@@ -135,9 +135,19 @@ pub(crate) struct DocCopyState {
     pub(crate) db_input: Entity<TextInput>,
     pub(crate) coll_input: Entity<TextInput>,
     pub(crate) mode: DocCopyMode,
+    /// The user has explicitly accepted that
+    /// [`DropAndInsert`](DocCopyMode::DropAndInsert) drops the target collection
+    /// first.
+    ///
+    /// Dropping a collection anywhere else in RED raises a confirm modal; reached
+    /// through the copy dialog's Mode picker it used to drop on one click, with
+    /// only a red button and a hint line between the user and losing the target.
+    /// Reset whenever the mode or the target changes, so the acknowledgement can
+    /// only ever apply to the thing that was on screen when it was given.
+    pub(crate) drop_ack: bool,
 }
 
-/// The "Export documents" modal's state, held on [`MongoView`] for the life of the
+/// The "Export documents" modal's state, held on [`MongoView`](super::MongoView) for the life of the
 /// dialog.
 pub(crate) struct DocExportState {
     /// The namespace being exported, captured at open so a tab switch behind the
@@ -413,6 +423,7 @@ impl AppState {
             })
             .unwrap_or(0);
         view.copy = Some(DocCopyState {
+            drop_ack: false,
             source_db: db,
             source_coll: coll,
             filter,
@@ -458,6 +469,16 @@ impl AppState {
     ) {
         if let Some(copy) = self.doc_copy_mut(session) {
             copy.mode = mode;
+            // A different mode is a different question.
+            copy.drop_ack = false;
+        }
+        cx.notify();
+    }
+
+    /// Toggle the "drop the target first" acknowledgement on the copy modal.
+    pub(crate) fn doc_toggle_drop_ack(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(copy) = self.doc_copy_mut(session) {
+            copy.drop_ack = !copy.drop_ack;
         }
         cx.notify();
     }
@@ -477,9 +498,15 @@ impl AppState {
             copy.mode,
             copy.total,
         );
+        let drop_ack = copy.drop_ack;
         let (db_input, coll_input) = (copy.db_input.clone(), copy.coll_input.clone());
         let target_db = db_input.read(cx).content().trim().to_string();
         let target_coll = coll_input.read(cx).content().trim().to_string();
+        // Backstop for the modal's own disabled button: "Replace" drops the target
+        // collection, which everywhere else in RED is behind a confirm.
+        if mode == DocCopyMode::DropAndInsert && !drop_ack {
+            return;
+        }
         if target_db.is_empty() || target_coll.is_empty() {
             self.notify(
                 ToastVariant::Warning,
@@ -606,6 +633,28 @@ impl AppState {
                     .unwrap_or_default(),
             );
 
+        // The confirm for the drop. Named, not generic: what is about to be
+        // destroyed is a specific collection on a specific server, and the checkbox
+        // is the only place the user is told which.
+        let ack_view = view.clone();
+        let ack = destructive.then(|| {
+            let target_name = format!(
+                "{}.{}",
+                copy.db_input.read(cx).content().trim(),
+                copy.coll_input.read(cx).content().trim()
+            );
+            div().child(
+                Checkbox::new("doc-copy-drop-ack", copy.drop_ack)
+                    .label(format!("Drop {target_name} first — this cannot be undone"))
+                    .on_change(move |_, _, cx| {
+                        ack_view
+                            .update(cx, |this, cx| this.doc_toggle_drop_ack(session, cx))
+                            .ok();
+                    }),
+            )
+        });
+        let can_run = !destructive || copy.drop_ack;
+
         let source_line = match &copy.filter {
             Some(f) => format!("From {}.{} matching {f}", copy.source_db, copy.source_coll),
             None => format!(
@@ -638,6 +687,7 @@ impl AppState {
                         ButtonVariant::Primary
                     })
                     .size(ButtonSize::Sm)
+                    .disabled(!can_run)
                     .on_click(move |_, _, cx| {
                         run_view
                             .update(cx, |this, cx| this.doc_start_copy(session, cx))
@@ -655,7 +705,8 @@ impl AppState {
             .child(labeled_field("Database", &theme).child(copy.db_input.clone()))
             .child(labeled_field("Collection", &theme).child(copy.coll_input.clone()))
             .child(mode_row)
-            .child(mode_hint);
+            .child(mode_hint)
+            .children(ack);
 
         Some(
             Modal::new("doc-copy")

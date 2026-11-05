@@ -1348,8 +1348,17 @@ impl AppState {
         // On a read-only connection, refuse writes up front instead of letting
         // them round-trip to the engine and bounce back as a cryptic error. The
         // engine still rejects writes as a backstop; this is the friendly gate.
+        //
+        // Graded with `is_read_only`, not with `assess`, because they answer
+        // different questions: `assess` grades *blast radius*, and by that measure
+        // any `SELECT` is Safe - including `SELECT lo_export(…)`,
+        // `SELECT pg_terminate_backend(…)` and `SET default_transaction_read_only =
+        // off`, which is the one statement that would turn the badge into a lie.
+        // `is_read_only` is the narrower "this reads and does nothing else" test the
+        // assistant's own read tier uses, and a false positive here costs only a
+        // refusal the user can work around by turning the connection writable.
         let read_only = matches!(&self.phase, Phase::Connected(active) if active.config.read_only);
-        if read_only && assessment.level > RiskLevel::Safe {
+        if read_only && !crate::sql::is_read_only(&sql, dialect) {
             self.notify(
                 ToastVariant::Error,
                 crate::i18n::tr!(
@@ -1443,9 +1452,12 @@ impl AppState {
         self.confirm_input = self
             .confirm_policy()
             .requires_typing(assessment.level)
-            .then(|| assessment.confirm_target())
+            // `confirm_text`, not `confirm_target`: a `TRUNCATE a, b` empties both,
+            // and a confirmation that only made the user type `a` vouched for less
+            // than what was about to run.
+            .then(|| assessment.confirm_text())
             .flatten()
-            .map(|target| ConfirmInput::new(target.to_string(), cx));
+            .map(|target| ConfirmInput::new(target, cx));
         // Ask the engine how much this touches. Fired here rather than awaited, so
         // the dialog opens on the grading immediately and the number fills in.
         self.confirm_count_token = self.confirm_count_token.wrapping_add(1);

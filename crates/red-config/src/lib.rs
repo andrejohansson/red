@@ -4,6 +4,7 @@
 //! **one** keychain. Nothing here knows about GPUI, Flint, or the database
 //! driver; it speaks only `red-core` types plus file/keychain IO.
 //!
+//! - [`atomic`]: the one owner-only, replace-whole file write they all persist through.
 //! - [`config`]: the saved-connection list (load/save/serialize, ids, paths).
 //! - [`secrets`]: the OS keychain (passwords never touch `connections.toml`).
 //! - [`history`]: the per-connection log of statements the user ran.
@@ -16,6 +17,7 @@
 //! a database agent can have, and it has to be reachable from the service thread,
 //! not just from a panel.
 
+pub mod atomic;
 pub mod config;
 pub mod history;
 pub mod plans;
